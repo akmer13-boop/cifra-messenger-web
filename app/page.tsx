@@ -92,6 +92,7 @@ import {
 import {
   CifraRealtimeClient,
   CifraRealtimeError,
+  type RealtimeChatMessage,
   type RealtimeChatSubscription,
   type RealtimeStatus,
 } from "./cifra-realtime";
@@ -105,6 +106,11 @@ import {
 type Tab = "chats" | "teams" | "calls" | "profile";
 type Filter = string;
 type Theme = "navy" | "black" | "sage" | "gray" | "sunset";
+type RealtimeChatObserverStatus =
+  | "idle"
+  | "subscribing"
+  | "subscribed"
+  | "error";
 type ChatPanel =
   | "attachments"
   | "emoji"
@@ -5947,6 +5953,14 @@ export default function Home() {
   const [realtimeSubscriptions, setRealtimeSubscriptions] = useState<
     readonly RealtimeChatSubscription[]
   >([]);
+  const [realtimeMessages, setRealtimeMessages] = useState<
+    readonly RealtimeChatMessage[]
+  >([]);
+  const [realtimeObservedTopic, setRealtimeObservedTopic] = useState<
+    string | null
+  >(null);
+  const [realtimeChatStatus, setRealtimeChatStatus] =
+    useState<RealtimeChatObserverStatus>("idle");
   const [authMode, setAuthMode] = useState<RuntimeMode>("demo");
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
@@ -6028,6 +6042,9 @@ export default function Home() {
       realtimeClientRef.current = null;
       setRealtimeStatus("disconnected");
       setRealtimeSubscriptions([]);
+      setRealtimeMessages([]);
+      setRealtimeObservedTopic(null);
+      setRealtimeChatStatus("idle");
       return;
     }
 
@@ -6037,6 +6054,9 @@ export default function Home() {
       },
       (subscriptions) => {
         setRealtimeSubscriptions([...subscriptions]);
+      },
+      (messages) => {
+        setRealtimeMessages([...messages]);
       },
     );
 
@@ -6081,6 +6101,54 @@ export default function Home() {
       }
     };
   }, [authSession, sessionActive]);
+  useEffect(() => {
+    const realtimeClient = realtimeClientRef.current;
+
+    if (
+      !sessionActive ||
+      realtimeStatus !== "connected" ||
+      !realtimeClient
+    ) {
+      setRealtimeObservedTopic(null);
+      setRealtimeChatStatus("idle");
+      return;
+    }
+
+    const subscription = realtimeSubscriptions.find(
+      (candidate) =>
+        !candidate.access?.mode ||
+        candidate.access.mode.includes("R"),
+    );
+
+    if (!subscription) {
+      setRealtimeObservedTopic(null);
+      setRealtimeChatStatus("idle");
+      return;
+    }
+
+    let cancelled = false;
+    setRealtimeObservedTopic(subscription.topic);
+    setRealtimeChatStatus("subscribing");
+
+    void realtimeClient
+      .subscribeToChat(subscription.topic, {
+        historyLimit: 20,
+      })
+      .then(() => {
+        if (!cancelled) {
+          setRealtimeChatStatus("subscribed");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRealtimeChatStatus("error");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [realtimeStatus, realtimeSubscriptions, sessionActive]);
   useEffect(() => {
     let frameId: number | undefined;
     try {
@@ -6421,6 +6489,9 @@ export default function Home() {
   realtimeClientRef.current = null;
   setRealtimeStatus("disconnected");
   setRealtimeSubscriptions([]);
+  setRealtimeMessages([]);
+  setRealtimeObservedTopic(null);
+  setRealtimeChatStatus("idle");
 
   try {
     await apiClientRef.current?.logout();
@@ -6801,6 +6872,15 @@ export default function Home() {
       className={`prototype-shell theme-${theme}`}
       data-realtime-status={realtimeStatus}
       data-realtime-topic-count={realtimeSubscriptions.length}
+      data-realtime-chat-status={realtimeChatStatus}
+      data-realtime-observed-topic={realtimeObservedTopic ?? ""}
+      data-realtime-message-count={
+        realtimeObservedTopic
+          ? realtimeMessages.filter(
+              (message) => message.topic === realtimeObservedTopic,
+            ).length
+          : 0
+      }
     >
       <div className="device-stage">
         <div className="device-glow" />
