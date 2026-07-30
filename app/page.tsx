@@ -111,6 +111,11 @@ type RealtimeChatObserverStatus =
   | "subscribing"
   | "subscribed"
   | "error";
+type RealtimePublishStatus =
+  | "idle"
+  | "publishing"
+  | "published"
+  | "error";
 type ChatPanel =
   | "attachments"
   | "emoji"
@@ -5961,6 +5966,11 @@ export default function Home() {
   >(null);
   const [realtimeChatStatus, setRealtimeChatStatus] =
     useState<RealtimeChatObserverStatus>("idle");
+  const [realtimePublishStatus, setRealtimePublishStatus] =
+    useState<RealtimePublishStatus>("idle");
+  const [realtimePublishedSeq, setRealtimePublishedSeq] = useState<
+    number | null
+  >(null);
   const [authMode, setAuthMode] = useState<RuntimeMode>("demo");
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
@@ -6045,6 +6055,8 @@ export default function Home() {
       setRealtimeMessages([]);
       setRealtimeObservedTopic(null);
       setRealtimeChatStatus("idle");
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
       return;
     }
 
@@ -6111,6 +6123,8 @@ export default function Home() {
     ) {
       setRealtimeObservedTopic(null);
       setRealtimeChatStatus("idle");
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
       return;
     }
 
@@ -6123,12 +6137,16 @@ export default function Home() {
     if (!subscription) {
       setRealtimeObservedTopic(null);
       setRealtimeChatStatus("idle");
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
       return;
     }
 
     let cancelled = false;
     setRealtimeObservedTopic(subscription.topic);
     setRealtimeChatStatus("subscribing");
+    setRealtimePublishStatus("idle");
+    setRealtimePublishedSeq(null);
 
     void realtimeClient
       .subscribeToChat(subscription.topic, {
@@ -6492,6 +6510,8 @@ export default function Home() {
   setRealtimeMessages([]);
   setRealtimeObservedTopic(null);
   setRealtimeChatStatus("idle");
+  setRealtimePublishStatus("idle");
+  setRealtimePublishedSeq(null);
 
   try {
     await apiClientRef.current?.logout();
@@ -6747,6 +6767,41 @@ export default function Home() {
     const voice = options.voice?.trim();
     if (!normalizedText && !voice) return false;
 
+    const realtimeClient = realtimeClientRef.current;
+
+    if (
+      realtimeClient &&
+      chatId === realtimeObservedTopic &&
+      realtimeStatus === "connected" &&
+      realtimeChatStatus === "subscribed" &&
+      realtimeClient.isTopicSubscribed(chatId)
+    ) {
+      if (
+        !normalizedText ||
+        voice ||
+        options.replyToId !== undefined ||
+        options.forwardedFrom
+      ) {
+        setRealtimePublishStatus("error");
+        return false;
+      }
+
+      setRealtimePublishStatus("publishing");
+      setRealtimePublishedSeq(null);
+
+      void realtimeClient
+        .publishText(chatId, normalizedText)
+        .then((result) => {
+          setRealtimePublishedSeq(result.seq);
+          setRealtimePublishStatus("published");
+        })
+        .catch(() => {
+          setRealtimePublishStatus("error");
+        });
+
+      return true;
+    }
+
     const now = formatMessageTime();
     const messageId = Date.now();
     const outgoingMessage: Message = {
@@ -6881,6 +6936,8 @@ export default function Home() {
             ).length
           : 0
       }
+      data-realtime-publish-status={realtimePublishStatus}
+      data-realtime-published-seq={realtimePublishedSeq ?? ""}
     >
       <div className="device-stage">
         <div className="device-glow" />
