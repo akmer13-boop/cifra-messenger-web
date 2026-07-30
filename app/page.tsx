@@ -91,6 +91,7 @@ import {
 
 import {
   CifraRealtimeClient,
+  CifraRealtimeError,
   type RealtimeStatus,
 } from "./cifra-realtime";
 
@@ -6045,11 +6046,21 @@ export default function Home() {
           realtimeClient.disconnect();
         }
       })
-      .catch(() => {
-        if (!cancelled) {
-          setRealtimeStatus("error");
-        }
-      });
+.catch((error: unknown) => {
+  if (cancelled) {
+    return;
+  }
+
+  if (
+    error instanceof CifraRealtimeError &&
+    error.code === "realtime_connection_cancelled"
+  ) {
+    setRealtimeStatus("disconnected");
+    return;
+  }
+
+  setRealtimeStatus("error");
+});
 
     return () => {
       cancelled = true;
