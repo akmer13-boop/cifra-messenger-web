@@ -21,8 +21,10 @@ export interface RealtimeTicketResponse {
 
 interface TinodeControl {
   readonly id?: string;
+  readonly topic?: string;
   readonly code: number;
   readonly text?: string;
+  readonly timestamp?: string;
   readonly params?: Readonly<Record<string, unknown>>;
 }
 
@@ -60,6 +62,12 @@ export interface RealtimeChatMessage {
 
 export interface RealtimeChatSubscribeOptions {
   readonly historyLimit?: number;
+}
+
+export interface RealtimePublishTextResult {
+  readonly topic: string;
+  readonly seq: number;
+  readonly timestamp?: string;
 }
 
 type RealtimeStatusListener = (
@@ -231,6 +239,89 @@ export class CifraRealtimeClient {
 
     this.chatSubscribePromises.set(topic, subscribePromise);
     return subscribePromise;
+  }
+
+  async publishText(
+    topic: string,
+    text: string,
+  ): Promise<RealtimePublishTextResult> {
+    if (!isChatTopicName(topic)) {
+      throw new CifraRealtimeError("tinode_chat_topic_invalid");
+    }
+
+    const normalizedText = text.trim();
+
+    if (!normalizedText) {
+      throw new CifraRealtimeError("tinode_publish_text_empty");
+    }
+
+    const subscription = this.chatSubscriptions.get(topic);
+
+    if (!subscription) {
+      throw new CifraRealtimeError("tinode_chat_topic_unknown");
+    }
+
+    if (
+      subscription.access?.mode &&
+      !subscription.access.mode.includes("W")
+    ) {
+      throw new CifraRealtimeError("tinode_chat_write_access_denied");
+    }
+
+    const socket = this.socket;
+
+    if (
+      !this.isConnected() ||
+      !socket ||
+      socket.readyState !== WebSocket.OPEN
+    ) {
+      throw new CifraRealtimeError("realtime_not_connected");
+    }
+
+    if (!this.subscribedTopics.has(topic)) {
+      throw new CifraRealtimeError("tinode_chat_not_subscribed");
+    }
+
+    const requestId = createPacketId("pub-text");
+    const controlPromise = waitForControl(socket, requestId);
+
+    socket.send(
+      JSON.stringify({
+        pub: {
+          id: requestId,
+          topic,
+          noecho: false,
+          head: {
+            mime: "text/plain",
+          },
+          content: normalizedText,
+        },
+      }),
+    );
+
+    const control = await controlPromise;
+
+    if (this.socket !== socket) {
+      throw new CifraRealtimeError("realtime_connection_cancelled");
+    }
+
+    if (control.code < 200 || control.code >= 300) {
+      throw new CifraRealtimeError("tinode_publish_rejected");
+    }
+
+    const seq = parsePositiveInteger(control.params?.["seq"]);
+
+    if (seq === null) {
+      throw new CifraRealtimeError("tinode_publish_seq_missing");
+    }
+
+    return {
+      topic,
+      seq,
+      ...(control.timestamp
+        ? { timestamp: control.timestamp }
+        : {}),
+    };
   }
 
   disconnect(): void {
@@ -1089,14 +1180,20 @@ function parseTinodeControl(
       return null;
     }
 
+    const timestamp = parseIsoDate(ctrl["ts"]);
+
     return {
       ...(typeof ctrl["id"] === "string"
         ? { id: ctrl["id"] }
+        : {}),
+      ...(typeof ctrl["topic"] === "string"
+        ? { topic: ctrl["topic"] }
         : {}),
       code: ctrl["code"],
       ...(typeof ctrl["text"] === "string"
         ? { text: ctrl["text"] }
         : {}),
+      ...(timestamp ? { timestamp } : {}),
       ...(isRecord(ctrl["params"])
         ? { params: ctrl["params"] }
         : {}),
