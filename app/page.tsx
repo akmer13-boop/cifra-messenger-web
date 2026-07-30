@@ -92,6 +92,7 @@ import {
 import {
   CifraRealtimeClient,
   CifraRealtimeError,
+  type RealtimeChatSubscription,
   type RealtimeStatus,
 } from "./cifra-realtime";
 
@@ -5943,6 +5944,9 @@ export default function Home() {
   const realtimeClientRef = useRef<CifraRealtimeClient | null>(null);
   const [realtimeStatus, setRealtimeStatus] =
     useState<RealtimeStatus>("disconnected");
+  const [realtimeSubscriptions, setRealtimeSubscriptions] = useState<
+    readonly RealtimeChatSubscription[]
+  >([]);
   const [authMode, setAuthMode] = useState<RuntimeMode>("demo");
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
@@ -6023,12 +6027,18 @@ export default function Home() {
       realtimeClientRef.current?.disconnect();
       realtimeClientRef.current = null;
       setRealtimeStatus("disconnected");
+      setRealtimeSubscriptions([]);
       return;
     }
 
-    const realtimeClient = new CifraRealtimeClient((status) => {
-      setRealtimeStatus(status);
-    });
+    const realtimeClient = new CifraRealtimeClient(
+      (status) => {
+        setRealtimeStatus(status);
+      },
+      (subscriptions) => {
+        setRealtimeSubscriptions([...subscriptions]);
+      },
+    );
 
     realtimeClientRef.current?.disconnect();
     realtimeClientRef.current = realtimeClient;
@@ -6410,6 +6420,7 @@ export default function Home() {
   realtimeClientRef.current?.disconnect();
   realtimeClientRef.current = null;
   setRealtimeStatus("disconnected");
+  setRealtimeSubscriptions([]);
 
   try {
     await apiClientRef.current?.logout();
@@ -6789,6 +6800,7 @@ export default function Home() {
     <main
       className={`prototype-shell theme-${theme}`}
       data-realtime-status={realtimeStatus}
+      data-realtime-topic-count={realtimeSubscriptions.length}
     >
       <div className="device-stage">
         <div className="device-glow" />
