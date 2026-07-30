@@ -6396,17 +6396,21 @@ export default function Home() {
   };
 
   const logout = async (): Promise<void> => {
-    try {
-      await apiClientRef.current?.logout();
-    } finally {
-      setAuthSession(null);
-      setSessionActive(false);
-      setComposeOpen(false);
-      setCallOpen(false);
-      setSelectedProfileUserId(null);
-      setAuditUserId(null);
-    }
-  };
+  realtimeClientRef.current?.disconnect();
+  realtimeClientRef.current = null;
+  setRealtimeStatus("disconnected");
+
+  try {
+    await apiClientRef.current?.logout();
+  } finally {
+    setAuthSession(null);
+    setSessionActive(false);
+    setComposeOpen(false);
+    setCallOpen(false);
+    setSelectedProfileUserId(null);
+    setAuditUserId(null);
+  }
+};
 
   const changeOwnPassword = async (
     currentPassword: string,
