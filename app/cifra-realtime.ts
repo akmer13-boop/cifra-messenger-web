@@ -32,10 +32,37 @@ export interface RealtimeConnectParams {
   readonly deviceId: string;
 }
 
+export interface RealtimeChatSubscription {
+  readonly topic: string;
+  readonly updatedAt?: string;
+  readonly touchedAt?: string;
+  readonly seq?: number;
+  readonly read?: number;
+  readonly recv?: number;
+  readonly online?: boolean;
+  readonly access?: {
+    readonly want?: string;
+    readonly given?: string;
+    readonly mode?: string;
+  };
+  readonly public?: Readonly<Record<string, unknown>>;
+  readonly private?: Readonly<Record<string, unknown>>;
+}
+
 type RealtimeStatusListener = (
   status: RealtimeStatus,
   error?: string,
 ) => void;
+
+type RealtimeSubscriptionsListener = (
+  subscriptions: readonly RealtimeChatSubscription[],
+) => void;
+
+interface TinodeSubscriptionBatch {
+  readonly topic: string;
+  readonly requestId?: string;
+  readonly subscriptions: readonly RealtimeChatSubscription[];
+}
 
 const REQUEST_TIMEOUT_MS = 15_000;
 const TINODE_VERSION = "0.25";
@@ -53,10 +80,16 @@ export class CifraRealtimeClient {
   private connectPromise: Promise<string> | null = null;
   private tinodeUserId: string | null = null;
   private subscribedTopics = new Set<string>();
+  private chatSubscriptions = new Map<
+    string,
+    RealtimeChatSubscription
+  >();
   private connectionAttempt = 0;
 
   constructor(
     private readonly onStatus: RealtimeStatusListener = () => undefined,
+    private readonly onSubscriptions: RealtimeSubscriptionsListener =
+      () => undefined,
   ) {}
 
   getStatus(): RealtimeStatus {
@@ -73,6 +106,14 @@ export class CifraRealtimeClient {
 
   isTopicSubscribed(topic: string): boolean {
     return this.subscribedTopics.has(topic);
+  }
+
+  getChatSubscriptions(): readonly RealtimeChatSubscription[] {
+    return Array.from(this.chatSubscriptions.values());
+  }
+
+  getChatTopicIds(): readonly string[] {
+    return Array.from(this.chatSubscriptions.keys());
   }
 
   isConnected(): boolean {
@@ -111,6 +152,7 @@ export class CifraRealtimeClient {
     this.socket = null;
     this.tinodeUserId = null;
     this.subscribedTopics.clear();
+    this.clearChatSubscriptions();
 
     if (
       socket &&
@@ -132,6 +174,7 @@ export class CifraRealtimeClient {
     this.socket = null;
     this.tinodeUserId = null;
     this.subscribedTopics.clear();
+    this.clearChatSubscriptions();
 
     if (
       previousSocket &&
@@ -233,6 +276,25 @@ export class CifraRealtimeClient {
         );
       }
 
+      const onTinodeMessage = (event: MessageEvent) => {
+        if (
+          this.socket !== socket ||
+          typeof event.data !== "string"
+        ) {
+          return;
+        }
+
+        const batch = parseTinodeSubscriptionBatch(event.data);
+
+        if (!batch || batch.topic !== "me") {
+          return;
+        }
+
+        this.upsertChatSubscriptions(batch.subscriptions);
+      };
+
+      socket.addEventListener("message", onTinodeMessage);
+
       const meSubId = createPacketId("sub-me");
       const meSubControlPromise = waitForControl(socket, meSubId);
 
@@ -264,6 +326,7 @@ export class CifraRealtimeClient {
           this.socket = null;
           this.tinodeUserId = null;
           this.subscribedTopics.clear();
+          this.clearChatSubscriptions();
           this.setStatus("disconnected");
         }
       });
@@ -286,6 +349,7 @@ export class CifraRealtimeClient {
         this.socket = null;
         this.tinodeUserId = null;
         this.subscribedTopics.clear();
+        this.clearChatSubscriptions();
       }
 
       if (
@@ -312,6 +376,32 @@ export class CifraRealtimeClient {
 
       throw error;
     }
+  }
+
+  private upsertChatSubscriptions(
+    subscriptions: readonly RealtimeChatSubscription[],
+  ): void {
+    if (subscriptions.length === 0) {
+      return;
+    }
+
+    for (const subscription of subscriptions) {
+      this.chatSubscriptions.set(
+        subscription.topic,
+        subscription,
+      );
+    }
+
+    this.onSubscriptions(this.getChatSubscriptions());
+  }
+
+  private clearChatSubscriptions(): void {
+    if (this.chatSubscriptions.size === 0) {
+      return;
+    }
+
+    this.chatSubscriptions.clear();
+    this.onSubscriptions([]);
   }
 
   private ensureActiveAttempt(
@@ -619,6 +709,142 @@ function waitForControl(
     socket.addEventListener("error", onError);
     socket.addEventListener("close", onClose);
   });
+}
+
+export function parseTinodeChatSubscriptions(
+  raw: string,
+): readonly RealtimeChatSubscription[] | null {
+  return parseTinodeSubscriptionBatch(raw)?.subscriptions ?? null;
+}
+
+function parseTinodeSubscriptionBatch(
+  raw: string,
+): TinodeSubscriptionBatch | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+
+    if (
+      !isRecord(parsed) ||
+      !isRecord(parsed["meta"])
+    ) {
+      return null;
+    }
+
+    const meta = parsed["meta"];
+
+    if (
+      typeof meta["topic"] !== "string" ||
+      !Array.isArray(meta["sub"])
+    ) {
+      return null;
+    }
+
+    const subscriptions = meta["sub"]
+      .map(parseTinodeChatSubscription)
+      .filter(
+        (subscription): subscription is RealtimeChatSubscription =>
+          subscription !== null,
+      );
+
+    return {
+      topic: meta["topic"],
+      ...(typeof meta["id"] === "string"
+        ? { requestId: meta["id"] }
+        : {}),
+      subscriptions,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseTinodeChatSubscription(
+  value: unknown,
+): RealtimeChatSubscription | null {
+  if (
+    !isRecord(value) ||
+    typeof value["topic"] !== "string" ||
+    !isChatTopicName(value["topic"])
+  ) {
+    return null;
+  }
+
+  const access = parseTinodeAccess(value["acs"]);
+  const updatedAt = parseIsoDate(value["updated"]);
+  const touchedAt = parseIsoDate(value["touched"]);
+  const seq = parseNonNegativeInteger(value["seq"]);
+  const read = parseNonNegativeInteger(value["read"]);
+  const recv = parseNonNegativeInteger(value["recv"]);
+
+  return {
+    topic: value["topic"],
+    ...(updatedAt ? { updatedAt } : {}),
+    ...(touchedAt ? { touchedAt } : {}),
+    ...(seq !== null ? { seq } : {}),
+    ...(read !== null ? { read } : {}),
+    ...(recv !== null ? { recv } : {}),
+    ...(typeof value["online"] === "boolean"
+      ? { online: value["online"] }
+      : {}),
+    ...(access ? { access } : {}),
+    ...(isRecord(value["public"])
+      ? { public: value["public"] }
+      : {}),
+    ...(isRecord(value["private"])
+      ? { private: value["private"] }
+      : {}),
+  };
+}
+
+function parseTinodeAccess(
+  value: unknown,
+): RealtimeChatSubscription["access"] | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const want =
+    typeof value["want"] === "string"
+      ? value["want"]
+      : undefined;
+  const given =
+    typeof value["given"] === "string"
+      ? value["given"]
+      : undefined;
+  const mode =
+    typeof value["mode"] === "string"
+      ? value["mode"]
+      : undefined;
+
+  if (!want && !given && !mode) {
+    return null;
+  }
+
+  return {
+    ...(want ? { want } : {}),
+    ...(given ? { given } : {}),
+    ...(mode ? { mode } : {}),
+  };
+}
+
+function parseIsoDate(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  return Number.isFinite(Date.parse(value)) ? value : null;
+}
+
+function parseNonNegativeInteger(
+  value: unknown,
+): number | null {
+  return Number.isInteger(value) && Number(value) >= 0
+    ? Number(value)
+    : null;
+}
+
+function isChatTopicName(value: string): boolean {
+  return /^(?:usr|grp|chn)[A-Za-z0-9_-]{8,125}$/.test(value);
 }
 
 function parseTinodeControl(
