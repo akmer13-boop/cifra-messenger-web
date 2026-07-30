@@ -180,7 +180,10 @@ export class CifraApiClient {
   private refreshInFlight: Promise<AuthSession> | null = null;
 
   constructor(readonly config: RuntimeConfig) {}
-
+  
+get currentDeviceId(): string {
+  return browserDevice().id;
+}
   get mode(): RuntimeMode {
     return this.config.mode;
   }

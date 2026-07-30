@@ -88,6 +88,13 @@ import {
   type RuntimeMode,
   type UserRole,
 } from "./cifra-api";
+
+import {
+  CifraRealtimeClient,
+  CifraRealtimeError,
+  type RealtimeStatus,
+} from "./cifra-realtime";
+
 import {
   clampSwipeOffset,
   getSwipeActionState,
@@ -5932,7 +5939,10 @@ export default function Home() {
   const [notificationUntil, setNotificationUntil] = useState<number | null>(
     null,
   );
-  const apiClientRef = useRef<CifraApiClient | null>(null);
+    const apiClientRef = useRef<CifraApiClient | null>(null);
+  const realtimeClientRef = useRef<CifraRealtimeClient | null>(null);
+  const [realtimeStatus, setRealtimeStatus] =
+    useState<RealtimeStatus>("disconnected");
   const [authMode, setAuthMode] = useState<RuntimeMode>("demo");
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
@@ -6000,7 +6010,67 @@ export default function Home() {
       cancelled = true;
     };
   }, [activateSession, syncBackendDirectory]);
+  useEffect(() => {
+    const apiClient = apiClientRef.current;
 
+    if (
+      !sessionActive ||
+      !authSession ||
+      authSession.context.must_change_password ||
+      !apiClient ||
+      apiClient.mode !== "backend"
+    ) {
+      realtimeClientRef.current?.disconnect();
+      realtimeClientRef.current = null;
+      setRealtimeStatus("disconnected");
+      return;
+    }
+
+    const realtimeClient = new CifraRealtimeClient((status) => {
+      setRealtimeStatus(status);
+    });
+
+    realtimeClientRef.current?.disconnect();
+    realtimeClientRef.current = realtimeClient;
+
+    let cancelled = false;
+
+    void realtimeClient
+      .connect({
+        apiBaseUrl: apiClient.config.apiBaseUrl,
+        accessToken: authSession.tokens.access_token,
+        deviceId: apiClient.currentDeviceId,
+      })
+      .then(() => {
+        if (cancelled) {
+          realtimeClient.disconnect();
+        }
+      })
+.catch((error: unknown) => {
+  if (cancelled) {
+    return;
+  }
+
+  if (
+    error instanceof CifraRealtimeError &&
+    error.code === "realtime_connection_cancelled"
+  ) {
+    setRealtimeStatus("disconnected");
+    return;
+  }
+
+  setRealtimeStatus("error");
+});
+
+    return () => {
+      cancelled = true;
+      realtimeClient.disconnect();
+
+      if (realtimeClientRef.current === realtimeClient) {
+        realtimeClientRef.current = null;
+      }
+    };
+  }, [authSession, sessionActive]);
   useEffect(() => {
     let frameId: number | undefined;
     try {
@@ -6337,17 +6407,21 @@ export default function Home() {
   };
 
   const logout = async (): Promise<void> => {
-    try {
-      await apiClientRef.current?.logout();
-    } finally {
-      setAuthSession(null);
-      setSessionActive(false);
-      setComposeOpen(false);
-      setCallOpen(false);
-      setSelectedProfileUserId(null);
-      setAuditUserId(null);
-    }
-  };
+  realtimeClientRef.current?.disconnect();
+  realtimeClientRef.current = null;
+  setRealtimeStatus("disconnected");
+
+  try {
+    await apiClientRef.current?.logout();
+  } finally {
+    setAuthSession(null);
+    setSessionActive(false);
+    setComposeOpen(false);
+    setCallOpen(false);
+    setSelectedProfileUserId(null);
+    setAuditUserId(null);
+  }
+};
 
   const changeOwnPassword = async (
     currentPassword: string,
@@ -6711,8 +6785,11 @@ export default function Home() {
     setCallOpen(true);
   };
 
-  return (
-    <main className={`prototype-shell theme-${theme}`}>
+    return (
+    <main
+      className={`prototype-shell theme-${theme}`}
+      data-realtime-status={realtimeStatus}
+    >
       <div className="device-stage">
         <div className="device-glow" />
         <div className="iphone">
