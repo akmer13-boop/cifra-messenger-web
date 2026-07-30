@@ -70,6 +70,15 @@ export interface RealtimePublishTextResult {
   readonly timestamp?: string;
 }
 
+export type RealtimeReceiptKind = "recv" | "read";
+
+export interface RealtimeChatReceipt {
+  readonly topic: string;
+  readonly from: string;
+  readonly what: RealtimeReceiptKind;
+  readonly seq: number;
+}
+
 type RealtimeStatusListener = (
   status: RealtimeStatus,
   error?: string,
@@ -81,6 +90,10 @@ type RealtimeSubscriptionsListener = (
 
 type RealtimeMessagesListener = (
   messages: readonly RealtimeChatMessage[],
+) => void;
+
+type RealtimeReceiptsListener = (
+  receipts: readonly RealtimeChatReceipt[],
 ) => void;
 
 interface TinodeSubscriptionBatch {
@@ -110,6 +123,11 @@ export class CifraRealtimeClient {
     RealtimeChatSubscription
   >();
   private chatMessages = new Map<string, RealtimeChatMessage>();
+  private chatReceipts = new Map<string, RealtimeChatReceipt>();
+  private localReceiptProgress = new Map<
+    string,
+    { recv: number; read: number }
+  >();
   private chatSubscribePromises = new Map<string, Promise<void>>();
   private attachingTopics = new Set<string>();
   private connectionAttempt = 0;
@@ -119,6 +137,8 @@ export class CifraRealtimeClient {
     private readonly onSubscriptions: RealtimeSubscriptionsListener =
       () => undefined,
     private readonly onMessages: RealtimeMessagesListener =
+      () => undefined,
+    private readonly onReceipts: RealtimeReceiptsListener =
       () => undefined,
   ) {}
 
@@ -152,6 +172,20 @@ export class CifraRealtimeClient {
       .sort((left, right) => {
         const topicOrder = left.topic.localeCompare(right.topic);
         return topicOrder !== 0 ? topicOrder : left.seq - right.seq;
+      });
+  }
+
+  getChatReceipts(topic?: string): readonly RealtimeChatReceipt[] {
+    return Array.from(this.chatReceipts.values())
+      .filter((receipt) => !topic || receipt.topic === topic)
+      .sort((left, right) => {
+        const topicOrder = left.topic.localeCompare(right.topic);
+        if (topicOrder !== 0) return topicOrder;
+
+        const fromOrder = left.from.localeCompare(right.from);
+        if (fromOrder !== 0) return fromOrder;
+
+        return left.what.localeCompare(right.what);
       });
   }
 
@@ -324,6 +358,93 @@ export class CifraRealtimeClient {
     };
   }
 
+  markReceived(topic: string, seq: number): boolean {
+    return this.sendReceipt(topic, "recv", seq);
+  }
+
+  markRead(topic: string, seq: number): boolean {
+    return this.sendReceipt(topic, "read", seq);
+  }
+
+  private sendReceipt(
+    topic: string,
+    what: RealtimeReceiptKind,
+    seq: number,
+  ): boolean {
+    if (!isChatTopicName(topic)) {
+      throw new CifraRealtimeError("tinode_chat_topic_invalid");
+    }
+
+    const normalizedSeq = parsePositiveInteger(seq);
+
+    if (normalizedSeq === null) {
+      throw new CifraRealtimeError("tinode_receipt_seq_invalid");
+    }
+
+    const subscription = this.chatSubscriptions.get(topic);
+
+    if (!subscription) {
+      throw new CifraRealtimeError("tinode_chat_topic_unknown");
+    }
+
+    if (
+      subscription.access?.mode &&
+      !subscription.access.mode.includes("R")
+    ) {
+      throw new CifraRealtimeError("tinode_chat_read_access_denied");
+    }
+
+    const socket = this.socket;
+
+    if (
+      !this.isConnected() ||
+      !socket ||
+      socket.readyState !== WebSocket.OPEN
+    ) {
+      throw new CifraRealtimeError("realtime_not_connected");
+    }
+
+    if (
+      !this.subscribedTopics.has(topic) &&
+      !this.attachingTopics.has(topic)
+    ) {
+      throw new CifraRealtimeError("tinode_chat_not_subscribed");
+    }
+
+    const progress = this.localReceiptProgress.get(topic) ?? {
+      recv: 0,
+      read: 0,
+    };
+
+    if (
+      (what === "recv" &&
+        normalizedSeq <= Math.max(progress.recv, progress.read)) ||
+      (what === "read" && normalizedSeq <= progress.read)
+    ) {
+      return false;
+    }
+
+    socket.send(
+      JSON.stringify({
+        note: {
+          topic,
+          what,
+          seq: normalizedSeq,
+        },
+      }),
+    );
+
+    this.localReceiptProgress.set(topic, {
+      recv: Math.max(progress.recv, normalizedSeq),
+      read:
+        what === "read"
+          ? Math.max(progress.read, normalizedSeq)
+          : progress.read,
+    });
+
+    return true;
+  }
+
   disconnect(): void {
     this.connectionAttempt += 1;
     this.connectPromise = null;
@@ -335,8 +456,10 @@ export class CifraRealtimeClient {
     this.subscribedTopics.clear();
     this.chatSubscribePromises.clear();
     this.attachingTopics.clear();
+    this.localReceiptProgress.clear();
     this.clearChatSubscriptions();
     this.clearChatMessages();
+    this.clearChatReceipts();
 
     if (
       socket &&
@@ -360,8 +483,10 @@ export class CifraRealtimeClient {
     this.subscribedTopics.clear();
     this.chatSubscribePromises.clear();
     this.attachingTopics.clear();
+    this.localReceiptProgress.clear();
     this.clearChatSubscriptions();
     this.clearChatMessages();
+    this.clearChatReceipts();
 
     if (
       previousSocket &&
@@ -478,6 +603,17 @@ export class CifraRealtimeClient {
           return;
         }
 
+        const receipt = parseTinodeChatReceipt(event.data);
+
+        if (
+          receipt &&
+          (this.subscribedTopics.has(receipt.topic) ||
+            this.attachingTopics.has(receipt.topic))
+        ) {
+          this.upsertChatReceipt(receipt);
+          return;
+        }
+
         const message = parseTinodeChatMessage(event.data);
 
         if (
@@ -486,6 +622,13 @@ export class CifraRealtimeClient {
             this.attachingTopics.has(message.topic))
         ) {
           this.upsertChatMessage(message);
+
+          if (
+            message.from &&
+            message.from !== this.tinodeUserId
+          ) {
+            this.markReceived(message.topic, message.seq);
+          }
         }
       };
 
@@ -524,8 +667,10 @@ export class CifraRealtimeClient {
           this.subscribedTopics.clear();
           this.chatSubscribePromises.clear();
           this.attachingTopics.clear();
+          this.localReceiptProgress.clear();
           this.clearChatSubscriptions();
           this.clearChatMessages();
+          this.clearChatReceipts();
           this.setStatus("disconnected");
         }
       });
@@ -550,8 +695,10 @@ export class CifraRealtimeClient {
         this.subscribedTopics.clear();
         this.chatSubscribePromises.clear();
         this.attachingTopics.clear();
+        this.localReceiptProgress.clear();
         this.clearChatSubscriptions();
         this.clearChatMessages();
+        this.clearChatReceipts();
       }
 
       if (
@@ -641,6 +788,18 @@ export class CifraRealtimeClient {
     this.onMessages(this.getChatMessages());
   }
 
+  private upsertChatReceipt(receipt: RealtimeChatReceipt): void {
+    const key = `${receipt.topic}:${receipt.from}:${receipt.what}`;
+    const current = this.chatReceipts.get(key);
+
+    if (current && current.seq >= receipt.seq) {
+      return;
+    }
+
+    this.chatReceipts.set(key, receipt);
+    this.onReceipts(this.getChatReceipts());
+  }
+
   private clearChatMessages(): void {
     if (this.chatMessages.size === 0) {
       return;
@@ -657,6 +816,15 @@ export class CifraRealtimeClient {
 
     this.chatSubscriptions.clear();
     this.onSubscriptions([]);
+  }
+
+  private clearChatReceipts(): void {
+    if (this.chatReceipts.size === 0) {
+      return;
+    }
+
+    this.chatReceipts.clear();
+    this.onReceipts([]);
   }
 
   private ensureActiveAttempt(
@@ -964,6 +1132,76 @@ function waitForControl(
     socket.addEventListener("error", onError);
     socket.addEventListener("close", onClose);
   });
+}
+
+export function parseTinodeChatReceipt(
+  raw: string,
+): RealtimeChatReceipt | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+
+    if (!isRecord(parsed)) {
+      return null;
+    }
+
+    if (isRecord(parsed["info"])) {
+      const info = parsed["info"];
+      const topic = info["topic"];
+      const from = info["from"];
+      const what = info["what"];
+      const seq = parsePositiveInteger(info["seq"]);
+
+      if (
+        typeof topic === "string" &&
+        isChatTopicName(topic) &&
+        typeof from === "string" &&
+        isUserTopicName(from) &&
+        (what === "recv" || what === "read") &&
+        seq !== null
+      ) {
+        return {
+          topic,
+          from,
+          what,
+          seq,
+        };
+      }
+    }
+
+    if (isRecord(parsed["pres"])) {
+      const pres = parsed["pres"];
+      const source = pres["src"];
+      const topic = pres["topic"];
+      const actor = pres["act"];
+      const what = pres["what"];
+      const seq = parsePositiveInteger(pres["seq"]);
+      const receiptTopic =
+        typeof source === "string" && isChatTopicName(source)
+          ? source
+          : typeof topic === "string" && isChatTopicName(topic)
+            ? topic
+            : null;
+
+      if (
+        receiptTopic &&
+        typeof actor === "string" &&
+        isUserTopicName(actor) &&
+        (what === "recv" || what === "read") &&
+        seq !== null
+      ) {
+        return {
+          topic: receiptTopic,
+          from: actor,
+          what,
+          seq,
+        };
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 export function parseTinodeChatMessage(
