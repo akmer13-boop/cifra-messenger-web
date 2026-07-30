@@ -5938,13 +5938,10 @@ export default function Home() {
   const [notificationUntil, setNotificationUntil] = useState<number | null>(
     null,
   );
-  const apiClientRef = useRef<CifraApiClient | null>(null);
-  
-  const realtimeClientRef =
-  useRef<CifraRealtimeClient | null>(null);
-  
-const [realtimeStatus, setRealtimeStatus] =
-  useState<RealtimeStatus>("disconnected");
+    const apiClientRef = useRef<CifraApiClient | null>(null);
+  const realtimeClientRef = useRef<CifraRealtimeClient | null>(null);
+  const [realtimeStatus, setRealtimeStatus] =
+    useState<RealtimeStatus>("disconnected");
   const [authMode, setAuthMode] = useState<RuntimeMode>("demo");
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
@@ -6012,7 +6009,57 @@ const [realtimeStatus, setRealtimeStatus] =
       cancelled = true;
     };
   }, [activateSession, syncBackendDirectory]);
+  useEffect(() => {
+    const apiClient = apiClientRef.current;
 
+    if (
+      !sessionActive ||
+      !authSession ||
+      authSession.context.must_change_password ||
+      !apiClient ||
+      apiClient.mode !== "backend"
+    ) {
+      realtimeClientRef.current?.disconnect();
+      realtimeClientRef.current = null;
+      setRealtimeStatus("disconnected");
+      return;
+    }
+
+    const realtimeClient = new CifraRealtimeClient((status) => {
+      setRealtimeStatus(status);
+    });
+
+    realtimeClientRef.current?.disconnect();
+    realtimeClientRef.current = realtimeClient;
+
+    let cancelled = false;
+
+    void realtimeClient
+      .connect({
+        apiBaseUrl: apiClient.config.apiBaseUrl,
+        accessToken: authSession.tokens.access_token,
+        deviceId: apiClient.currentDeviceId,
+      })
+      .then(() => {
+        if (cancelled) {
+          realtimeClient.disconnect();
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRealtimeStatus("error");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      realtimeClient.disconnect();
+
+      if (realtimeClientRef.current === realtimeClient) {
+        realtimeClientRef.current = null;
+      }
+    };
+  }, [authSession, sessionActive]);
   useEffect(() => {
     let frameId: number | undefined;
     try {
