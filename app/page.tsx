@@ -6770,8 +6770,11 @@ export default function Home() {
     setCallOpen(true);
   };
 
-  return (
-    <main className={`prototype-shell theme-${theme}`}>
+    return (
+    <main
+      className={`prototype-shell theme-${theme}`}
+      data-realtime-status={realtimeStatus}
+    >
       <div className="device-stage">
         <div className="device-glow" />
         <div className="iphone">
