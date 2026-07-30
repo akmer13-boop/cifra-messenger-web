@@ -132,6 +132,8 @@ export class CifraRealtimeClient {
 
     this.setStatus("connecting");
 
+    let attemptSocket: WebSocket | null = null;
+
     try {
       const ticket = await issueRealtimeTicket(
         params.apiBaseUrl,
@@ -148,6 +150,7 @@ export class CifraRealtimeClient {
       );
 
       const socket = new WebSocket(ticket.endpoint.url);
+      attemptSocket = socket;
       this.socket = socket;
 
       await waitForSocketOpen(socket);
@@ -239,10 +242,12 @@ export class CifraRealtimeClient {
 
       return user;
     } catch (error) {
-      const socket = this.socket;
+      const socket = attemptSocket;
 
-      this.socket = null;
-      this.tinodeUserId = null;
+      if (this.socket === socket) {
+        this.socket = null;
+        this.tinodeUserId = null;
+      }
 
       if (
         socket &&
