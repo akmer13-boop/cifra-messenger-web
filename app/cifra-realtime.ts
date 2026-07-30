@@ -52,6 +52,7 @@ export class CifraRealtimeClient {
   private status: RealtimeStatus = "disconnected";
   private connectPromise: Promise<string> | null = null;
   private tinodeUserId: string | null = null;
+  private connectionAttempt = 0;
 
   constructor(
     private readonly onStatus: RealtimeStatusListener = () => undefined,
@@ -81,14 +82,21 @@ export class CifraRealtimeClient {
       return this.connectPromise;
     }
 
-    this.connectPromise = this.connectInternal(params).finally(() => {
-      this.connectPromise = null;
+    const attempt = ++this.connectionAttempt;
+    const connectPromise = this.connectInternal(params, attempt).finally(() => {
+      if (this.connectPromise === connectPromise) {
+        this.connectPromise = null;
+      }
     });
 
-    return this.connectPromise;
+    this.connectPromise = connectPromise;
+    return connectPromise;
   }
 
   disconnect(): void {
+    this.connectionAttempt += 1;
+    this.connectPromise = null;
+
     const socket = this.socket;
 
     this.socket = null;
@@ -107,8 +115,21 @@ export class CifraRealtimeClient {
 
   private async connectInternal(
     params: RealtimeConnectParams,
+    attempt: number,
   ): Promise<string> {
-    this.disconnect();
+    const previousSocket = this.socket;
+
+    this.socket = null;
+    this.tinodeUserId = null;
+
+    if (
+      previousSocket &&
+      previousSocket.readyState !== WebSocket.CLOSED &&
+      previousSocket.readyState !== WebSocket.CLOSING
+    ) {
+      previousSocket.close(1000, "client_reconnect");
+    }
+
     this.setStatus("connecting");
 
     try {
@@ -116,6 +137,8 @@ export class CifraRealtimeClient {
         params.apiBaseUrl,
         params.accessToken,
       );
+
+      this.ensureActiveAttempt(attempt);
 
       validateEndpointSecurity(
         ticket.endpoint.url,
@@ -128,6 +151,7 @@ export class CifraRealtimeClient {
       this.socket = socket;
 
       await waitForSocketOpen(socket);
+      this.ensureActiveAttempt(attempt, socket);
 
       const hiId = createPacketId("hi");
 
@@ -147,6 +171,7 @@ export class CifraRealtimeClient {
       );
 
       const hiControl = await hiControlPromise;
+      this.ensureActiveAttempt(attempt, socket);
 
       if (
         hiControl.code !== 201 ||
@@ -170,6 +195,8 @@ export class CifraRealtimeClient {
       );
 
       const loginControl = await loginControlPromise;
+      this.ensureActiveAttempt(attempt, socket);
+
       const user = loginControl.params?.["user"];
       const authLevel = loginControl.params?.["authlvl"];
 
@@ -206,6 +233,7 @@ export class CifraRealtimeClient {
         }
       });
 
+      this.ensureActiveAttempt(attempt, socket);
       this.tinodeUserId = user;
       this.setStatus("connected");
 
@@ -229,9 +257,38 @@ export class CifraRealtimeClient {
           ? error.code
           : "realtime_connection_failed";
 
-      this.setStatus("error", code);
+      const cancelled =
+        attempt !== this.connectionAttempt ||
+        (error instanceof CifraRealtimeError &&
+          error.code === "realtime_connection_cancelled");
+
+      if (!cancelled) {
+        this.setStatus("error", code);
+      }
+
       throw error;
     }
+  }
+
+  private ensureActiveAttempt(
+    attempt: number,
+    socket?: WebSocket,
+  ): void {
+    if (attempt === this.connectionAttempt) {
+      return;
+    }
+
+    if (
+      socket &&
+      socket.readyState !== WebSocket.CLOSED &&
+      socket.readyState !== WebSocket.CLOSING
+    ) {
+      socket.close(1000, "connection_cancelled");
+    }
+
+    throw new CifraRealtimeError(
+      "realtime_connection_cancelled",
+    );
   }
 
   private setStatus(
