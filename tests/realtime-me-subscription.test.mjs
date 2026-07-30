@@ -4,10 +4,7 @@ import test from "node:test";
 import ts from "typescript";
 
 async function loadRealtimeModule() {
-  const source = await readFile(
-    new URL("../app/cifra-realtime.ts", import.meta.url),
-    "utf8",
-  );
+  const source = await readFile(new URL("../app/cifra-realtime.ts", import.meta.url), "utf8");
   const output = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.ES2022,
@@ -15,9 +12,7 @@ async function loadRealtimeModule() {
     },
   }).outputText;
 
-  return import(
-    `data:text/javascript;base64,${Buffer.from(output).toString("base64")}`
-  );
+  return import(`data:text/javascript;base64,${Buffer.from(output).toString("base64")}`);
 }
 
 class FakeWebSocket {
@@ -77,50 +72,12 @@ class FakeWebSocket {
       return;
     }
 
-    if (packet.sub?.topic === "me") {
-      // The metadata intentionally arrives before ctrl. The client must not lose it.
-      this.reply({
-        meta: {
-          id: packet.sub.id,
-          topic: "me",
-          sub: [
-            {
-              topic: "usrZyXwVuTsR10",
-              updated: "2026-07-30T18:00:00.000Z",
-              touched: "2026-07-30T18:05:00.000Z",
-              seq: 12,
-              read: 10,
-              recv: 11,
-              online: true,
-              acs: {
-                want: "JRWPA",
-                given: "JRWPA",
-                mode: "JRWPA",
-              },
-              public: { fn: "Иван Иванов" },
-              private: { archived: false },
-            },
-            {
-              topic: "grpAbCdEfGhI12",
-              seq: 4,
-              read: 4,
-              recv: 4,
-              public: { fn: "Проектная группа" },
-            },
-            {
-              topic: "me",
-            },
-            {
-              topic: "invalid topic",
-            },
-          ],
-        },
-      });
+    if (packet.sub) {
       this.reply({
         ctrl: {
           id: packet.sub.id,
           code: 200,
-          params: { topic: "me" },
+          params: { topic: packet.sub.topic },
         },
       });
     }
@@ -144,7 +101,7 @@ class FakeWebSocket {
   }
 }
 
-test("captures real chat topic ids from meta.sub on the me topic", async () => {
+test("subscribes to the authenticated user's me topic before reporting connected", async () => {
   const originalFetch = globalThis.fetch;
   const originalWebSocket = globalThis.WebSocket;
 
@@ -168,78 +125,37 @@ test("captures real chat topic ids from meta.sub on the me topic", async () => {
 
   try {
     const { CifraRealtimeClient } = await loadRealtimeModule();
-    const snapshots = [];
-    const client = new CifraRealtimeClient(
-      () => undefined,
-      (subscriptions) => snapshots.push(structuredClone(subscriptions)),
-    );
+    const statuses = [];
+    const client = new CifraRealtimeClient((status) => statuses.push(status));
 
-    await client.connect({
+    const userId = await client.connect({
       apiBaseUrl: "https://gateway.example.test",
       accessToken: "access-token",
       deviceId: "device-id",
     });
 
-    assert.deepEqual(client.getChatTopicIds(), [
-      "usrZyXwVuTsR10",
-      "grpAbCdEfGhI12",
+    assert.equal(userId, "usrAbCdEfGhI12");
+    assert.equal(client.getStatus(), "connected");
+    assert.equal(client.isTopicSubscribed("me"), true);
+    assert.deepEqual(client.getSubscribedTopics(), ["me"]);
+    assert.deepEqual(statuses, ["connecting", "connected"]);
+
+    const socket = client.socket;
+    assert.deepEqual(socket.sent.map((packet) => Object.keys(packet)[0]), [
+      "hi",
+      "login",
+      "sub",
     ]);
-    assert.deepEqual(client.getChatSubscriptions(), [
-      {
-        topic: "usrZyXwVuTsR10",
-        updatedAt: "2026-07-30T18:00:00.000Z",
-        touchedAt: "2026-07-30T18:05:00.000Z",
-        seq: 12,
-        read: 10,
-        recv: 11,
-        online: true,
-        access: {
-          want: "JRWPA",
-          given: "JRWPA",
-          mode: "JRWPA",
-        },
-        public: { fn: "Иван Иванов" },
-        private: { archived: false },
-      },
-      {
-        topic: "grpAbCdEfGhI12",
-        seq: 4,
-        read: 4,
-        recv: 4,
-        public: { fn: "Проектная группа" },
-      },
-    ]);
-    assert.equal(snapshots.length, 1);
+    assert.deepEqual(socket.sent[2].sub, {
+      id: socket.sent[2].sub.id,
+      topic: "me",
+      get: { what: "desc sub" },
+    });
 
     client.disconnect();
-    assert.deepEqual(client.getChatTopicIds(), []);
-    assert.deepEqual(snapshots.at(-1), []);
+    assert.equal(client.isTopicSubscribed("me"), false);
   } finally {
     globalThis.fetch = originalFetch;
     globalThis.WebSocket = originalWebSocket;
   }
-});
-
-test("parses only valid Tinode chat subscriptions", async () => {
-  const { parseTinodeChatSubscriptions } = await loadRealtimeModule();
-
-  assert.equal(parseTinodeChatSubscriptions("not-json"), null);
-  assert.equal(
-    parseTinodeChatSubscriptions(JSON.stringify({ ctrl: { code: 200 } })),
-    null,
-  );
-  assert.deepEqual(
-    parseTinodeChatSubscriptions(
-      JSON.stringify({
-        meta: {
-          topic: "me",
-          sub: [
-            { topic: "chnAbCdEfGhI12", seq: 0 },
-            { topic: "fnd" },
-          ],
-        },
-      }),
-    ),
-    [{ topic: "chnAbCdEfGhI12", seq: 0 }],
-  );
 });
