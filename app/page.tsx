@@ -93,6 +93,7 @@ import {
   CifraRealtimeClient,
   CifraRealtimeError,
   type RealtimeChatMessage,
+  type RealtimeChatReceipt,
   type RealtimeChatSubscription,
   type RealtimeStatus,
 } from "./cifra-realtime";
@@ -908,6 +909,22 @@ const getRealtimeMessageText = (content: unknown) => {
   return undefined;
 };
 
+const getRealtimeReceiptSeq = (
+  receipts: readonly RealtimeChatReceipt[],
+  topic: string,
+  what: "recv" | "read",
+  selfUserId: string,
+) =>
+  receipts.reduce(
+    (highest, receipt) =>
+      receipt.topic === topic &&
+      receipt.what === what &&
+      receipt.from !== selfUserId
+        ? Math.max(highest, receipt.seq)
+        : highest,
+    0,
+  );
+
 const buildRealtimeUiMessage = (
   message: RealtimeChatMessage,
   selfUserId: string,
@@ -924,6 +941,40 @@ const buildRealtimeUiMessage = (
     time: formatRealtimeTimestamp(message.timestamp) || formatMessageTime(),
     ...(outgoing ? { deliveryStatus: "sent" as const } : {}),
     ...(!outgoing && message.from ? { author: message.from } : {}),
+  };
+};
+
+const withRealtimeReceiptStatus = (
+  projected: Message | null,
+  message: RealtimeChatMessage,
+  selfUserId: string,
+  receipts: readonly RealtimeChatReceipt[],
+): Message | null => {
+  if (!projected || projected.side !== "out") {
+    return projected;
+  }
+
+  const remoteReadSeq = getRealtimeReceiptSeq(
+    receipts,
+    message.topic,
+    "read",
+    selfUserId,
+  );
+  const remoteReceivedSeq = getRealtimeReceiptSeq(
+    receipts,
+    message.topic,
+    "recv",
+    selfUserId,
+  );
+
+  return {
+    ...projected,
+    deliveryStatus:
+      message.seq <= remoteReadSeq
+        ? "read"
+        : message.seq <= remoteReceivedSeq
+          ? "delivered"
+          : "sent",
   };
 };
 
@@ -6050,6 +6101,9 @@ export default function Home() {
   const [realtimeMessages, setRealtimeMessages] = useState<
     readonly RealtimeChatMessage[]
   >([]);
+  const [realtimeReceipts, setRealtimeReceipts] = useState<
+    readonly RealtimeChatReceipt[]
+  >([]);
   const [realtimeUserId, setRealtimeUserId] = useState<string | null>(null);
   const [realtimeObservedTopic, setRealtimeObservedTopic] = useState<
     string | null
@@ -6143,6 +6197,7 @@ export default function Home() {
       setRealtimeStatus("disconnected");
       setRealtimeSubscriptions([]);
       setRealtimeMessages([]);
+      setRealtimeReceipts([]);
       setRealtimeUserId(null);
       setRealtimeObservedTopic(null);
       setRealtimeChatStatus("idle");
@@ -6163,6 +6218,9 @@ export default function Home() {
       },
       (messages) => {
         setRealtimeMessages([...messages]);
+      },
+      (receipts) => {
+        setRealtimeReceipts([...receipts]);
       },
     );
 
@@ -6299,7 +6357,14 @@ export default function Home() {
 
     const projectedMessages = realtimeMessages
       .filter((message) => message.topic === activeTopic)
-      .map((message) => buildRealtimeUiMessage(message, realtimeUserId))
+      .map((message) =>
+        withRealtimeReceiptStatus(
+          buildRealtimeUiMessage(message, realtimeUserId),
+          message,
+          realtimeUserId,
+          realtimeReceipts,
+        ),
+      )
       .filter((message): message is Message => Boolean(message));
     const latestMessage = projectedMessages.at(-1);
     const title = getRealtimeChatTitle(subscription);
@@ -6360,10 +6425,74 @@ export default function Home() {
     realtimeChatStatus,
     realtimeMessages,
     realtimeObservedTopic,
+    realtimeReceipts,
     realtimeSubscriptions,
     realtimeUserId,
     sessionActive,
   ]);
+  useEffect(() => {
+    const realtimeClient = realtimeClientRef.current;
+    const topic = realtimeObservedTopic;
+    const userId = realtimeUserId;
+
+    if (
+      !sessionActive ||
+      realtimeStatus !== "connected" ||
+      realtimeChatStatus !== "subscribed" ||
+      !realtimeClient ||
+      !topic ||
+      !userId ||
+      selectedChatId !== topic
+    ) {
+      return;
+    }
+
+    const markLatestIncomingAsRead = () => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
+
+      const latestIncomingSeq = realtimeMessages.reduce(
+        (highest, message) =>
+          message.topic === topic &&
+          message.from &&
+          message.from !== userId
+            ? Math.max(highest, message.seq)
+            : highest,
+        0,
+      );
+
+      if (latestIncomingSeq > 0) {
+        try {
+          realtimeClient.markRead(topic, latestIncomingSeq);
+        } catch {
+          // Connection cleanup may race with a visibility change.
+        }
+      }
+    };
+
+    markLatestIncomingAsRead();
+    document.addEventListener(
+      "visibilitychange",
+      markLatestIncomingAsRead,
+    );
+
+    return () => {
+      document.removeEventListener(
+        "visibilitychange",
+        markLatestIncomingAsRead,
+      );
+    };
+  }, [
+    realtimeChatStatus,
+    realtimeMessages,
+    realtimeObservedTopic,
+    realtimeStatus,
+    realtimeUserId,
+    selectedChatId,
+    sessionActive,
+  ]);
+
   useEffect(() => {
     let frameId: number | undefined;
     try {
@@ -6705,6 +6834,7 @@ export default function Home() {
   setRealtimeStatus("disconnected");
   setRealtimeSubscriptions([]);
   setRealtimeMessages([]);
+  setRealtimeReceipts([]);
   setRealtimeUserId(null);
   setRealtimeObservedTopic(null);
   setRealtimeChatStatus("idle");
@@ -7136,6 +7266,27 @@ export default function Home() {
       }
       data-realtime-publish-status={realtimePublishStatus}
       data-realtime-published-seq={realtimePublishedSeq ?? ""}
+      data-realtime-receipt-count={realtimeReceipts.length}
+      data-realtime-remote-recv-seq={
+        realtimeObservedTopic && realtimeUserId
+          ? getRealtimeReceiptSeq(
+              realtimeReceipts,
+              realtimeObservedTopic,
+              "recv",
+              realtimeUserId,
+            )
+          : 0
+      }
+      data-realtime-remote-read-seq={
+        realtimeObservedTopic && realtimeUserId
+          ? getRealtimeReceiptSeq(
+              realtimeReceipts,
+              realtimeObservedTopic,
+              "read",
+              realtimeUserId,
+            )
+          : 0
+      }
       data-realtime-ui-topic={realtimeUiTopicRef.current ?? ""}
       data-realtime-ui-message-count={
         realtimeUiTopicRef.current
