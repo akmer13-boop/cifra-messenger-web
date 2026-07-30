@@ -52,6 +52,7 @@ export class CifraRealtimeClient {
   private status: RealtimeStatus = "disconnected";
   private connectPromise: Promise<string> | null = null;
   private tinodeUserId: string | null = null;
+  private subscribedTopics = new Set<string>();
   private connectionAttempt = 0;
 
   constructor(
@@ -64,6 +65,14 @@ export class CifraRealtimeClient {
 
   getTinodeUserId(): string | null {
     return this.tinodeUserId;
+  }
+
+  getSubscribedTopics(): readonly string[] {
+    return Array.from(this.subscribedTopics);
+  }
+
+  isTopicSubscribed(topic: string): boolean {
+    return this.subscribedTopics.has(topic);
   }
 
   isConnected(): boolean {
@@ -101,6 +110,7 @@ export class CifraRealtimeClient {
 
     this.socket = null;
     this.tinodeUserId = null;
+    this.subscribedTopics.clear();
 
     if (
       socket &&
@@ -121,6 +131,7 @@ export class CifraRealtimeClient {
 
     this.socket = null;
     this.tinodeUserId = null;
+    this.subscribedTopics.clear();
 
     if (
       previousSocket &&
@@ -222,10 +233,37 @@ export class CifraRealtimeClient {
         );
       }
 
+      const meSubId = createPacketId("sub-me");
+      const meSubControlPromise = waitForControl(socket, meSubId);
+
+      socket.send(
+        JSON.stringify({
+          sub: {
+            id: meSubId,
+            topic: "me",
+            get: {
+              what: "desc sub",
+            },
+          },
+        }),
+      );
+
+      const meSubControl = await meSubControlPromise;
+      this.ensureActiveAttempt(attempt, socket);
+
+      if (meSubControl.code < 200 || meSubControl.code >= 300) {
+        throw new CifraRealtimeError(
+          "tinode_me_subscription_rejected",
+        );
+      }
+
+      this.subscribedTopics.add("me");
+
       socket.addEventListener("close", () => {
         if (this.socket === socket) {
           this.socket = null;
           this.tinodeUserId = null;
+          this.subscribedTopics.clear();
           this.setStatus("disconnected");
         }
       });
@@ -247,6 +285,7 @@ export class CifraRealtimeClient {
       if (this.socket === socket) {
         this.socket = null;
         this.tinodeUserId = null;
+        this.subscribedTopics.clear();
       }
 
       if (
