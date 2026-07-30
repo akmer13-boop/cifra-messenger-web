@@ -839,6 +839,94 @@ const formatMessageTime = () =>
     minute: "2-digit",
   }).format(new Date());
 
+const formatRealtimeTimestamp = (value?: string) => {
+  if (!value) return "";
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "";
+
+  return new Intl.DateTimeFormat("ru-RU", {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(timestamp));
+};
+
+const isRealtimeRecord = (
+  value: unknown,
+): value is Readonly<Record<string, unknown>> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+const readRealtimeLabel = (
+  source: Readonly<Record<string, unknown>> | undefined,
+  keys: readonly string[],
+) => {
+  if (!source) return undefined;
+
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return undefined;
+};
+
+const getRealtimeChatTitle = (
+  subscription: RealtimeChatSubscription,
+) =>
+  readRealtimeLabel(subscription.public, ["fn", "title", "name"]) ||
+  readRealtimeLabel(subscription.private, ["title", "name", "comment"]) ||
+  (subscription.topic.startsWith("grp")
+    ? "Групповой чат Tinode"
+    : subscription.topic.startsWith("chn")
+      ? "Канал Tinode"
+      : "Личный чат Tinode");
+
+const getRealtimeAvatar = (title: string) => {
+  const initials = title
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toLocaleUpperCase("ru"))
+    .join("");
+
+  return initials || "RT";
+};
+
+const getRealtimeMessageText = (content: unknown) => {
+  if (typeof content === "string") {
+    return content.trim() || undefined;
+  }
+
+  if (isRealtimeRecord(content)) {
+    const text = content["txt"];
+    if (typeof text === "string" && text.trim()) {
+      return text.trim();
+    }
+  }
+
+  return undefined;
+};
+
+const buildRealtimeUiMessage = (
+  message: RealtimeChatMessage,
+  selfUserId: string,
+): Message | null => {
+  const text = getRealtimeMessageText(message.content);
+  if (!text) return null;
+
+  const outgoing = message.from === selfUserId;
+
+  return {
+    id: message.seq,
+    side: outgoing ? "out" : "in",
+    text,
+    time: formatRealtimeTimestamp(message.timestamp) || formatMessageTime(),
+    ...(outgoing ? { deliveryStatus: "sent" as const } : {}),
+    ...(!outgoing && message.from ? { author: message.from } : {}),
+  };
+};
+
 const getMessageSnippet = (message: Message) =>
   message.text?.trim() ||
   `Голосовое сообщение${message.voice ? ` · ${message.voice}` : ""}`;
@@ -5951,8 +6039,9 @@ export default function Home() {
   const [notificationUntil, setNotificationUntil] = useState<number | null>(
     null,
   );
-    const apiClientRef = useRef<CifraApiClient | null>(null);
+  const apiClientRef = useRef<CifraApiClient | null>(null);
   const realtimeClientRef = useRef<CifraRealtimeClient | null>(null);
+  const realtimeUiTopicRef = useRef<string | null>(null);
   const [realtimeStatus, setRealtimeStatus] =
     useState<RealtimeStatus>("disconnected");
   const [realtimeSubscriptions, setRealtimeSubscriptions] = useState<
@@ -5961,6 +6050,7 @@ export default function Home() {
   const [realtimeMessages, setRealtimeMessages] = useState<
     readonly RealtimeChatMessage[]
   >([]);
+  const [realtimeUserId, setRealtimeUserId] = useState<string | null>(null);
   const [realtimeObservedTopic, setRealtimeObservedTopic] = useState<
     string | null
   >(null);
@@ -6053,6 +6143,7 @@ export default function Home() {
       setRealtimeStatus("disconnected");
       setRealtimeSubscriptions([]);
       setRealtimeMessages([]);
+      setRealtimeUserId(null);
       setRealtimeObservedTopic(null);
       setRealtimeChatStatus("idle");
       setRealtimePublishStatus("idle");
@@ -6063,6 +6154,9 @@ export default function Home() {
     const realtimeClient = new CifraRealtimeClient(
       (status) => {
         setRealtimeStatus(status);
+        if (status !== "connected") {
+          setRealtimeUserId(null);
+        }
       },
       (subscriptions) => {
         setRealtimeSubscriptions([...subscriptions]);
@@ -6083,26 +6177,29 @@ export default function Home() {
         accessToken: authSession.tokens.access_token,
         deviceId: apiClient.currentDeviceId,
       })
-      .then(() => {
+      .then((userId) => {
         if (cancelled) {
           realtimeClient.disconnect();
+          return;
         }
+
+        setRealtimeUserId(userId);
       })
-.catch((error: unknown) => {
-  if (cancelled) {
-    return;
-  }
+      .catch((error: unknown) => {
+        if (cancelled) {
+          return;
+        }
 
-  if (
-    error instanceof CifraRealtimeError &&
-    error.code === "realtime_connection_cancelled"
-  ) {
-    setRealtimeStatus("disconnected");
-    return;
-  }
+        if (
+          error instanceof CifraRealtimeError &&
+          error.code === "realtime_connection_cancelled"
+        ) {
+          setRealtimeStatus("disconnected");
+          return;
+        }
 
-  setRealtimeStatus("error");
-});
+        setRealtimeStatus("error");
+      });
 
     return () => {
       cancelled = true;
@@ -6167,6 +6264,106 @@ export default function Home() {
       cancelled = true;
     };
   }, [realtimeStatus, realtimeSubscriptions, sessionActive]);
+  useEffect(() => {
+    const previousTopic = realtimeUiTopicRef.current;
+    const activeTopic =
+      sessionActive &&
+      realtimeChatStatus === "subscribed" &&
+      realtimeObservedTopic &&
+      realtimeUserId
+        ? realtimeObservedTopic
+        : null;
+
+    if (!activeTopic || !realtimeUserId) {
+      if (previousTopic) {
+        setChatItems((current) =>
+          current.filter((chat) => chat.id !== previousTopic),
+        );
+        setSelectedChatId((current) =>
+          current === previousTopic ? null : current,
+        );
+        setMessagesByChat((current) => {
+          const next = { ...current };
+          delete next[previousTopic];
+          return next;
+        });
+        realtimeUiTopicRef.current = null;
+      }
+      return;
+    }
+
+    const subscription = realtimeSubscriptions.find(
+      (candidate) => candidate.topic === activeTopic,
+    );
+    if (!subscription) return;
+
+    const projectedMessages = realtimeMessages
+      .filter((message) => message.topic === activeTopic)
+      .map((message) => buildRealtimeUiMessage(message, realtimeUserId))
+      .filter((message): message is Message => Boolean(message));
+    const latestMessage = projectedMessages.at(-1);
+    const title = getRealtimeChatTitle(subscription);
+    const realtimeChat: Chat = {
+      id: activeTopic,
+      title,
+      subtitle: latestMessage
+        ? getMessageSnippet(latestMessage)
+        : "Реальный чат Tinode",
+      time:
+        latestMessage?.time ||
+        formatRealtimeTimestamp(
+          subscription.touchedAt || subscription.updatedAt,
+        ),
+      unread: 0,
+      avatar: getRealtimeAvatar(title),
+      gradient: "linear-gradient(145deg, #0f766e, #2563eb)",
+      kind:
+        activeTopic.startsWith("grp") || activeTopic.startsWith("chn")
+          ? "group"
+          : "work",
+      lastActivityOrder:
+        1_000_000 +
+        (latestMessage?.id || subscription.seq || 0),
+      ...(latestMessage
+        ? {
+            lastMessageId: latestMessage.id,
+            lastMessageSide: latestMessage.side,
+            ...(latestMessage.deliveryStatus
+              ? { lastDeliveryStatus: latestMessage.deliveryStatus }
+              : {}),
+          }
+        : {}),
+      ...(typeof subscription.online === "boolean"
+        ? { online: subscription.online }
+        : {}),
+    };
+
+    setMessagesByChat((current) => ({
+      ...current,
+      [activeTopic]: projectedMessages,
+    }));
+    setChatItems((current) => {
+      const withoutRealtimeTopics = current.filter(
+        (chat) =>
+          chat.id !== activeTopic &&
+          (!previousTopic || chat.id !== previousTopic),
+      );
+      return [realtimeChat, ...withoutRealtimeTopics];
+    });
+    if (previousTopic && previousTopic !== activeTopic) {
+      setSelectedChatId((current) =>
+        current === previousTopic ? activeTopic : current,
+      );
+    }
+    realtimeUiTopicRef.current = activeTopic;
+  }, [
+    realtimeChatStatus,
+    realtimeMessages,
+    realtimeObservedTopic,
+    realtimeSubscriptions,
+    realtimeUserId,
+    sessionActive,
+  ]);
   useEffect(() => {
     let frameId: number | undefined;
     try {
@@ -6508,6 +6705,7 @@ export default function Home() {
   setRealtimeStatus("disconnected");
   setRealtimeSubscriptions([]);
   setRealtimeMessages([]);
+  setRealtimeUserId(null);
   setRealtimeObservedTopic(null);
   setRealtimeChatStatus("idle");
   setRealtimePublishStatus("idle");
@@ -6938,6 +7136,12 @@ export default function Home() {
       }
       data-realtime-publish-status={realtimePublishStatus}
       data-realtime-published-seq={realtimePublishedSeq ?? ""}
+      data-realtime-ui-topic={realtimeUiTopicRef.current ?? ""}
+      data-realtime-ui-message-count={
+        realtimeUiTopicRef.current
+          ? (messagesByChat[realtimeUiTopicRef.current]?.length ?? 0)
+          : 0
+      }
     >
       <div className="device-stage">
         <div className="device-glow" />
