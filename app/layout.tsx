@@ -2,10 +2,10 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "CIFRA Messenger — iOS Web Prototype",
+  title: "CIFRA Messenger",
   applicationName: "CIFRA",
   description:
-    "Кликабельный мобильный прототип корпоративного мессенджера CIFRA.",
+    "Корпоративный веб-мессенджер CIFRA для компьютеров и мобильных устройств.",
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",

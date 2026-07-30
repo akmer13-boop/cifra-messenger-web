@@ -1,0 +1,6 @@
+{
+  "mode": "demo",
+  "apiBaseUrl": "",
+  "requestTimeoutMs": 15000,
+  "demoMfaCode": "111111"
+}

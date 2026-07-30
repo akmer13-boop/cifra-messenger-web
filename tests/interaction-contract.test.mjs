@@ -117,7 +117,10 @@ test("messages are scoped to the selected chat", async () => {
     source,
     /const \[messagesByChat, setMessagesByChat\][\s\S]*initialMessagesByChat/,
   );
-  assert.match(source, /const sendMessage = \(chatId: string, text: string\)/);
+  assert.match(
+    source,
+    /const sendMessage = \(\s*chatId: string,\s*text: string,\s*options: SendMessageOptions/,
+  );
   assert.match(source, /\[chatId\]: \[[\s\S]*current\[chatId\]/);
   assert.match(source, /const clearMessages = \(chatId: string\)/);
   assert.doesNotMatch(source, /useState<Message\[]>\(initialMessages\)/);
@@ -174,8 +177,8 @@ test("admin form validates identity fields before saving", async () => {
 
   assert.match(source, /const normalizedDraft: MessengerUser/);
   assert.match(source, /const canSave =/);
-  assert.match(source, /disabled=\{!canSave\}/);
-  assert.match(source, /onSave\(normalizedDraft\)/);
+  assert.match(source, /disabled=\{!canSave \|\| saving\}/);
+  assert.match(source, /await onSave\(normalizedDraft\)/);
 });
 
 test("hidden swipe actions stay outside keyboard navigation", async () => {

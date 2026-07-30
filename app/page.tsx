@@ -8,11 +8,15 @@ import {
   Bell,
   BellOff,
   Camera,
+  Check,
   CheckCheck,
   ChevronLeft,
   ChevronRight,
+  Copy,
   Eye,
+  EyeOff,
   FileText,
+  Forward,
   Image as ImageIcon,
   LockKeyhole,
   LogIn,
@@ -30,6 +34,7 @@ import {
   Pin,
   Play,
   Plus,
+  Reply,
   Search,
   Send,
   Settings2,
@@ -49,6 +54,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -58,6 +64,31 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
+  hydrateChatsWithMessages,
+  sortChatsByActivity,
+  withLatestDeliveryStatus,
+  withLatestMessage,
+} from "./chat-list-policy.mjs";
+import {
+  canAuditChats,
+  canManageUsers,
+  primaryRole,
+  roleDisplayName,
+  roleShortName,
+  wireRole,
+} from "./auth-policy.mjs";
+import {
+  CifraApiClient,
+  CifraApiError,
+  loadRuntimeConfig,
+  type AuthSession,
+  type BackendUser,
+  type CorporateRole,
+  type LoginOutcome,
+  type RuntimeMode,
+  type UserRole,
+} from "./cifra-api";
+import {
   clampSwipeOffset,
   getSwipeActionState,
   snapSwipeOffset,
@@ -65,8 +96,7 @@ import {
 
 type Tab = "chats" | "teams" | "calls" | "profile";
 type Filter = string;
-type Theme = "navy" | "black" | "sage" | "gray";
-type UserRole = "admin" | "employee";
+type Theme = "navy" | "black" | "sage" | "gray" | "sunset";
 type ChatPanel =
   | "attachments"
   | "emoji"
@@ -82,6 +112,26 @@ type EmojiCategory = "Недавние" | "Люди" | "Работа" | "Сим�
 type MediaCategory = "Фото и видео" | "Файлы";
 type ProfilePanel = "notifications" | "storage" | "theme" | null;
 type NotificationMode = "on" | "off" | "hour";
+type MessageDeliveryStatus = "sent" | "delivered" | "read";
+type IncomingMessageDetail = {
+  chatId: string;
+  id?: number;
+  text?: string;
+  voice?: string;
+  author?: string;
+  time?: string;
+  replyToId?: number;
+  forwardedFrom?: string;
+};
+type IncomingCallDetail = {
+  participantIds: string[];
+  missed?: boolean;
+};
+type SendMessageOptions = {
+  replyToId?: number;
+  forwardedFrom?: string;
+  voice?: string;
+};
 
 type Chat = {
   id: string;
@@ -92,6 +142,10 @@ type Chat = {
   avatar: string;
   gradient: string;
   kind: "work" | "personal" | "group";
+  lastActivityOrder: number;
+  lastMessageId?: number;
+  lastMessageSide?: "in" | "out";
+  lastDeliveryStatus?: MessageDeliveryStatus;
   online?: boolean;
   pinned?: boolean;
   muted?: boolean;
@@ -107,10 +161,27 @@ type Message = {
   time: string;
   voice?: string;
   author?: string;
+  deliveryStatus?: MessageDeliveryStatus;
+  replyToId?: number;
+  forwardedFrom?: string;
+  pinned?: boolean;
+  pinnedAt?: number;
+};
+
+type CallRecord = {
+  participantIds: string[];
+  name: string;
+  detail: string;
+  type: "in" | "out" | "missed";
+  avatar: string;
+  gradient: string;
 };
 
 type MessengerUser = {
   id: string;
+  backendId?: string;
+  backendVersion?: number;
+  backendRoles?: CorporateRole[];
   name: string;
   email: string;
   username: string;
@@ -175,15 +246,22 @@ const themeOptions: {
     description: "Нейтральный цвет · #999999",
     symbol: "●",
   },
+  {
+    id: "sunset",
+    title: "Закат CIFRA",
+    description: "Солнечный градиент",
+    symbol: "✦",
+  },
 ];
 
-const initialChats: Chat[] = [
+const initialChatSeeds: Chat[] = [
   {
     id: "product",
     title: "Команда продукта",
     subtitle: "Марк: Макеты готовы к просмотру",
     time: "15:42",
     unread: 4,
+    lastActivityOrder: 9,
     avatar: "CF",
     gradient: "linear-gradient(145deg, #102c52, #255d96)",
     kind: "group",
@@ -196,6 +274,7 @@ const initialChats: Chat[] = [
     subtitle: "Договорились, отправлю сегодня",
     time: "14:18",
     unread: 2,
+    lastActivityOrder: 8,
     avatar: "АС",
     gradient: "linear-gradient(145deg, #6366f1, #a78bfa)",
     kind: "work",
@@ -207,6 +286,7 @@ const initialChats: Chat[] = [
     subtitle: "🎙 Голосовое сообщение",
     time: "13:54",
     unread: 0,
+    lastActivityOrder: 7,
     avatar: "ИО",
     gradient: "linear-gradient(145deg, #0ea5e9, #67e8f9)",
     kind: "work",
@@ -217,6 +297,7 @@ const initialChats: Chat[] = [
     subtitle: "Наталья: Обновила компоненты",
     time: "12:06",
     unread: 7,
+    lastActivityOrder: 6,
     avatar: "UI",
     gradient: "linear-gradient(145deg, #e879f9, #fb7185)",
     kind: "group",
@@ -229,6 +310,7 @@ const initialChats: Chat[] = [
     subtitle: "Фотография",
     time: "Вчера",
     unread: 0,
+    lastActivityOrder: 5,
     avatar: "М",
     gradient: "linear-gradient(145deg, #f59e0b, #fb7185)",
     kind: "personal",
@@ -239,6 +321,7 @@ const initialChats: Chat[] = [
     subtitle: "Новый график на август",
     time: "Вс",
     unread: 0,
+    lastActivityOrder: 4,
     avatar: "HR",
     gradient: "linear-gradient(145deg, #164e75, #2563eb)",
     kind: "group",
@@ -251,6 +334,7 @@ const initialChats: Chat[] = [
     subtitle: "Вернусь с ответом после встречи",
     time: "Пт",
     unread: 0,
+    lastActivityOrder: 3,
     avatar: "АР",
     gradient: "linear-gradient(145deg, #1d4ed8, #60a5fa)",
     kind: "work",
@@ -263,6 +347,7 @@ const initialChats: Chat[] = [
     subtitle: "Отправила итоговый документ",
     time: "Чт",
     unread: 0,
+    lastActivityOrder: 2,
     avatar: "ЕБ",
     gradient: "linear-gradient(145deg, #7c3aed, #c084fc)",
     kind: "work",
@@ -275,6 +360,7 @@ const initialChats: Chat[] = [
     subtitle: "Спасибо, всё получил",
     time: "Ср",
     unread: 0,
+    lastActivityOrder: 1,
     avatar: "ДС",
     gradient: "linear-gradient(145deg, #075985, #38bdf8)",
     kind: "work",
@@ -297,12 +383,15 @@ const initialMessages: Message[] = [
     author: "Марк",
     text: "Посмотрите главный экран и переписку. Нужно понять, достаточно ли привычна логика.",
     time: "15:32",
+    pinned: true,
+    pinnedAt: 2,
   },
   {
     id: 3,
     side: "out",
     text: "Да, структура понятная. По ощущениям близко к Telegram, но визуально уже CIFRA.",
     time: "15:37",
+    deliveryStatus: "read",
   },
   {
     id: 4,
@@ -317,6 +406,8 @@ const initialMessages: Message[] = [
     author: "Марк",
     text: "Макеты готовы к просмотру",
     time: "15:42",
+    pinned: true,
+    pinnedAt: 5,
   },
 ];
 
@@ -335,6 +426,7 @@ const initialMessagesByChat: Record<string, Message[]> = {
       side: "out",
       text: "Хорошо, жду файл.",
       time: "14:18",
+      deliveryStatus: "read",
     },
   ],
   ilya: [
@@ -401,6 +493,11 @@ const initialMessagesByChat: Record<string, Message[]> = {
     },
   ],
 };
+
+const initialChats: Chat[] = hydrateChatsWithMessages(
+  initialChatSeeds,
+  initialMessagesByChat,
+);
 
 const initialUsers: MessengerUser[] = [
   {
@@ -585,7 +682,53 @@ const initialUsers: MessengerUser[] = [
   },
 ];
 
-const callHistory = [
+function backendUserToMessenger(
+  user: BackendUser,
+  currentUserId: string,
+): MessengerUser {
+  const name = `${user.first_name} ${user.last_name}`.trim();
+  const avatar = [user.first_name, user.last_name]
+    .map((part) => part.trim().charAt(0).toLocaleUpperCase("ru"))
+    .join("")
+    .slice(0, 2);
+  const colorIndex = Array.from(user.id).reduce(
+    (sum, character) => sum + character.charCodeAt(0),
+    0,
+  ) % 5;
+  const gradients = [
+    "linear-gradient(145deg, #102c52, #2d659d)",
+    "linear-gradient(145deg, #6366f1, #a78bfa)",
+    "linear-gradient(145deg, #0e7490, #38bdf8)",
+    "linear-gradient(145deg, #b453c6, #f472b6)",
+    "linear-gradient(145deg, #b45309, #fbbf24)",
+  ];
+  return {
+    id: user.id === currentUserId ? "self" : user.id,
+    backendId: user.id,
+    backendVersion: user.version,
+    backendRoles: user.roles,
+    name,
+    email: user.email ?? "",
+    username: user.login,
+    phone: user.phone ?? "",
+    avatar: avatar || "CF",
+    gradient: gradients[colorIndex] ?? gradients[0],
+    role: primaryRole(user.roles) as UserRole,
+    online: user.status === "active",
+    position:
+      user.job_title ??
+      user.department ??
+      roleDisplayName(primaryRole(user.roles)),
+  };
+}
+
+function corporateRolesFor(role: UserRole): CorporateRole[] {
+  return role === "employee"
+    ? ["employee"]
+    : ["employee", wireRole(role) as CorporateRole];
+}
+
+const initialCallHistory: CallRecord[] = [
   {
     participantIds: ["anna"],
     name: "Анна Смирнова",
@@ -669,6 +812,92 @@ const formatParticipantCount = (count: number) => {
           ? "участника"
           : "участников";
   return `${count} ${word}`;
+};
+
+const formatMessageTime = () =>
+  new Intl.DateTimeFormat("ru-RU", {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date());
+
+const getMessageSnippet = (message: Message) =>
+  message.text?.trim() ||
+  `Голосовое сообщение${message.voice ? ` · ${message.voice}` : ""}`;
+
+const haveSameParticipants = (first: string[], second: string[]) => {
+  const firstIds = new Set(first.filter((id) => id !== "self"));
+  const secondIds = new Set(second.filter((id) => id !== "self"));
+  return (
+    firstIds.size === secondIds.size &&
+    [...firstIds].every((id) => secondIds.has(id))
+  );
+};
+
+const buildCallRecord = (
+  participantIds: string[],
+  type: CallRecord["type"],
+  users: MessengerUser[],
+  chats: Chat[],
+): CallRecord | null => {
+  const ids = Array.from(
+    new Set(participantIds.filter((id) => id && id !== "self")),
+  );
+  if (!ids.length) return null;
+
+  const people = ids
+    .map((id) => users.find((user) => user.id === id))
+    .filter((user): user is MessengerUser => Boolean(user));
+  const matchingGroup = chats.find(
+    (chat) =>
+      chat.kind === "group" &&
+      haveSameParticipants(chat.memberIds ?? [], ids),
+  );
+  const directPerson = people.length === 1 ? people[0] : undefined;
+  const firstNames = people.map((person) => person.name.split(" ")[0]);
+  const name = matchingGroup
+    ? matchingGroup.title
+    : directPerson
+      ? directPerson.name
+      : firstNames.length <= 2
+        ? firstNames.join(", ")
+        : `${firstNames.slice(0, 2).join(", ")} и ещё ${firstNames.length - 2}`;
+  const avatar =
+    matchingGroup?.avatar ??
+    directPerson?.avatar ??
+    people
+      .slice(0, 2)
+      .map((person) => person.name[0]?.toLocaleUpperCase("ru"))
+      .join("") ??
+    "CF";
+  const gradient =
+    matchingGroup?.gradient ??
+    directPerson?.gradient ??
+    "linear-gradient(145deg, #1d4ed8, #7c3aed)";
+
+  return {
+    participantIds: ids,
+    name: name || "Групповой звонок",
+    detail: `Сегодня, ${formatMessageTime()}`,
+    type,
+    avatar: avatar || "CF",
+    gradient,
+  };
+};
+
+const isCallRecord = (value: unknown): value is CallRecord => {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<CallRecord>;
+  return (
+    Array.isArray(record.participantIds) &&
+    record.participantIds.every((id) => typeof id === "string") &&
+    typeof record.name === "string" &&
+    typeof record.detail === "string" &&
+    (record.type === "in" ||
+      record.type === "out" ||
+      record.type === "missed") &&
+    typeof record.avatar === "string" &&
+    typeof record.gradient === "string"
+  );
 };
 
 const emojiSets: Record<EmojiCategory, string[]> = {
@@ -888,19 +1117,385 @@ function ContentPreview({
   );
 }
 
-function SignedOutView({ onRestore }: { onRestore: () => void }) {
+function SignedOutView({
+  onCredentials,
+  onVerifyMfa,
+}: {
+  onCredentials: (login: string, password: string) => Promise<LoginOutcome>;
+  onVerifyMfa: (
+    login: string,
+    challengeToken: string,
+    code: string,
+  ) => Promise<void>;
+}) {
+  const [step, setStep] = useState<"credentials" | "mfa">("credentials");
+  const [login, setLogin] = useState("");
+  const [password, setPassword] = useState("");
+  const [passwordVisible, setPasswordVisible] = useState(false);
+  const [mfaCode, setMfaCode] = useState("");
+  const [challengeToken, setChallengeToken] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const canSubmitCredentials =
+    login.trim().length > 0 && password.length > 0 && !busy;
+  const canSubmitMfa = /^\d{6}$/.test(mfaCode) && !busy;
+
   return (
-    <section className="view signed-out-view" aria-label="Сеанс завершён">
-      <span className="signed-out-icon">
-        <LogOut size={28} />
-      </span>
-      <h1>Вы вышли</h1>
-      <p>Демо-сеанс CIFRA завершён. Данные прототипа сохранены.</p>
-      <button type="button" onClick={onRestore}>
-        <LogIn size={18} />
-        Вернуться в прототип
-      </button>
+    <section className="view signed-out-view" aria-label="Авторизация CIFRA">
+      <span className="auth-glow auth-glow-one" aria-hidden="true" />
+      <span className="auth-glow auth-glow-two" aria-hidden="true" />
+
+      <div className={`auth-card ${step === "mfa" ? "auth-card-mfa" : ""}`}>
+        <div className="auth-brand-lockup" aria-label="CIFRA Messenger">
+          <span className="auth-brand-mark">C</span>
+          <span>
+            <strong>CIFRA</strong>
+            {step === "credentials" ? (
+              <small>Корпоративный мессенджер</small>
+            ) : null}
+          </span>
+        </div>
+
+        {step === "credentials" ? (
+          <>
+            <div className="auth-heading">
+              <h1>Добро пожаловать</h1>
+            </div>
+
+            <form
+              className="auth-form"
+              onSubmit={async (event) => {
+                event.preventDefault();
+                if (!canSubmitCredentials) return;
+                setBusy(true);
+                setAuthError("");
+                try {
+                  const outcome = await onCredentials(login, password);
+                  if (outcome.kind === "mfa_required") {
+                    setChallengeToken(outcome.challengeToken);
+                    setPassword("");
+                    setMfaCode("");
+                    setStep("mfa");
+                  }
+                } catch (error) {
+                  setAuthError(authErrorMessage(error));
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            >
+              <label className="auth-field">
+                <span>Логин</span>
+                <span className="auth-input">
+                  <AtSign size={18} aria-hidden="true" />
+                  <input
+                    name="login"
+                    type="text"
+                    value={login}
+                    autoComplete="username"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    placeholder="Введите логин"
+                    onChange={(event) => {
+                      setLogin(event.target.value);
+                      setAuthError("");
+                    }}
+                    autoFocus
+                    disabled={busy}
+                    required
+                  />
+                </span>
+              </label>
+
+              <label className="auth-field">
+                <span>Пароль</span>
+                <span className="auth-input">
+                  <LockKeyhole size={18} aria-hidden="true" />
+                  <input
+                    name="password"
+                    type={passwordVisible ? "text" : "password"}
+                    value={password}
+                    autoComplete="current-password"
+                    placeholder="Введите пароль"
+                    onChange={(event) => {
+                      setPassword(event.target.value);
+                      setAuthError("");
+                    }}
+                    disabled={busy}
+                    required
+                  />
+                  <button
+                    type="button"
+                    className="auth-password-toggle"
+                    aria-label={
+                      passwordVisible ? "Скрыть пароль" : "Показать пароль"
+                    }
+                    aria-pressed={passwordVisible}
+                    onClick={() => setPasswordVisible((current) => !current)}
+                    disabled={busy}
+                  >
+                    {passwordVisible ? <EyeOff size={18} /> : <Eye size={18} />}
+                  </button>
+                </span>
+              </label>
+
+              {authError ? (
+                <p className="auth-error" role="alert">
+                  {authError}
+                </p>
+              ) : null}
+
+              <button
+                type="submit"
+                className="auth-submit"
+                disabled={!canSubmitCredentials}
+              >
+                <LogIn size={19} />
+                Войти
+              </button>
+            </form>
+          </>
+        ) : (
+          <>
+            <div className="auth-mfa-symbol" aria-hidden="true">
+              <ShieldCheck size={26} />
+            </div>
+            <div className="auth-heading auth-mfa-heading">
+              <h1>Подтвердите вход</h1>
+              <p>Введите шестизначный код двухфакторной авторизации</p>
+            </div>
+
+            <form
+              className="auth-form"
+              onSubmit={async (event) => {
+                event.preventDefault();
+                if (!canSubmitMfa) return;
+                setBusy(true);
+                setAuthError("");
+                try {
+                  await onVerifyMfa(login, challengeToken, mfaCode);
+                } catch (error) {
+                  setAuthError(authErrorMessage(error));
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            >
+              <label className="auth-field">
+                <span>Код подтверждения</span>
+                <span
+                  className={`auth-input auth-code-input ${
+                    authError ? "auth-input-error" : ""
+                  }`}
+                >
+                  <input
+                    name="mfa-code"
+                    type="text"
+                    value={mfaCode}
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    maxLength={6}
+                    autoComplete="one-time-code"
+                    aria-invalid={Boolean(authError)}
+                    placeholder="000000"
+                    onChange={(event) => {
+                      setMfaCode(
+                        event.target.value.replace(/\D/g, "").slice(0, 6),
+                      );
+                      setAuthError("");
+                    }}
+                    autoFocus
+                    disabled={busy}
+                    required
+                  />
+                </span>
+              </label>
+
+              {authError ? (
+                <p className="auth-error" role="alert">
+                  {authError}
+                </p>
+              ) : null}
+
+              <button
+                type="submit"
+                className="auth-submit"
+                disabled={!canSubmitMfa}
+              >
+                <ShieldCheck size={19} />
+                Подтвердить вход
+              </button>
+
+              <button
+                type="button"
+                className="auth-back"
+                onClick={() => {
+                  setMfaCode("");
+                  setChallengeToken("");
+                  setAuthError("");
+                  setStep("credentials");
+                }}
+                disabled={busy}
+              >
+                <ChevronLeft size={17} />
+                Вернуться к логину
+              </button>
+            </form>
+          </>
+        )}
+      </div>
     </section>
+  );
+}
+
+function authErrorMessage(error: unknown): string {
+  if (error instanceof CifraApiError) {
+    if (error.code === "STEP_UP_REQUIRED") {
+      return "Для операции требуется повторный вход с MFA.";
+    }
+    return error.requestId
+      ? `${error.message} · запрос ${error.requestId}`
+      : error.message;
+  }
+  return error instanceof Error
+    ? error.message
+    : "Не удалось выполнить вход";
+}
+
+function PasswordChangeOverlay({
+  login,
+  onChangePassword,
+}: {
+  login: string;
+  onChangePassword: (
+    currentPassword: string,
+    newPassword: string,
+  ) => Promise<void>;
+}) {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const canSubmit =
+    currentPassword.length > 0 &&
+    newPassword.length >= 12 &&
+    newPassword === confirmation &&
+    !busy;
+
+  return (
+    <div
+      className="password-change-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Обязательная смена временного пароля"
+    >
+      <div className="auth-card password-change-card">
+        <div className="auth-mfa-symbol" aria-hidden="true">
+          <LockKeyhole size={26} />
+        </div>
+        <div className="auth-heading auth-mfa-heading">
+          <h1>Смените временный пароль</h1>
+          <p>
+            Для учётной записи @{login} необходимо установить постоянный
+            пароль.
+          </p>
+        </div>
+        <form
+          className="auth-form"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            if (!canSubmit) return;
+            setBusy(true);
+            setError("");
+            try {
+              await onChangePassword(currentPassword, newPassword);
+            } catch (changeError) {
+              setError(authErrorMessage(changeError));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          <label className="auth-field">
+            <span>Текущий пароль</span>
+            <span className="auth-input">
+              <LockKeyhole size={18} aria-hidden="true" />
+              <input
+                type="password"
+                value={currentPassword}
+                autoComplete="current-password"
+                onChange={(event) => {
+                  setCurrentPassword(event.target.value);
+                  setError("");
+                }}
+                disabled={busy}
+                autoFocus
+                required
+              />
+            </span>
+          </label>
+          <label className="auth-field">
+            <span>Новый пароль · минимум 12 символов</span>
+            <span className="auth-input">
+              <LockKeyhole size={18} aria-hidden="true" />
+              <input
+                type="password"
+                value={newPassword}
+                autoComplete="new-password"
+                onChange={(event) => {
+                  setNewPassword(event.target.value);
+                  setError("");
+                }}
+                disabled={busy}
+                minLength={12}
+                required
+              />
+            </span>
+          </label>
+          <label className="auth-field">
+            <span>Повторите новый пароль</span>
+            <span
+              className={`auth-input ${
+                confirmation && confirmation !== newPassword
+                  ? "auth-input-error"
+                  : ""
+              }`}
+            >
+              <CheckCheck size={18} aria-hidden="true" />
+              <input
+                type="password"
+                value={confirmation}
+                autoComplete="new-password"
+                onChange={(event) => {
+                  setConfirmation(event.target.value);
+                  setError("");
+                }}
+                disabled={busy}
+                minLength={12}
+                required
+              />
+            </span>
+          </label>
+          {error ? (
+            <p className="auth-error" role="alert">
+              {error}
+            </p>
+          ) : null}
+          <button
+            type="submit"
+            className="auth-submit"
+            disabled={!canSubmit}
+          >
+            <ShieldCheck size={19} />
+            Сменить пароль
+          </button>
+          <p className="password-change-note">
+            После смены сервер отзовёт текущую сессию и вернёт вас ко входу.
+          </p>
+        </form>
+      </div>
+    </div>
   );
 }
 
@@ -942,6 +1537,14 @@ function SwipeableChatRow({
     showPin,
   } = getSwipeActionState(offset, rowWidth, pinEnabled);
   const actionsOpen = showMute || showPin;
+  const deliveryStatusLabel =
+    chat.lastMessageSide === "out" && chat.lastDeliveryStatus
+      ? chat.lastDeliveryStatus === "sent"
+        ? "Отправлено"
+        : chat.lastDeliveryStatus === "delivered"
+          ? "Доставлено"
+          : "Прочитано"
+      : null;
 
   const updateOffset = (value: number) => {
     currentOffset.current = value;
@@ -1092,7 +1695,7 @@ function SwipeableChatRow({
           }
           onOpen();
         }}
-        aria-label={`${chat.title}. ${chat.subtitle}. Проведите влево для уведомлений, удаления и архива${pinEnabled ? " или вправо для закрепления" : ""}`}
+        aria-label={`${chat.title}. ${chat.subtitle}.${deliveryStatusLabel ? ` ${deliveryStatusLabel}.` : ""} Проведите влево для уведомлений, удаления и архива${pinEnabled ? " или вправо для закрепления" : ""}`}
       >
         <Avatar
           label={chat.avatar}
@@ -1107,6 +1710,23 @@ function SwipeableChatRow({
           <span className="chat-preview-line">
             <small>{chat.subtitle}</small>
             <span className="chat-meta">
+              {deliveryStatusLabel ? (
+                <span
+                  className={`chat-delivery-status is-${chat.lastDeliveryStatus}`}
+                  aria-label={deliveryStatusLabel}
+                  title={deliveryStatusLabel}
+                >
+                  {chat.lastDeliveryStatus === "sent" ? (
+                    <Check size={15} strokeWidth={2.35} aria-hidden="true" />
+                  ) : (
+                    <CheckCheck
+                      size={15}
+                      strokeWidth={2.35}
+                      aria-hidden="true"
+                    />
+                  )}
+                </span>
+              ) : null}
               {chat.pinned ? <Pin size={13} /> : null}
               {chat.muted ? <BellOff size={13} /> : null}
               {chat.unread ? <i>{chat.unread}</i> : null}
@@ -1122,10 +1742,12 @@ function TabBar({
   active,
   onChange,
   notificationsEnabled,
+  unreadCount,
 }: {
   active: Tab;
   onChange: (tab: Tab) => void;
   notificationsEnabled: boolean;
+  unreadCount: number;
 }) {
   const items: {
     id: Tab;
@@ -1133,7 +1755,12 @@ function TabBar({
     icon: typeof MessageCircle;
     badge?: number;
   }[] = [
-    { id: "chats", label: "Чаты", icon: MessageCircle, badge: 13 },
+    {
+      id: "chats",
+      label: "Чаты",
+      icon: MessageCircle,
+      badge: unreadCount,
+    },
     { id: "teams", label: "Люди", icon: UsersRound },
     { id: "calls", label: "Звонки", icon: Phone },
     { id: "profile", label: "Профиль", icon: UserRound },
@@ -1141,6 +1768,9 @@ function TabBar({
 
   return (
     <nav className="tab-bar" aria-label="Основная навигация">
+      <span className="desktop-nav-brand" aria-label="CIFRA">
+        C
+      </span>
       {items.map((item) => {
         const Icon = item.icon;
         const selected = item.id === active;
@@ -1162,14 +1792,20 @@ function TabBar({
           </button>
         );
       })}
+      <span className="desktop-nav-version" aria-hidden="true">
+        WEB
+      </span>
     </nav>
   );
 }
 
 function ChatsView({
   chats,
+  users,
   role,
   onOpenChat,
+  onMessageUser,
+  onCallUser,
   onCompose,
   onToggleMute,
   onArchiveChat,
@@ -1178,8 +1814,11 @@ function ChatsView({
   onDeleteChat,
 }: {
   chats: Chat[];
+  users: MessengerUser[];
   role: UserRole;
   onOpenChat: (id: string) => void;
+  onMessageUser: (id: string) => void;
+  onCallUser: (id: string) => void;
   onCompose: () => void;
   onToggleMute: (id: string) => void;
   onArchiveChat: (id: string) => void;
@@ -1204,27 +1843,43 @@ function ChatsView({
     Record<string, string[]>
   >({});
   const activeFilter =
-    role !== "admin" && filter === "Удалённые" ? "Все" : filter;
+    !canAuditChats(role) && filter === "Удалённые" ? "Все" : filter;
 
   const isBuiltInCategory = (category: string) =>
     category === "Удалённые" ||
     defaultFilters.some((item) => item === category);
 
-  const availableCategories =
-    role === "admin" ? [...categories, "Удалённые"] : categories;
-  const archivedChats = chats.filter((chat) => chat.archived && !chat.deleted);
+  const availableCategories = canAuditChats(role)
+    ? [...categories, "Удалённые"]
+    : categories;
+  const archivedChats = sortChatsByActivity(
+    chats.filter((chat) => chat.archived && !chat.deleted),
+  );
   const pinnedCount = chats.filter(
     (chat) => chat.pinned && !chat.archived && !chat.deleted,
   ).length;
   const pendingDeleteChat = chats.find(
     (chat) => chat.id === pendingDeleteChatId,
   );
+  const normalizedQuery = query.trim().toLocaleLowerCase("ru");
+  const matchingUsers = useMemo(
+    () =>
+      normalizedQuery && activeFilter !== "Удалённые"
+        ? users.filter(
+            (user) =>
+              user.id !== "self" &&
+              `${user.name} ${user.username}`
+                .toLocaleLowerCase("ru")
+                .includes(normalizedQuery),
+          )
+        : [],
+    [activeFilter, normalizedQuery, users],
+  );
 
   const visibleChats = useMemo(() => {
-    const normalizedQuery = query.trim().toLocaleLowerCase("ru");
     const customChatIds = customCategoryChats[activeFilter] ?? [];
-    return chats
-      .filter((chat) => {
+    return sortChatsByActivity(
+      chats.filter((chat) => {
         const matchesQuery =
           !normalizedQuery ||
           `${chat.title} ${chat.subtitle}`
@@ -1232,7 +1887,7 @@ function ChatsView({
             .includes(normalizedQuery);
         const matchesFilter =
           activeFilter === "Удалённые"
-            ? role === "admin" && Boolean(chat.deleted)
+            ? canAuditChats(role) && Boolean(chat.deleted)
             : !chat.archived &&
               !chat.deleted &&
               (activeFilter === "Все" ||
@@ -1243,12 +1898,9 @@ function ChatsView({
                 (!isBuiltInCategory(activeFilter) &&
                   customChatIds.includes(chat.id)));
         return matchesQuery && matchesFilter;
-      })
-      .sort(
-        (first, second) =>
-          Number(Boolean(second.pinned)) - Number(Boolean(first.pinned)),
-      );
-  }, [activeFilter, chats, customCategoryChats, query, role]);
+      }),
+    );
+  }, [activeFilter, chats, customCategoryChats, normalizedQuery, role]);
 
   const addCategory = () => {
     const value = newCategory.trim().replace(/\s+/g, " ");
@@ -1443,6 +2095,48 @@ function ChatsView({
               </button>
             ) : null}
 
+            {query && matchingUsers.length ? (
+              <section
+                className="chat-people-results"
+                aria-label="Найденные сотрудники"
+              >
+                <span className="chat-results-heading">Сотрудники</span>
+                {matchingUsers.map((person) => (
+                  <div className="chat-search-person-row" key={person.id}>
+                    <Avatar
+                      label={person.avatar}
+                      gradient={person.gradient}
+                      imageUrl={person.avatarUrl}
+                      size="small"
+                      online={person.online}
+                    />
+                    <span className="chat-search-person-copy">
+                      <strong>{person.name}</strong>
+                      <small>{person.position}</small>
+                    </span>
+                    <span className="chat-search-person-actions">
+                      <button
+                        type="button"
+                        aria-label={`Написать: ${person.name}`}
+                        title="Написать"
+                        onClick={() => onMessageUser(person.id)}
+                      >
+                        <MessageCircle size={17} />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Позвонить: ${person.name}`}
+                        title="Позвонить"
+                        onClick={() => onCallUser(person.id)}
+                      >
+                        <Phone size={17} />
+                      </button>
+                    </span>
+                  </div>
+                ))}
+              </section>
+            ) : null}
+
             {pinLimitVisible ? (
               <div className="pin-limit-note" role="status">
                 <span className="pin-limit-icon">
@@ -1463,6 +2157,9 @@ function ChatsView({
             ) : null}
 
             <div className="chat-list">
+              {query && matchingUsers.length && visibleChats.length ? (
+                <span className="chat-results-heading">Чаты</span>
+              ) : null}
               {visibleChats.map((chat) =>
                 chat.deleted ? (
                   <button
@@ -1506,7 +2203,7 @@ function ChatsView({
                   />
                 ),
               )}
-              {!visibleChats.length ? (
+              {!visibleChats.length && !matchingUsers.length ? (
                 <div className="empty-state">
                   {activeFilter === "Удалённые" ? (
                     <Trash2 size={28} />
@@ -1707,6 +2404,7 @@ function ChatsView({
 
 function ChatView({
   chat,
+  chats,
   users,
   role,
   messages,
@@ -1719,13 +2417,16 @@ function ChatView({
   onUnarchive,
   onDelete,
   onAddParticipants,
+  onTogglePinnedMessage,
+  onForwardMessage,
 }: {
   chat: Chat;
+  chats: Chat[];
   users: MessengerUser[];
   role: UserRole;
   messages: Message[];
   onBack: () => void;
-  onSend: (text: string) => void;
+  onSend: (text: string, options?: SendMessageOptions) => void;
   onClear: () => void;
   onCall: () => void;
   onToggleMute: () => void;
@@ -1733,8 +2434,26 @@ function ChatView({
   onUnarchive: () => void;
   onDelete: () => void;
   onAddParticipants: (participantIds: string[]) => void;
+  onTogglePinnedMessage: (messageId: number) => void;
+  onForwardMessage: (messageId: number, targetChatId: string) => void;
 }) {
   const [draft, setDraft] = useState("");
+  const [replyingToMessageId, setReplyingToMessageId] = useState<
+    number | null
+  >(null);
+  const [contextMessageId, setContextMessageId] = useState<number | null>(
+    null,
+  );
+  const [forwardMessageId, setForwardMessageId] = useState<number | null>(
+    null,
+  );
+  const [forwardQuery, setForwardQuery] = useState("");
+  const [forwardFilter, setForwardFilter] = useState("Все");
+  const [messageSwipe, setMessageSwipe] = useState<{
+    id: number | null;
+    offset: number;
+  }>({ id: null, offset: 0 });
+  const [actionNotice, setActionNotice] = useState("");
   const [activePanel, setActivePanel] = useState<ChatPanel>(null);
   const [recording, setRecording] = useState(false);
   const [joinApproval, setJoinApproval] = useState(false);
@@ -1762,6 +2481,17 @@ function ChatView({
     "settings" | "profile"
   >("settings");
   const panelTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const longPressTimerRef = useRef<number | null>(null);
+  const actionNoticeTimerRef = useRef<number | null>(null);
+  const messageGestureRef = useRef<{
+    id: number;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    offset: number;
+    swiping: boolean;
+  } | null>(null);
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
   const cameraInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1795,6 +2525,27 @@ function ChatView({
     "media",
     "search",
   ];
+  const replyingToMessage = messages.find(
+    (message) => message.id === replyingToMessageId,
+  );
+  const contextMessage = messages.find(
+    (message) => message.id === contextMessageId,
+  );
+  const forwardMessage = messages.find(
+    (message) => message.id === forwardMessageId,
+  );
+
+  useEffect(
+    () => () => {
+      if (longPressTimerRef.current !== null) {
+        window.clearTimeout(longPressTimerRef.current);
+      }
+      if (actionNoticeTimerRef.current !== null) {
+        window.clearTimeout(actionNoticeTimerRef.current);
+      }
+    },
+    [],
+  );
 
   const openPanel = (panel: ActiveChatPanel, trigger: HTMLButtonElement) => {
     panelTriggerRef.current = trigger;
@@ -1822,12 +2573,35 @@ function ChatView({
     .trim()
     .toLocaleLowerCase("ru");
   const matchingMessages = messages.filter((message) =>
-    `${message.author ?? ""} ${message.text ?? ""} ${message.voice ?? ""}`
+    `${message.author ?? ""} ${message.forwardedFrom ?? ""} ${message.text ?? ""} ${message.voice ?? ""}`
       .toLocaleLowerCase("ru")
       .includes(normalizedMessageSearch),
   );
-  const pinnedMessages = messages.filter(
-    (message) => message.id === 2 || message.id === 5,
+  const pinnedMessages = messages
+    .filter((message) => message.pinned)
+    .sort(
+      (first, second) =>
+        (second.pinnedAt ?? second.id) - (first.pinnedAt ?? first.id),
+    );
+  const normalizedForwardQuery = forwardQuery
+    .trim()
+    .toLocaleLowerCase("ru");
+  const visibleForwardChats = sortChatsByActivity(
+    chats.filter((target) => {
+      if (target.deleted || target.archived) return false;
+      const matchesQuery =
+        !normalizedForwardQuery ||
+        `${target.title} ${target.subtitle}`
+          .toLocaleLowerCase("ru")
+          .includes(normalizedForwardQuery);
+      const matchesFilter =
+        forwardFilter === "Все" ||
+        (forwardFilter === "Рабочие" && target.kind === "work") ||
+        (forwardFilter === "Личные" && target.kind === "personal") ||
+        (forwardFilter === "Группы" && target.kind === "group") ||
+        (forwardFilter === "Непрочитанные" && target.unread > 0);
+      return matchesQuery && matchesFilter;
+    }),
   );
   const normalizedParticipantQuery = participantQuery
     .trim()
@@ -1850,6 +2624,131 @@ function ChatView({
     );
   };
 
+  const showActionNotice = (message: string) => {
+    setActionNotice(message);
+    if (actionNoticeTimerRef.current !== null) {
+      window.clearTimeout(actionNoticeTimerRef.current);
+    }
+    actionNoticeTimerRef.current = window.setTimeout(() => {
+      setActionNotice("");
+      actionNoticeTimerRef.current = null;
+    }, 1800);
+  };
+
+  const getMessageAuthorLabel = (message: Message) =>
+    message.side === "out"
+      ? "Вы"
+      : message.author || profileUser?.name || chat.title;
+
+  const clearLongPressTimer = () => {
+    if (longPressTimerRef.current === null) return;
+    window.clearTimeout(longPressTimerRef.current);
+    longPressTimerRef.current = null;
+  };
+
+  const openMessageContext = (messageId: number) => {
+    clearLongPressTimer();
+    messageGestureRef.current = null;
+    setMessageSwipe({ id: null, offset: 0 });
+    setContextMessageId(messageId);
+  };
+
+  const beginMessageGesture = (
+    event: ReactPointerEvent<HTMLDivElement>,
+    messageId: number,
+  ) => {
+    if (!event.isPrimary || event.button !== 0) return;
+    clearLongPressTimer();
+    messageGestureRef.current = {
+      id: messageId,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      offset: 0,
+      swiping: false,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    if (event.pointerType !== "mouse") {
+      longPressTimerRef.current = window.setTimeout(() => {
+        openMessageContext(messageId);
+      }, 520);
+    }
+  };
+
+  const moveMessageGesture = (
+    event: ReactPointerEvent<HTMLDivElement>,
+    messageId: number,
+  ) => {
+    const gesture = messageGestureRef.current;
+    if (!gesture || gesture.id !== messageId) return;
+
+    const deltaX = event.clientX - gesture.startX;
+    const deltaY = event.clientY - gesture.startY;
+    if (Math.abs(deltaX) > 8 || Math.abs(deltaY) > 8) {
+      clearLongPressTimer();
+    }
+    if (
+      !gesture.swiping &&
+      deltaX < -8 &&
+      Math.abs(deltaX) > Math.abs(deltaY)
+    ) {
+      gesture.swiping = true;
+    }
+    if (!gesture.swiping) return;
+
+    event.preventDefault();
+    gesture.offset = Math.max(-72, Math.min(0, deltaX));
+    setMessageSwipe({ id: messageId, offset: gesture.offset });
+  };
+
+  const finishMessageGesture = (
+    event: ReactPointerEvent<HTMLDivElement>,
+    messageId: number,
+    cancelled = false,
+  ) => {
+    clearLongPressTimer();
+    const gesture = messageGestureRef.current;
+    if (!gesture || gesture.id !== messageId) return;
+    const shouldReply = !cancelled && gesture.swiping && gesture.offset <= -42;
+    messageGestureRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setMessageSwipe({ id: null, offset: 0 });
+    if (shouldReply) {
+      setReplyingToMessageId(messageId);
+      window.requestAnimationFrame(() => composerInputRef.current?.focus());
+    }
+  };
+
+  const copyMessage = async (message: Message) => {
+    const content = getMessageSnippet(message);
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(content);
+      } else {
+        const temporaryInput = document.createElement("textarea");
+        temporaryInput.value = content;
+        temporaryInput.style.position = "fixed";
+        temporaryInput.style.opacity = "0";
+        document.body.append(temporaryInput);
+        temporaryInput.select();
+        document.execCommand("copy");
+        temporaryInput.remove();
+      }
+      showActionNotice("Сообщение скопировано");
+    } catch {
+      showActionNotice("Не удалось скопировать сообщение");
+    }
+    setContextMessageId(null);
+  };
+
+  const closeForwardPicker = () => {
+    setForwardMessageId(null);
+    setForwardQuery("");
+    setForwardFilter("Все");
+  };
+
   const confirmParticipants = () => {
     if (!selectedParticipantIds.length) return;
     onAddParticipants(selectedParticipantIds);
@@ -1862,14 +2761,22 @@ function ChatView({
   const submitMessage = () => {
     const value = draft.trim();
     if (!value) return;
-    onSend(value);
+    onSend(value, {
+      replyToId: replyingToMessage?.id,
+    });
     setDraft("");
+    setReplyingToMessageId(null);
+    window.requestAnimationFrame(() => composerInputRef.current?.focus());
   };
 
   const handleVoice = () => {
     if (recording) {
       setRecording(false);
-      onSend("🎙 Голосовое сообщение · 0:07");
+      onSend("", {
+        voice: "0:07",
+        replyToId: replyingToMessage?.id,
+      });
+      setReplyingToMessageId(null);
       return;
     }
     setRecording(true);
@@ -1887,13 +2794,19 @@ function ChatView({
         selectedFiles.length === 1
           ? `🖼️ ${selectedFiles[0].name}`
           : `🖼️ Медиафайлы · ${selectedFiles.length}`,
+        { replyToId: replyingToMessage?.id },
       );
     } else if (kind === "camera") {
-      onSend(`📷 ${selectedFiles[0].name}`);
+      onSend(`📷 ${selectedFiles[0].name}`, {
+        replyToId: replyingToMessage?.id,
+      });
     } else {
-      onSend(`📎 ${selectedFiles[0].name}`);
+      onSend(`📎 ${selectedFiles[0].name}`, {
+        replyToId: replyingToMessage?.id,
+      });
     }
 
+    setReplyingToMessageId(null);
     event.currentTarget.value = "";
   };
 
@@ -2009,69 +2922,174 @@ function ChatView({
           Сообщения защищены
         </div>
         <div className="message-stack">
-          {messages.map((message) => (
-            <div
-              className={`message-row message-${message.side}`}
-              key={message.id}
-              id={`message-${message.id}`}
-            >
+          {messages.map((message) => {
+            const repliedMessage = message.replyToId
+              ? messages.find((item) => item.id === message.replyToId)
+              : undefined;
+            const swipeOffset =
+              messageSwipe.id === message.id ? messageSwipe.offset : 0;
+
+            return (
               <div
-                className={`message-bubble ${
-                  message.voice ? "voice-bubble" : ""
+                className={`message-swipe-shell message-shell-${message.side} ${
+                  swipeOffset ? "is-swiping" : ""
                 }`}
+                key={message.id}
+                id={`message-${message.id}`}
               >
-                {message.author ? (
-                  <strong className="message-author">{message.author}</strong>
-                ) : null}
-                {message.voice ? (
-                  <div className="voice-content">
-                    <button
-                      type="button"
-                      className={
-                        playingVoiceId === message.id ? "is-playing" : ""
-                      }
-                      aria-label={
-                        playingVoiceId === message.id
-                          ? "Поставить голосовое на паузу"
-                          : "Воспроизвести голосовое"
-                      }
-                      aria-pressed={playingVoiceId === message.id}
-                      onClick={() =>
-                        setPlayingVoiceId((current) =>
-                          current === message.id ? null : message.id,
-                        )
-                      }
-                    >
-                      {playingVoiceId === message.id ? (
-                        <Pause size={13} fill="currentColor" />
-                      ) : (
-                        <Play size={13} fill="currentColor" />
-                      )}
-                    </button>
-                    <span className="waveform" aria-hidden="true">
-                      {Array.from({ length: 19 }).map((_, index) => (
-                        <i
-                          key={index}
-                          style={{
-                            height: `${8 + ((index * 7) % 19)}px`,
-                          }}
+                <span
+                  className="message-reply-indicator"
+                  aria-hidden="true"
+                  style={{
+                    opacity: Math.min(Math.abs(swipeOffset) / 42, 1),
+                    transform: `translateY(-50%) scale(${0.78 + Math.min(Math.abs(swipeOffset) / 72, 1) * 0.22})`,
+                  }}
+                >
+                  <Reply size={18} />
+                </span>
+                <div
+                  className={`message-row message-${message.side}`}
+                  style={{ transform: `translateX(${swipeOffset}px)` }}
+                  onPointerDown={(event) =>
+                    beginMessageGesture(event, message.id)
+                  }
+                  onPointerMove={(event) =>
+                    moveMessageGesture(event, message.id)
+                  }
+                  onPointerUp={(event) =>
+                    finishMessageGesture(event, message.id)
+                  }
+                  onPointerCancel={(event) =>
+                    finishMessageGesture(event, message.id, true)
+                  }
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    openMessageContext(message.id);
+                  }}
+                  aria-label="Свайпните влево, чтобы ответить"
+                >
+                  <div
+                    className={`message-bubble ${
+                      message.voice ? "voice-bubble" : ""
+                    }`}
+                  >
+                    {message.forwardedFrom ? (
+                      <span className="forwarded-message-label">
+                        <Forward size={13} />
+                        Переслано от {message.forwardedFrom}
+                      </span>
+                    ) : null}
+                    {repliedMessage ? (
+                      <button
+                        type="button"
+                        className="message-quote"
+                        onPointerDown={(event) => event.stopPropagation()}
+                        onClick={() => jumpToMessage(repliedMessage.id)}
+                        aria-label={`Перейти к сообщению: ${getMessageSnippet(repliedMessage)}`}
+                      >
+                        <i />
+                        <span>
+                          <strong>{getMessageAuthorLabel(repliedMessage)}</strong>
+                          <small>{getMessageSnippet(repliedMessage)}</small>
+                        </span>
+                      </button>
+                    ) : null}
+                    {message.author ? (
+                      <strong className="message-author">{message.author}</strong>
+                    ) : null}
+                    {message.voice ? (
+                      <div className="voice-content">
+                        <button
+                          type="button"
+                          className={
+                            playingVoiceId === message.id ? "is-playing" : ""
+                          }
+                          aria-label={
+                            playingVoiceId === message.id
+                              ? "Поставить голосовое на паузу"
+                              : "Воспроизвести голосовое"
+                          }
+                          aria-pressed={playingVoiceId === message.id}
+                          onPointerDown={(event) => event.stopPropagation()}
+                          onClick={() =>
+                            setPlayingVoiceId((current) =>
+                              current === message.id ? null : message.id,
+                            )
+                          }
+                        >
+                          {playingVoiceId === message.id ? (
+                            <Pause size={13} fill="currentColor" />
+                          ) : (
+                            <Play size={13} fill="currentColor" />
+                          )}
+                        </button>
+                        <span className="waveform" aria-hidden="true">
+                          {Array.from({ length: 19 }).map((_, index) => (
+                            <i
+                              key={index}
+                              style={{
+                                height: `${8 + ((index * 7) % 19)}px`,
+                              }}
+                            />
+                          ))}
+                        </span>
+                        <small>{message.voice}</small>
+                      </div>
+                    ) : (
+                      <span>{message.text}</span>
+                    )}
+                    <time>
+                      {message.time}
+                      {message.pinned ? (
+                        <Pin
+                          className="message-pinned-mark"
+                          size={11}
+                          aria-label="Закреплено"
                         />
-                      ))}
-                    </span>
-                    <small>{message.voice}</small>
+                      ) : null}
+                      {message.side === "out" && message.deliveryStatus ? (
+                        <span
+                          className={`message-delivery-status is-${message.deliveryStatus}`}
+                          role="img"
+                          aria-label={
+                            message.deliveryStatus === "sent"
+                              ? "Отправлено"
+                              : message.deliveryStatus === "delivered"
+                                ? "Доставлено"
+                                : "Прочитано"
+                          }
+                        >
+                          {message.deliveryStatus === "sent" ? (
+                            <Check
+                              size={14}
+                              strokeWidth={2.3}
+                              aria-hidden="true"
+                            />
+                          ) : (
+                            <CheckCheck
+                              size={14}
+                              strokeWidth={2.3}
+                              aria-hidden="true"
+                            />
+                          )}
+                        </span>
+                      ) : null}
+                    </time>
                   </div>
-                ) : (
-                  <span>{message.text}</span>
-                )}
-                <time>
-                  {message.time}
-                  {message.side === "out" ? (
-                    <CheckCheck size={14} strokeWidth={2.3} />
-                  ) : null}
-                </time>
+                </div>
+                <button
+                  type="button"
+                  className="message-actions-trigger"
+                  aria-label="Действия с сообщением"
+                  aria-expanded={contextMessageId === message.id}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onClick={() => openMessageContext(message.id)}
+                >
+                  <MoreHorizontal size={17} />
+                </button>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -2084,7 +3102,26 @@ function ChatView({
           </span>
         </div>
       ) : (
-      <div className={`composer-wrap ${recording ? "is-recording" : ""}`}>
+      <>
+        {replyingToMessage ? (
+          <div className="reply-selection" role="status">
+            <i />
+            <span>
+              <strong>
+                Ответ: {getMessageAuthorLabel(replyingToMessage)}
+              </strong>
+              <small>{getMessageSnippet(replyingToMessage)}</small>
+            </span>
+            <button
+              type="button"
+              aria-label="Отменить ответ"
+              onClick={() => setReplyingToMessageId(null)}
+            >
+              <X size={16} />
+            </button>
+          </div>
+        ) : null}
+        <div className={`composer-wrap ${recording ? "is-recording" : ""}`}>
         <input
           ref={galleryInputRef}
           hidden
@@ -2128,6 +3165,7 @@ function ChatView({
             </button>
             <div className="composer-input">
               <textarea
+                ref={composerInputRef}
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
                 placeholder="Сообщение"
@@ -2159,8 +3197,185 @@ function ChatView({
         >
           {draft ? <Send size={19} /> : <Mic size={20} />}
         </button>
-      </div>
+        </div>
+      </>
       )}
+
+      {actionNotice ? (
+        <div className="chat-action-toast" role="status">
+          {actionNotice}
+        </div>
+      ) : null}
+
+      {contextMessage ? (
+        <div
+          className="sheet-backdrop message-context-backdrop"
+          role="presentation"
+          onClick={() => setContextMessageId(null)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") setContextMessageId(null);
+          }}
+        >
+          <div
+            className="bottom-sheet message-context-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Действия с сообщением"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <span className="sheet-handle" />
+            <div className="message-context-preview">
+              <small>{getMessageAuthorLabel(contextMessage)}</small>
+              <strong>{getMessageSnippet(contextMessage)}</strong>
+            </div>
+            <div className="message-context-actions">
+              <button
+                type="button"
+                onClick={() => void copyMessage(contextMessage)}
+              >
+                <Copy size={20} />
+                <span>Скопировать</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onTogglePinnedMessage(contextMessage.id);
+                  setContextMessageId(null);
+                  showActionNotice(
+                    contextMessage.pinned
+                      ? "Сообщение откреплено"
+                      : "Сообщение закреплено",
+                  );
+                }}
+              >
+                <Pin size={20} />
+                <span>
+                  {contextMessage.pinned ? "Открепить" : "Закрепить"}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setContextMessageId(null);
+                  setForwardMessageId(contextMessage.id);
+                }}
+              >
+                <Forward size={20} />
+                <span>Переслать</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {forwardMessage ? (
+        <div
+          className="sheet-backdrop forward-picker-backdrop"
+          role="presentation"
+          onClick={closeForwardPicker}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") closeForwardPicker();
+          }}
+        >
+          <div
+            className="bottom-sheet forward-picker-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Переслать сообщение"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <span className="sheet-handle" />
+            <div className="sheet-title forward-picker-title">
+              <span>
+                <strong>Переслать</strong>
+                <small>Выберите чат</small>
+              </span>
+              <button
+                type="button"
+                aria-label="Закрыть пересылку"
+                onClick={closeForwardPicker}
+                autoFocus
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="forward-source-preview">
+              <Forward size={17} />
+              <span>
+                <small>Пересылаемое сообщение</small>
+                <strong>{getMessageSnippet(forwardMessage)}</strong>
+              </span>
+            </div>
+
+            <label className="search-field panel-search forward-search">
+              <Search size={18} />
+              <input
+                value={forwardQuery}
+                onChange={(event) => setForwardQuery(event.target.value)}
+                placeholder="Поиск чата"
+                aria-label="Поиск чата для пересылки"
+              />
+              {forwardQuery ? (
+                <button
+                  type="button"
+                  aria-label="Очистить поиск чатов"
+                  onClick={() => setForwardQuery("")}
+                >
+                  <X size={15} />
+                </button>
+              ) : null}
+            </label>
+
+            <div className="forward-filter-strip" aria-label="Фильтр чатов">
+              {defaultFilters.map((filter) => (
+                <button
+                  type="button"
+                  key={filter}
+                  className={forwardFilter === filter ? "is-active" : ""}
+                  aria-pressed={forwardFilter === filter}
+                  onClick={() => setForwardFilter(filter)}
+                >
+                  {filter}
+                </button>
+              ))}
+            </div>
+
+            <div className="forward-target-list">
+              {visibleForwardChats.map((target) => (
+                <button
+                  type="button"
+                  className="forward-target-row"
+                  key={target.id}
+                  aria-label={`Переслать в ${target.title}`}
+                  onClick={() => {
+                    const messageId = forwardMessage.id;
+                    closeForwardPicker();
+                    onForwardMessage(messageId, target.id);
+                  }}
+                >
+                  <Avatar
+                    label={target.avatar}
+                    gradient={target.gradient}
+                    online={target.online}
+                  />
+                  <span>
+                    <strong>{target.title}</strong>
+                    <small>{target.subtitle}</small>
+                  </span>
+                  <Forward size={18} />
+                </button>
+              ))}
+              {!visibleForwardChats.length ? (
+                <div className="panel-empty">
+                  <Search size={22} />
+                  <span>Чаты не найдены</span>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {activePanel ? (
         <div
@@ -2421,7 +3636,6 @@ function ChatView({
                               label={person.avatar}
                               gradient={person.gradient}
                               imageUrl={person.avatarUrl}
-                              online={person.online}
                             />
                             <span>
                               <strong>{person.name}</strong>
@@ -2569,7 +3783,7 @@ function ChatView({
                     <span className="tool-emoji">👥</span>
                     <strong>Участники</strong>
                   </button>
-                  {role === "admin" ? (
+                  {canAuditChats(role) ? (
                     <button
                       type="button"
                       onClick={() => {
@@ -2873,7 +4087,8 @@ function ChatView({
                           `Голосовое сообщение · ${message.voice}`}
                       </strong>
                       <small>
-                        {message.author ?? "Вы"} · сегодня, {message.time}
+                        {getMessageAuthorLabel(message)} · сегодня,{" "}
+                        {message.time}
                       </small>
                     </span>
                     <ChevronRight size={17} />
@@ -3023,8 +4238,12 @@ function TeamsView({
           <h1>Сотрудники</h1>
         </div>
         <span className={`access-chip access-chip-${role}`}>
-          {role === "admin" ? <ShieldCheck size={14} /> : <UserRound size={14} />}
-          {role === "admin" ? "Админ" : "Сотрудник"}
+          {role === "employee" ? (
+            <UserRound size={14} />
+          ) : (
+            <ShieldCheck size={14} />
+          )}
+          {roleShortName(role)}
         </span>
       </header>
 
@@ -3032,9 +4251,9 @@ function TeamsView({
         <button
           type="button"
           className="workspace-card"
-          disabled={role !== "admin"}
+          disabled={role === "employee"}
           aria-label={
-            role === "admin"
+            role !== "employee"
               ? `Открыть контакты организации CIFRA. ${users.length} контактов`
               : `Организация CIFRA. ${users.length} контактов`
           }
@@ -3046,7 +4265,7 @@ function TeamsView({
             <strong>CIFRA</strong>
             <span>{users.length} контактов · корпоративное пространство</span>
           </div>
-          {role === "admin" ? (
+          {role !== "employee" ? (
             <ChevronRight size={22} />
           ) : (
             <ShieldCheck size={22} />
@@ -3083,12 +4302,12 @@ function TeamsView({
               className="person-row"
               key={person.id}
               onClick={() =>
-                role === "admin"
+                role !== "employee"
                   ? onOpenUser(person.id)
                   : onMessage(person.id)
               }
               aria-label={
-                role === "admin"
+                role !== "employee"
                   ? `Открыть профиль: ${person.name}`
                   : `Написать: ${person.name}`
               }
@@ -3105,7 +4324,7 @@ function TeamsView({
                   {person.position} · {person.online ? "в сети" : "не в сети"}
                 </small>
               </span>
-              {role === "admin" ? (
+              {role !== "employee" ? (
                 <ChevronRight size={19} />
               ) : (
                 <MessageCircle size={19} />
@@ -3121,7 +4340,7 @@ function TeamsView({
         </div>
       </div>
 
-      {organizationOpen && role === "admin" ? (
+      {organizationOpen && role !== "employee" ? (
         <div
           className="sheet-backdrop"
           role="presentation"
@@ -3187,9 +4406,11 @@ function TeamsView({
 }
 
 function CallsView({
+  calls,
   users,
   onCall,
 }: {
+  calls: CallRecord[];
   users: MessengerUser[];
   onCall: (participantIds: string[]) => void;
 }) {
@@ -3251,11 +4472,11 @@ function CallsView({
       </div>
 
       <div className="scroll-area call-list">
-        {callHistory.map((call) => (
+        {calls.map((call, index) => (
           <button
             type="button"
             className="call-row"
-            key={`${call.name}-${call.detail}`}
+            key={`${call.type}-${call.name}-${call.detail}-${index}`}
             onClick={() => onCall(call.participantIds)}
             aria-label={`Позвонить: ${call.name}`}
           >
@@ -3430,6 +4651,7 @@ function ProfileView({
   role,
   theme,
   notificationMode,
+  authMode,
   onRoleChange,
   onThemeChange,
   onNotificationModeChange,
@@ -3441,6 +4663,7 @@ function ProfileView({
   role: UserRole;
   theme: Theme;
   notificationMode: NotificationMode;
+  authMode: RuntimeMode;
   onRoleChange: (role: UserRole) => void;
   onThemeChange: (theme: Theme) => void;
   onNotificationModeChange: (mode: NotificationMode) => void;
@@ -3498,10 +4721,25 @@ function ProfileView({
           onChange={handleAvatarChange}
         />
 
-        <div className="role-preview" aria-label="Демо роли пользователя">
+        <div
+          className={`role-preview ${
+            authMode === "backend" ? "role-preview-readonly" : ""
+          }`}
+          aria-label={
+            authMode === "demo"
+              ? "Демо роли пользователя"
+              : "Роль пользователя"
+          }
+        >
           <span>
-            <strong>Демо доступа</strong>
-            <small>Переключатель только для проверки прототипа</small>
+            <strong>
+              {authMode === "demo" ? "Демо доступа" : "Доступ организации"}
+            </strong>
+            <small>
+              {authMode === "demo"
+                ? "Переключатель только для проверки прототипа"
+                : "Роль назначена сервером и не меняется в профиле"}
+            </small>
           </span>
           <div role="group" aria-label="Выбрать роль">
             <button
@@ -3509,14 +4747,25 @@ function ProfileView({
               className={role === "admin" ? "is-active" : ""}
               aria-pressed={role === "admin"}
               onClick={() => onRoleChange("admin")}
+              disabled={authMode === "backend"}
             >
               Админ
+            </button>
+            <button
+              type="button"
+              className={role === "moderator" ? "is-active" : ""}
+              aria-pressed={role === "moderator"}
+              onClick={() => onRoleChange("moderator")}
+              disabled={authMode === "backend"}
+            >
+              Модератор
             </button>
             <button
               type="button"
               className={role === "employee" ? "is-active" : ""}
               aria-pressed={role === "employee"}
               onClick={() => onRoleChange("employee")}
+              disabled={authMode === "backend"}
             >
               Сотрудник
             </button>
@@ -3533,12 +4782,12 @@ function ProfileView({
           />
           <h1>{user.name}</h1>
           <span className={`role-badge role-badge-${role}`}>
-            {role === "admin" ? (
-              <ShieldCheck size={14} />
-            ) : (
+            {role === "employee" ? (
               <UserRound size={14} />
+            ) : (
+              <ShieldCheck size={14} />
             )}
-            {role === "admin" ? "Администратор" : "Сотрудник"}
+            {roleDisplayName(role)}
           </span>
           <small>в сети</small>
         </div>
@@ -3567,12 +4816,16 @@ function ProfileView({
           </div>
         </div>
 
-        {role === "employee" ? (
+        {role !== "admin" ? (
           <div className="profile-lock-note">
             <ShieldCheck size={18} />
             <span>
               <strong>Данные защищены ролью</strong>
-              <small>Сотрудник может изменить только свою аватарку</small>
+              <small>
+                {role === "moderator"
+                  ? "Модератор работает с аудитом без изменения сотрудников"
+                  : "Сотрудник может изменить только свою аватарку"}
+              </small>
             </span>
           </div>
         ) : null}
@@ -3623,7 +4876,7 @@ function ProfileView({
               {currentTheme.symbol}
             </span>
             <span className="setting-copy">
-              <strong>Сменить тему</strong>
+              <strong>Выбрать тему</strong>
               <small>{currentTheme.title}</small>
             </span>
             <ChevronRight size={17} />
@@ -3815,7 +5068,9 @@ function ProfileView({
                   <button
                     type="button"
                     key={option.id}
-                    className={theme === option.id ? "is-active" : ""}
+                    className={`theme-option-${option.id} ${
+                      theme === option.id ? "is-active" : ""
+                    }`}
                     aria-pressed={theme === option.id}
                     onClick={() => {
                       onThemeChange(option.id);
@@ -3853,19 +5108,27 @@ function ProfileView({
 
 function AdminUserSheet({
   user,
+  readOnly,
   onClose,
   onSave,
+  onMessage,
+  onCall,
   onAudit,
   onDelete,
 }: {
   user: MessengerUser;
+  readOnly: boolean;
   onClose: () => void;
-  onSave: (user: MessengerUser) => void;
+  onSave: (user: MessengerUser) => void | Promise<void>;
+  onMessage: (id: string) => void;
+  onCall: (id: string) => void;
   onAudit: (user: MessengerUser) => void;
-  onDelete: (id: string) => void;
+  onDelete: (id: string) => void | Promise<void>;
 }) {
   const [draft, setDraft] = useState<MessengerUser>(user);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [saving, setSaving] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
   const normalizedDraft: MessengerUser = {
     ...draft,
@@ -3876,9 +5139,10 @@ function AdminUserSheet({
   };
   const canSave =
     normalizedDraft.name.length >= 2 &&
-    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedDraft.email) &&
+    (!normalizedDraft.email ||
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedDraft.email)) &&
     normalizedDraft.username.length >= 2 &&
-    normalizedDraft.phone.length >= 7;
+    (!normalizedDraft.phone || normalizedDraft.phone.length >= 7);
 
   const updateField = (
     field: "name" | "email" | "username" | "phone",
@@ -3910,7 +5174,7 @@ function AdminUserSheet({
         className="bottom-sheet admin-user-sheet"
         role="dialog"
         aria-modal="true"
-        aria-label={`Редактировать профиль: ${user.name}`}
+        aria-label={`${readOnly ? "Просмотреть" : "Редактировать"} профиль: ${user.name}`}
         onClick={(event) => event.stopPropagation()}
       >
         <span className="sheet-handle" />
@@ -3936,22 +5200,56 @@ function AdminUserSheet({
             <strong>{draft.name}</strong>
             <small>{draft.position}</small>
           </span>
-          <button
-            type="button"
-            className="avatar-edit-button"
-            aria-label="Изменить аватар сотрудника"
-            onClick={() => avatarInputRef.current?.click()}
-          >
-            <Camera size={18} />
-          </button>
-          <input
-            ref={avatarInputRef}
-            hidden
-            type="file"
-            accept="image/*"
-            onChange={handleAvatarChange}
-          />
+          {!readOnly ? (
+            <>
+              <button
+                type="button"
+                className="avatar-edit-button"
+                aria-label="Изменить аватар сотрудника"
+                onClick={() => avatarInputRef.current?.click()}
+              >
+                <Camera size={18} />
+              </button>
+              <input
+                ref={avatarInputRef}
+                hidden
+                type="file"
+                accept="image/*"
+                onChange={handleAvatarChange}
+              />
+            </>
+          ) : null}
         </div>
+
+        {user.id !== "self" ? (
+          <div
+            className="admin-contact-actions"
+            aria-label="Связаться с сотрудником"
+          >
+            <button
+              type="button"
+              onClick={() => onMessage(user.id)}
+              aria-label={`Написать: ${user.name}`}
+            >
+              <MessageCircle size={19} />
+              <span>
+                <strong>Написать</strong>
+                <small>Открыть личный чат</small>
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onCall(user.id)}
+              aria-label={`Позвонить: ${user.name}`}
+            >
+              <Phone size={19} />
+              <span>
+                <strong>Позвонить</strong>
+                <small>Начать звонок</small>
+              </span>
+            </button>
+          </div>
+        ) : null}
 
         <div className="profile-editor-fields">
           <label>
@@ -3959,6 +5257,7 @@ function AdminUserSheet({
             <input
               value={draft.name}
               onChange={(event) => updateField("name", event.target.value)}
+              disabled={readOnly}
               autoFocus
             />
           </label>
@@ -3968,6 +5267,7 @@ function AdminUserSheet({
               type="email"
               value={draft.email}
               onChange={(event) => updateField("email", event.target.value)}
+              disabled={readOnly}
             />
           </label>
           <label>
@@ -3975,6 +5275,7 @@ function AdminUserSheet({
             <input
               value={draft.username}
               onChange={(event) => updateField("username", event.target.value)}
+              disabled={readOnly || Boolean(user.backendId)}
             />
           </label>
           <label>
@@ -3983,20 +5284,72 @@ function AdminUserSheet({
               type="tel"
               value={draft.phone}
               onChange={(event) => updateField("phone", event.target.value)}
+              disabled={readOnly}
             />
           </label>
         </div>
 
+        <div className="admin-role-picker">
+          <span>
+            <strong>Роль сотрудника</strong>
+            <small>
+              {readOnly
+                ? "Модератор видит назначение без права изменения"
+                : "Изменение роли фиксируется сервером в журнале аудита"}
+            </small>
+          </span>
+          <div role="group" aria-label="Назначить роль сотрудника">
+            {(["employee", "moderator", "admin"] as const).map(
+              (availableRole) => (
+                <button
+                  type="button"
+                  key={availableRole}
+                  className={
+                    draft.role === availableRole ? "is-active" : ""
+                  }
+                  aria-pressed={draft.role === availableRole}
+                  disabled={readOnly || user.id === "self"}
+                  onClick={() =>
+                    setDraft((current) => ({
+                      ...current,
+                      role: availableRole,
+                    }))
+                  }
+                >
+                  {roleShortName(availableRole)}
+                </button>
+              ),
+            )}
+          </div>
+        </div>
+
         <div className="admin-actions">
-          <button
-            type="button"
-            className="save-profile-button"
-            disabled={!canSave}
-            onClick={() => onSave(normalizedDraft)}
-          >
-            <CheckCheck size={18} />
-            Сохранить изменения
-          </button>
+          {!readOnly ? (
+            <button
+              type="button"
+              className="save-profile-button"
+              disabled={!canSave || saving}
+              onClick={async () => {
+                setSaving(true);
+                setSaveError("");
+                try {
+                  await onSave(normalizedDraft);
+                } catch (error) {
+                  setSaveError(authErrorMessage(error));
+                } finally {
+                  setSaving(false);
+                }
+              }}
+            >
+              <CheckCheck size={18} />
+              {saving ? "Сохранение…" : "Сохранить изменения"}
+            </button>
+          ) : null}
+          {saveError ? (
+            <p className="admin-save-error" role="alert">
+              {saveError}
+            </p>
+          ) : null}
           {user.id !== "self" ? (
             <>
               <button
@@ -4011,26 +5364,34 @@ function AdminUserSheet({
                 </span>
                 <ChevronRight size={17} />
               </button>
-              <button
-                type="button"
-                className="delete-contact-button"
-                onClick={() => setDeleteConfirmOpen(true)}
-              >
-                <Trash2 size={18} />
-                Удалить контакт
-              </button>
+              {!readOnly ? (
+                <button
+                  type="button"
+                  className="delete-contact-button"
+                  onClick={() => setDeleteConfirmOpen(true)}
+                >
+                  <Trash2 size={18} />
+                  Удалить контакт
+                </button>
+              ) : null}
             </>
           ) : null}
         </div>
 
-        {deleteConfirmOpen ? (
+        {deleteConfirmOpen && !readOnly ? (
           <ConfirmDialog
             title="Вы действительно хотите удалить контакт?"
             description={`Контакт «${draft.name}» будет удалён из организации CIFRA.`}
             onCancel={() => setDeleteConfirmOpen(false)}
-            onConfirm={() => {
-              setDeleteConfirmOpen(false);
-              onDelete(user.id);
+            onConfirm={async () => {
+              setSaveError("");
+              try {
+                await onDelete(user.id);
+                setDeleteConfirmOpen(false);
+              } catch (error) {
+                setDeleteConfirmOpen(false);
+                setSaveError(authErrorMessage(error));
+              }
             }}
           />
         ) : null}
@@ -4041,11 +5402,13 @@ function AdminUserSheet({
 
 function AuditOverlay({
   user,
+  viewerRole,
   chats,
   messagesByChat,
   onClose,
 }: {
   user: MessengerUser;
+  viewerRole: UserRole;
   chats: Chat[];
   messagesByChat: Record<string, Message[]>;
   onClose: () => void;
@@ -4104,7 +5467,8 @@ function AuditOverlay({
           <Eye size={14} /> Режим аудита
         </span>
         <p>
-          Администратор просматривает данные в режиме только для чтения.
+          {viewerRole === "moderator" ? "Модератор" : "Администратор"}{" "}
+          просматривает данные в режиме только для чтения.
           Действие записано в журнал, отправка сообщений отключена.
         </p>
         <small>Сеанс AUD-2026-0727 · журналирование включено</small>
@@ -4555,22 +5919,87 @@ export default function Home() {
   const [chatItems, setChatItems] = useState<Chat[]>(initialChats);
   const [messagesByChat, setMessagesByChat] =
     useState<Record<string, Message[]>>(initialMessagesByChat);
+  const deliveryTimersRef = useRef<number[]>([]);
+  const activitySequenceRef = useRef(initialChats.length);
   const [composeOpen, setComposeOpen] = useState(false);
   const [callOpen, setCallOpen] = useState(false);
   const [callParticipantIds, setCallParticipantIds] = useState<string[]>([]);
+  const [calls, setCalls] = useState<CallRecord[]>(initialCallHistory);
+  const [callHistoryReady, setCallHistoryReady] = useState(false);
   const [theme, setTheme] = useState<Theme>("navy");
   const [notificationMode, setNotificationMode] =
     useState<NotificationMode>("on");
   const [notificationUntil, setNotificationUntil] = useState<number | null>(
     null,
   );
-  const [sessionActive, setSessionActive] = useState(true);
+  const apiClientRef = useRef<CifraApiClient | null>(null);
+  const [authMode, setAuthMode] = useState<RuntimeMode>("demo");
+  const [authSession, setAuthSession] = useState<AuthSession | null>(null);
+  const [sessionActive, setSessionActive] = useState(false);
   const [role, setRole] = useState<UserRole>("admin");
   const [users, setUsers] = useState<MessengerUser[]>(initialUsers);
   const [selectedProfileUserId, setSelectedProfileUserId] = useState<
     string | null
   >(null);
   const [auditUserId, setAuditUserId] = useState<string | null>(null);
+
+  const activateSession = useCallback((session: AuthSession) => {
+    setAuthSession(session);
+    setRole(session.role);
+    setSessionActive(true);
+    setUsers((current) =>
+      current.map((user) =>
+        user.id === "self"
+          ? {
+              ...user,
+              username: session.login,
+              role: session.role,
+              backendId:
+                session.context.user_id ===
+                "00000000-0000-4000-8000-000000000001"
+                  ? undefined
+                  : session.context.user_id,
+              backendRoles: session.context.roles,
+            }
+          : user,
+      ),
+    );
+  }, []);
+
+  const syncBackendDirectory = useCallback(
+    async (client: CifraApiClient, session: AuthSession) => {
+      if (client.mode !== "backend") return;
+      const page = await client.listUsers();
+      if (page.items.length === 0) return;
+      setUsers(
+        page.items.map((user) =>
+          backendUserToMessenger(user, session.context.user_id),
+        ),
+      );
+    },
+    [],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadRuntimeConfig()
+      .then(async (config) => {
+        if (cancelled) return;
+        const client = new CifraApiClient(config);
+        apiClientRef.current = client;
+        setAuthMode(config.mode);
+        const restored = await client.restoreSession();
+        if (cancelled || !restored) return;
+        activateSession(restored);
+        await syncBackendDirectory(client, restored);
+      })
+      .catch(() => {
+        // The sign-in form will display a precise error on the next attempt.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activateSession, syncBackendDirectory]);
 
   useEffect(() => {
     let frameId: number | undefined;
@@ -4580,7 +6009,8 @@ export default function Home() {
         storedTheme === "navy" ||
         storedTheme === "black" ||
         storedTheme === "sage" ||
-        storedTheme === "gray"
+        storedTheme === "gray" ||
+        storedTheme === "sunset"
       ) {
         frameId = window.requestAnimationFrame(() => setTheme(storedTheme));
       }
@@ -4591,6 +6021,146 @@ export default function Home() {
       if (frameId !== undefined) window.cancelAnimationFrame(frameId);
     };
   }, []);
+
+  useEffect(() => {
+    let storedCalls: CallRecord[] | null = null;
+    try {
+      const rawHistory = window.localStorage.getItem("cifra-call-history");
+      if (rawHistory) {
+        const parsed: unknown = JSON.parse(rawHistory);
+        if (Array.isArray(parsed) && parsed.every(isCallRecord)) {
+          storedCalls = parsed.slice(0, 100);
+        }
+      }
+    } catch {
+      // Keep the bundled call history when browser storage is unavailable.
+    }
+    const frameId = window.requestAnimationFrame(() => {
+      if (storedCalls) setCalls(storedCalls);
+      setCallHistoryReady(true);
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, []);
+
+  useEffect(() => {
+    if (!callHistoryReady) return;
+    try {
+      window.localStorage.setItem(
+        "cifra-call-history",
+        JSON.stringify(calls.slice(0, 100)),
+      );
+    } catch {
+      // The current session still keeps the updated call history.
+    }
+  }, [callHistoryReady, calls]);
+
+  useEffect(() => {
+    const deliveryTimers = deliveryTimersRef.current;
+    return () => {
+      deliveryTimers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleIncomingMessage = (event: Event) => {
+      const detail = (event as CustomEvent<IncomingMessageDetail>).detail;
+      if (!detail || typeof detail.chatId !== "string") return;
+
+      const targetChat = chatItems.find(
+        (chat) => chat.id === detail.chatId && !chat.deleted,
+      );
+      if (!targetChat) return;
+
+      const text =
+        typeof detail.text === "string" ? detail.text.trim() : undefined;
+      const voice =
+        typeof detail.voice === "string" ? detail.voice.trim() : undefined;
+      if (!text && !voice) return;
+
+      const incomingMessage: Message = {
+        id: detail.id ?? Date.now(),
+        side: "in",
+        text,
+        voice,
+        author:
+          typeof detail.author === "string"
+            ? detail.author.trim()
+            : undefined,
+        time:
+          typeof detail.time === "string" && detail.time.trim()
+            ? detail.time.trim()
+            : formatMessageTime(),
+        replyToId:
+          typeof detail.replyToId === "number"
+            ? detail.replyToId
+            : undefined,
+        forwardedFrom:
+          typeof detail.forwardedFrom === "string" &&
+          detail.forwardedFrom.trim()
+            ? detail.forwardedFrom.trim()
+            : undefined,
+      };
+      const activityOrder = ++activitySequenceRef.current;
+
+      setMessagesByChat((current) => ({
+        ...current,
+        [detail.chatId]: [
+          ...(current[detail.chatId] ?? []),
+          incomingMessage,
+        ],
+      }));
+      setChatItems((current) =>
+        current.map((chat) =>
+          chat.id === detail.chatId
+            ? withLatestMessage(
+                chat,
+                incomingMessage,
+                activityOrder,
+                selectedChatId !== detail.chatId,
+              )
+            : chat,
+        ),
+      );
+    };
+
+    window.addEventListener("cifra:incoming-message", handleIncomingMessage);
+    return () =>
+      window.removeEventListener(
+        "cifra:incoming-message",
+        handleIncomingMessage,
+      );
+  }, [chatItems, selectedChatId]);
+
+  useEffect(() => {
+    const handleIncomingCall = (event: Event) => {
+      const detail = (event as CustomEvent<IncomingCallDetail>).detail;
+      if (
+        !detail ||
+        !Array.isArray(detail.participantIds) ||
+        !detail.participantIds.every((id) => typeof id === "string")
+      ) {
+        return;
+      }
+      const type: CallRecord["type"] = detail.missed ? "missed" : "in";
+      const record = buildCallRecord(
+        detail.participantIds,
+        type,
+        users,
+        chatItems,
+      );
+      if (!record) return;
+
+      setCalls((current) => [record, ...current].slice(0, 100));
+      if (!detail.missed) {
+        setCallParticipantIds(record.participantIds);
+        setCallOpen(true);
+      }
+    };
+
+    window.addEventListener("cifra:incoming-call", handleIncomingCall);
+    return () =>
+      window.removeEventListener("cifra:incoming-call", handleIncomingCall);
+  }, [chatItems, users]);
 
   useEffect(() => {
     let frameId: number | undefined;
@@ -4644,6 +6214,7 @@ export default function Home() {
       black: "#030405",
       sage: "#18261d",
       gray: "#1b1b1b",
+      sunset: "#1f214d",
     };
     document
       .querySelector('meta[name="theme-color"]')
@@ -4688,8 +6259,17 @@ export default function Home() {
     (user) => user.id === selectedProfileUserId,
   );
   const auditUser = users.find((user) => user.id === auditUserId);
+  const unreadChatCount = chatItems.reduce(
+    (total, chat) => total + (chat.deleted ? 0 : chat.unread),
+    0,
+  );
 
   const openChat = (id: string) => {
+    setChatItems((current) =>
+      current.map((chat) =>
+        chat.id === id && chat.unread > 0 ? { ...chat, unread: 0 } : chat,
+      ),
+    );
     setSelectedChatId(id);
     setComposeOpen(false);
   };
@@ -4708,6 +6288,7 @@ export default function Home() {
       subtitle: "Новая переписка",
       time: "Сейчас",
       unread: 0,
+      lastActivityOrder: ++activitySequenceRef.current,
       avatar: user.avatar,
       gradient: user.gradient,
       kind: "work",
@@ -4718,27 +6299,144 @@ export default function Home() {
     openChat(newChat.id);
   };
 
+  const getApiClient = async (): Promise<CifraApiClient> => {
+    if (apiClientRef.current) return apiClientRef.current;
+    const config = await loadRuntimeConfig();
+    const client = new CifraApiClient(config);
+    apiClientRef.current = client;
+    setAuthMode(config.mode);
+    return client;
+  };
+
+  const loginWithCredentials = async (
+    login: string,
+    password: string,
+  ): Promise<LoginOutcome> => {
+    const client = await getApiClient();
+    const outcome = await client.login(login, password);
+    if (outcome.kind === "authenticated") {
+      activateSession(outcome.session);
+      void syncBackendDirectory(client, outcome.session).catch(() => {
+        // Authentication remains valid if the directory is temporarily unavailable.
+      });
+    }
+    return outcome;
+  };
+
+  const verifyMfa = async (
+    login: string,
+    challengeToken: string,
+    code: string,
+  ): Promise<void> => {
+    const client = await getApiClient();
+    const session = await client.verifyMfa(login, challengeToken, code);
+    activateSession(session);
+    void syncBackendDirectory(client, session).catch(() => {
+      // Authentication remains valid if the directory is temporarily unavailable.
+    });
+  };
+
+  const logout = async (): Promise<void> => {
+    try {
+      await apiClientRef.current?.logout();
+    } finally {
+      setAuthSession(null);
+      setSessionActive(false);
+      setComposeOpen(false);
+      setCallOpen(false);
+      setSelectedProfileUserId(null);
+      setAuditUserId(null);
+    }
+  };
+
+  const changeOwnPassword = async (
+    currentPassword: string,
+    newPassword: string,
+  ): Promise<void> => {
+    const client = await getApiClient();
+    await client.changePassword(currentPassword, newPassword);
+    setAuthSession(null);
+    setSessionActive(false);
+    setComposeOpen(false);
+    setCallOpen(false);
+    setSelectedProfileUserId(null);
+    setAuditUserId(null);
+  };
+
   const changeRole = (nextRole: UserRole) => {
+    if (authMode !== "demo") return;
     setRole(nextRole);
     setSelectedProfileUserId(null);
     setAuditUserId(null);
   };
 
-  const updateUser = (updatedUser: MessengerUser) => {
+  const updateUser = async (updatedUser: MessengerUser): Promise<void> => {
+    const original = users.find((user) => user.id === updatedUser.id);
+    let persistedUser = updatedUser;
+    if (
+      authMode === "backend" &&
+      authSession &&
+      original?.backendId &&
+      original.backendVersion &&
+      apiClientRef.current
+    ) {
+      let backendUser: BackendUser | null = null;
+      const profileChanged =
+        original.name !== updatedUser.name ||
+        original.email !== updatedUser.email ||
+        original.phone !== updatedUser.phone;
+      if (profileChanged) {
+        const [firstName = "", ...lastNameParts] = updatedUser.name
+          .trim()
+          .split(/\s+/);
+        const lastName = lastNameParts.join(" ");
+        if (!firstName || !lastName) {
+          throw new CifraApiError(
+            "Укажите имя и фамилию",
+            400,
+            "VALIDATION_ERROR",
+          );
+        }
+        backendUser = await apiClientRef.current.updateUser(
+          original.backendId,
+          original.backendVersion,
+          {
+            first_name: firstName,
+            last_name: lastName,
+            email: updatedUser.email || null,
+            phone: updatedUser.phone || null,
+            reason: "Изменение профиля через CIFRA Web",
+          },
+        );
+      }
+      if (original.role !== updatedUser.role) {
+        backendUser = await apiClientRef.current.setUserRoles(
+          original.backendId,
+          corporateRolesFor(updatedUser.role),
+          "Изменение роли через CIFRA Web",
+        );
+      }
+      if (backendUser) {
+        persistedUser = backendUserToMessenger(
+          backendUser,
+          authSession.context.user_id,
+        );
+      }
+    }
     setUsers((current) =>
       current.map((user) =>
-        user.id === updatedUser.id ? updatedUser : user,
+        user.id === persistedUser.id ? persistedUser : user,
       ),
     );
     setChatItems((current) =>
       current.map((chat) =>
-        chat.id === updatedUser.id
+        chat.id === persistedUser.id
           ? {
               ...chat,
-              title: updatedUser.name,
-              avatar: updatedUser.avatar,
-              gradient: updatedUser.gradient,
-              online: updatedUser.online,
+              title: persistedUser.name,
+              avatar: persistedUser.avatar,
+              gradient: persistedUser.gradient,
+              online: persistedUser.online,
             }
           : chat,
       ),
@@ -4746,7 +6444,18 @@ export default function Home() {
     setSelectedProfileUserId(null);
   };
 
-  const deleteContact = (id: string) => {
+  const deleteContact = async (id: string): Promise<void> => {
+    const target = users.find((user) => user.id === id);
+    if (
+      authMode === "backend" &&
+      target?.backendId &&
+      apiClientRef.current
+    ) {
+      await apiClientRef.current.disableUser(
+        target.backendId,
+        "Отключение сотрудника через CIFRA Web",
+      );
+    }
     setUsers((current) => current.filter((user) => user.id !== id));
     setChatItems((current) =>
       current.map((chat) =>
@@ -4849,6 +6558,7 @@ export default function Home() {
       subtitle: `${memberIds.length + 1} участников · группа создана`,
       time: "Сейчас",
       unread: 0,
+      lastActivityOrder: ++activitySequenceRef.current,
       avatar: name
         .split(/\s+/)
         .slice(0, 2)
@@ -4872,143 +6582,319 @@ export default function Home() {
     );
   };
 
-  const sendMessage = (chatId: string, text: string) => {
-    const now = new Intl.DateTimeFormat("ru-RU", {
-      hour: "2-digit",
-      minute: "2-digit",
-    }).format(new Date());
+  const sendMessage = (
+    chatId: string,
+    text: string,
+    options: SendMessageOptions = {},
+  ) => {
+    const normalizedText = text.trim();
+    const voice = options.voice?.trim();
+    if (!normalizedText && !voice) return false;
+
+    const now = formatMessageTime();
+    const messageId = Date.now();
+    const outgoingMessage: Message = {
+      id: messageId,
+      side: "out",
+      text: normalizedText || undefined,
+      voice,
+      time: now,
+      deliveryStatus: "sent",
+      replyToId: options.replyToId,
+      forwardedFrom: options.forwardedFrom,
+    };
+    const activityOrder = ++activitySequenceRef.current;
+
     setMessagesByChat((current) => ({
       ...current,
       [chatId]: [
         ...(current[chatId] ?? []),
-        {
-          id: Date.now(),
-          side: "out",
-          text,
-          time: now,
-        },
+        outgoingMessage,
       ],
     }));
+    setChatItems((current) =>
+      current.map((chat) =>
+        chat.id === chatId
+          ? withLatestMessage(chat, outgoingMessage, activityOrder)
+          : chat,
+      ),
+    );
+
+    const updateDeliveryStatus = (deliveryStatus: MessageDeliveryStatus) => {
+      setMessagesByChat((current) => ({
+        ...current,
+        [chatId]: (current[chatId] ?? []).map((message) =>
+          message.id === messageId ? { ...message, deliveryStatus } : message,
+        ),
+      }));
+      setChatItems((current) =>
+        current.map((chat) =>
+          chat.id === chatId
+            ? withLatestDeliveryStatus(chat, messageId, deliveryStatus)
+            : chat,
+        ),
+      );
+    };
+
+    const deliveredTimer = window.setTimeout(
+      () => updateDeliveryStatus("delivered"),
+      700,
+    );
+    const readTimer = window.setTimeout(
+      () => updateDeliveryStatus("read"),
+      1800,
+    );
+    deliveryTimersRef.current.push(deliveredTimer, readTimer);
+    return true;
+  };
+
+  const togglePinnedMessage = (chatId: string, messageId: number) => {
+    setMessagesByChat((current) => ({
+      ...current,
+      [chatId]: (current[chatId] ?? []).map((message) =>
+        message.id === messageId
+          ? {
+              ...message,
+              pinned: !message.pinned,
+              pinnedAt: message.pinned ? undefined : Date.now(),
+            }
+          : message,
+      ),
+    }));
+  };
+
+  const forwardMessage = (
+    sourceChatId: string,
+    messageId: number,
+    targetChatId: string,
+  ) => {
+    const sourceMessage = (messagesByChat[sourceChatId] ?? []).find(
+      (message) => message.id === messageId,
+    );
+    const sourceChat = chatItems.find((chat) => chat.id === sourceChatId);
+    if (!sourceMessage || !sourceChat) return;
+
+    const forwardedFrom =
+      sourceMessage.forwardedFrom ||
+      sourceMessage.author ||
+      (sourceMessage.side === "out" ? currentUser.name : sourceChat.title);
+    const sent = sendMessage(targetChatId, sourceMessage.text ?? "", {
+      voice: sourceMessage.voice,
+      forwardedFrom,
+    });
+    if (sent) openChat(targetChatId);
   };
 
   const clearMessages = (chatId: string) => {
     setMessagesByChat((current) => ({ ...current, [chatId]: [] }));
+    setChatItems((current) =>
+      current.map((chat) =>
+        chat.id === chatId
+          ? {
+              ...chat,
+              subtitle: "Нет сообщений",
+              time: "",
+              lastMessageId: undefined,
+              lastMessageSide: undefined,
+              lastDeliveryStatus: undefined,
+            }
+          : chat,
+      ),
+    );
   };
 
   const startCall = (participantIds: string[] = []) => {
-    setCallParticipantIds(participantIds);
+    const record = buildCallRecord(participantIds, "out", users, chatItems);
+    if (!record) return;
+    setCalls((current) => [record, ...current].slice(0, 100));
+    setCallParticipantIds(record.participantIds);
     setCallOpen(true);
   };
 
   return (
     <main className={`prototype-shell theme-${theme}`}>
-      <aside className="prototype-note">
-        <span className="brand-mark">C</span>
-        <p className="prototype-kicker">CIFRA FLOW · IOS</p>
-        <h1>Привычный мессенджер с собственным характером.</h1>
-        <p>
-          Нажимайте на чаты, вкладки и кнопки. На iPhone прототип откроется
-          как полноэкранное приложение.
-        </p>
-        <div className="prototype-features">
-          <span>
-            <i>01</i> Список чатов и поиск
-          </span>
-          <span>
-            <i>02</i> Переписка и вложения
-          </span>
-          <span>
-            <i>03</i> Команды и звонки
-          </span>
-        </div>
-      </aside>
-
       <div className="device-stage">
         <div className="device-glow" />
         <div className="iphone">
           <div className="dynamic-island" aria-hidden="true" />
-          <div className="app-screen">
+          <div
+            className={`app-screen ${
+              sessionActive && selectedChatId ? "chat-open" : ""
+            }`}
+          >
             <StatusBar />
             <div className="view-host">
               {!sessionActive ? (
-                <SignedOutView onRestore={() => setSessionActive(true)} />
-              ) : selectedChatId ? (
-                <ChatView
-                  chat={selectedChat}
-                  users={users}
-                  role={role}
-                  messages={selectedMessages}
-                  onBack={() => setSelectedChatId(null)}
-                  onSend={(text) => sendMessage(selectedChat.id, text)}
-                  onClear={() => clearMessages(selectedChat.id)}
-                  onCall={() =>
-                    startCall(
-                      selectedChat.kind === "group"
-                        ? (selectedChat.memberIds ?? [])
-                        : users.some((user) => user.id === selectedChat.id)
-                          ? [selectedChat.id]
-                          : [],
-                    )
-                  }
-                  onToggleMute={() => toggleChatMute(selectedChat.id)}
-                  onArchive={() => archiveChat(selectedChat.id)}
-                  onUnarchive={() => unarchiveChat(selectedChat.id)}
-                  onDelete={() => deleteChat(selectedChat.id)}
-                  onAddParticipants={(participantIds) =>
-                    addChatParticipants(selectedChat.id, participantIds)
-                  }
+                <SignedOutView
+                  onCredentials={loginWithCredentials}
+                  onVerifyMfa={verifyMfa}
                 />
-              ) : activeTab === "chats" ? (
-                <ChatsView
-                  chats={chatItems}
-                  role={role}
-                  onOpenChat={openChat}
-                  onCompose={() => setComposeOpen(true)}
-                  onToggleMute={toggleChatMute}
-                  onArchiveChat={archiveChat}
-                  onUnarchiveChat={unarchiveChat}
-                  onTogglePin={toggleChatPin}
-                  onDeleteChat={deleteChat}
-                />
-              ) : activeTab === "teams" ? (
-                <TeamsView
-                  users={users}
-                  role={role}
-                  onMessage={openUserChat}
-                  onOpenUser={(id) => {
-                    if (role === "admin") setSelectedProfileUserId(id);
-                  }}
-                />
-              ) : activeTab === "calls" ? (
-                <CallsView users={users} onCall={startCall} />
-              ) : (
-                <ProfileView
-                  user={currentUser}
-                  role={role}
-                  theme={theme}
-                  notificationMode={notificationMode}
-                  onRoleChange={changeRole}
-                  onThemeChange={changeTheme}
-                  onNotificationModeChange={changeNotificationMode}
-                  onEditProfile={() => {
-                    if (role === "admin") setSelectedProfileUserId("self");
-                  }}
-                  onAvatarChange={updateOwnAvatar}
-                  onLogout={() => {
-                    setSessionActive(false);
-                    setComposeOpen(false);
-                    setCallOpen(false);
-                    setSelectedProfileUserId(null);
-                    setAuditUserId(null);
-                  }}
-                />
+              ) : authSession?.context.must_change_password ? null : (
+                <div
+                  className={`web-workspace web-workspace-${activeTab} ${
+                    selectedChatId ? "is-chat-open" : ""
+                  }`}
+                >
+                  {activeTab === "chats" ? (
+                    <>
+                      <section
+                        className="chat-directory"
+                        aria-label="Список чатов"
+                      >
+                        <ChatsView
+                          chats={chatItems}
+                          users={users}
+                          role={role}
+                          onOpenChat={openChat}
+                          onMessageUser={openUserChat}
+                          onCallUser={(id) => startCall([id])}
+                          onCompose={() => setComposeOpen(true)}
+                          onToggleMute={toggleChatMute}
+                          onArchiveChat={archiveChat}
+                          onUnarchiveChat={unarchiveChat}
+                          onTogglePin={toggleChatPin}
+                          onDeleteChat={deleteChat}
+                        />
+                      </section>
+
+                      <section
+                        className="conversation-stage"
+                        aria-label="Область переписки"
+                      >
+                        {selectedChatId ? (
+                          <ChatView
+                            key={selectedChat.id}
+                            chat={selectedChat}
+                            chats={chatItems}
+                            users={users}
+                            role={role}
+                            messages={selectedMessages}
+                            onBack={() => setSelectedChatId(null)}
+                            onSend={(text, options) =>
+                              sendMessage(selectedChat.id, text, options)
+                            }
+                            onClear={() => clearMessages(selectedChat.id)}
+                            onCall={() =>
+                              startCall(
+                                selectedChat.kind === "group"
+                                  ? (selectedChat.memberIds ?? [])
+                                  : users.some(
+                                        (user) =>
+                                          user.id === selectedChat.id,
+                                      )
+                                    ? [selectedChat.id]
+                                    : [],
+                              )
+                            }
+                            onToggleMute={() =>
+                              toggleChatMute(selectedChat.id)
+                            }
+                            onArchive={() => archiveChat(selectedChat.id)}
+                            onUnarchive={() => unarchiveChat(selectedChat.id)}
+                            onDelete={() => deleteChat(selectedChat.id)}
+                            onAddParticipants={(participantIds) =>
+                              addChatParticipants(
+                                selectedChat.id,
+                                participantIds,
+                              )
+                            }
+                            onTogglePinnedMessage={(messageId) =>
+                              togglePinnedMessage(
+                                selectedChat.id,
+                                messageId,
+                              )
+                            }
+                            onForwardMessage={(messageId, targetChatId) =>
+                              forwardMessage(
+                                selectedChat.id,
+                                messageId,
+                                targetChatId,
+                              )
+                            }
+                          />
+                        ) : (
+                          <div className="desktop-chat-empty">
+                            <span aria-hidden="true">
+                              <MessageCircle size={34} />
+                            </span>
+                            <h2>CIFRA Messenger</h2>
+                            <p>
+                              Выберите чат слева, чтобы открыть переписку.
+                            </p>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const firstChat = chatItems.find(
+                                  (chat) => !chat.deleted && !chat.archived,
+                                );
+                                if (firstChat) openChat(firstChat.id);
+                              }}
+                            >
+                              Открыть первый чат
+                            </button>
+                          </div>
+                        )}
+                      </section>
+                    </>
+                  ) : (
+                    <section
+                      className="section-stage"
+                      aria-label={
+                        activeTab === "teams"
+                          ? "Люди"
+                          : activeTab === "calls"
+                            ? "Звонки"
+                            : "Профиль"
+                      }
+                    >
+                      {activeTab === "teams" ? (
+                        <TeamsView
+                          users={users}
+                          role={role}
+                          onMessage={openUserChat}
+                          onOpenUser={(id) => {
+                            if (role !== "employee") {
+                              setSelectedProfileUserId(id);
+                            }
+                          }}
+                        />
+                      ) : activeTab === "calls" ? (
+                        <CallsView
+                          calls={calls}
+                          users={users}
+                          onCall={startCall}
+                        />
+                      ) : (
+                        <ProfileView
+                          user={currentUser}
+                          role={role}
+                          theme={theme}
+                          notificationMode={notificationMode}
+                          authMode={authMode}
+                          onRoleChange={changeRole}
+                          onThemeChange={changeTheme}
+                          onNotificationModeChange={changeNotificationMode}
+                          onEditProfile={() => {
+                            if (role === "admin") {
+                              setSelectedProfileUserId("self");
+                            }
+                          }}
+                          onAvatarChange={updateOwnAvatar}
+                          onLogout={() => void logout()}
+                        />
+                      )}
+                    </section>
+                  )}
+                </div>
               )}
             </div>
 
-            {sessionActive && !selectedChatId ? (
+            {sessionActive &&
+            !authSession?.context.must_change_password ? (
               <TabBar
                 active={activeTab}
                 notificationsEnabled={notificationMode === "on"}
+                unreadCount={unreadChatCount}
                 onChange={(tab) => {
                   setActiveTab(tab);
                   setSelectedChatId(null);
@@ -5018,7 +6904,9 @@ export default function Home() {
 
             <div className="home-indicator" aria-hidden="true" />
 
-            {sessionActive && composeOpen ? (
+            {sessionActive &&
+            !authSession?.context.must_change_password &&
+            composeOpen ? (
               <ComposeSheet
                 users={users}
                 onClose={() => setComposeOpen(false)}
@@ -5027,7 +6915,9 @@ export default function Home() {
               />
             ) : null}
 
-            {sessionActive && callOpen ? (
+            {sessionActive &&
+            !authSession?.context.must_change_password &&
+            callOpen ? (
               <CallOverlay
                 users={users}
                 participantIds={callParticipantIds}
@@ -5038,13 +6928,33 @@ export default function Home() {
               />
             ) : null}
 
-            {sessionActive && role === "admin" && selectedProfileUser ? (
+            {sessionActive &&
+            authSession?.context.must_change_password ? (
+              <PasswordChangeOverlay
+                login={authSession.login}
+                onChangePassword={changeOwnPassword}
+              />
+            ) : null}
+
+            {sessionActive &&
+            !authSession?.context.must_change_password &&
+            role !== "employee" &&
+            selectedProfileUser ? (
               <AdminUserSheet
                 key={selectedProfileUser.id}
                 user={selectedProfileUser}
+                readOnly={!canManageUsers(role)}
                 onClose={() => setSelectedProfileUserId(null)}
                 onSave={updateUser}
                 onDelete={deleteContact}
+                onMessage={(id) => {
+                  setSelectedProfileUserId(null);
+                  openUserChat(id);
+                }}
+                onCall={(id) => {
+                  setSelectedProfileUserId(null);
+                  startCall([id]);
+                }}
                 onAudit={(user) => {
                   setSelectedProfileUserId(null);
                   setAuditUserId(user.id);
@@ -5052,10 +6962,14 @@ export default function Home() {
               />
             ) : null}
 
-            {sessionActive && role === "admin" && auditUser ? (
+            {sessionActive &&
+            !authSession?.context.must_change_password &&
+            canAuditChats(role) &&
+            auditUser ? (
               <AuditOverlay
                 key={auditUser.id}
                 user={auditUser}
+                viewerRole={role}
                 chats={chatItems}
                 messagesByChat={messagesByChat}
                 onClose={() => setAuditUserId(null)}

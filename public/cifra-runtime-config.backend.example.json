@@ -1,0 +1,6 @@
+{
+  "mode": "backend",
+  "apiBaseUrl": "",
+  "requestTimeoutMs": 15000,
+  "demoMfaCode": ""
+}

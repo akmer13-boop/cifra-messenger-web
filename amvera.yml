@@ -1,0 +1,9 @@
+meta:
+  environment: node
+  toolchain:
+    name: browser
+    version: 22
+
+build:
+  artifacts:
+    "out/*": /
