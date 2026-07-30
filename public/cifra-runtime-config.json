@@ -1,6 +1,6 @@
 {
-  "mode": "demo",
-  "apiBaseUrl": "",
+  "mode": "backend",
+  "apiBaseUrl": "https://cifragateway-staging-ilyaman.amvera.io",
   "requestTimeoutMs": 15000,
-  "demoMfaCode": "111111"
+  "demoMfaCode": ""
 }
