@@ -88,6 +88,12 @@ import {
   type RuntimeMode,
   type UserRole,
 } from "./cifra-api";
+
+import {
+  CifraRealtimeClient,
+  type RealtimeStatus,
+} from "./cifra-realtime";
+
 import {
   clampSwipeOffset,
   getSwipeActionState,
@@ -5933,6 +5939,12 @@ export default function Home() {
     null,
   );
   const apiClientRef = useRef<CifraApiClient | null>(null);
+  
+  const realtimeClientRef =
+  useRef<CifraRealtimeClient | null>(null);
+  
+const [realtimeStatus, setRealtimeStatus] =
+  useState<RealtimeStatus>("disconnected");
   const [authMode, setAuthMode] = useState<RuntimeMode>("demo");
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
