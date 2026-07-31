@@ -97,6 +97,11 @@ import {
   type RealtimeChatSubscription,
   type RealtimeStatus,
 } from "./cifra-realtime";
+import {
+  getLatestIncomingRealtimeSeq,
+  getLatestRealtimeSeq,
+  getRealtimeUnreadCount,
+} from "./realtime-chat-list-policy.mjs";
 
 import {
   clampSwipeOffset,
@@ -6093,6 +6098,12 @@ export default function Home() {
   const apiClientRef = useRef<CifraApiClient | null>(null);
   const realtimeClientRef = useRef<CifraRealtimeClient | null>(null);
   const realtimeUiTopicRef = useRef<string | null>(null);
+  const realtimeActivityRef = useRef<
+    Record<string, { seq: number; order: number }>
+  >({});
+  const [realtimeReadSeqByTopic, setRealtimeReadSeqByTopic] = useState<
+    Record<string, number>
+  >({});
   const [realtimeStatus, setRealtimeStatus] =
     useState<RealtimeStatus>("disconnected");
   const [realtimeSubscriptions, setRealtimeSubscriptions] = useState<
@@ -6203,6 +6214,8 @@ export default function Home() {
       setRealtimeChatStatus("idle");
       setRealtimePublishStatus("idle");
       setRealtimePublishedSeq(null);
+      setRealtimeReadSeqByTopic({});
+      realtimeActivityRef.current = {};
       return;
     }
 
@@ -6345,6 +6358,13 @@ export default function Home() {
           delete next[previousTopic];
           return next;
         });
+        setRealtimeReadSeqByTopic((current) => {
+          if (!(previousTopic in current)) return current;
+          const next = { ...current };
+          delete next[previousTopic];
+          return next;
+        });
+        delete realtimeActivityRef.current[previousTopic];
         realtimeUiTopicRef.current = null;
       }
       return;
@@ -6355,8 +6375,8 @@ export default function Home() {
     );
     if (!subscription) return;
 
-    const projectedMessages = realtimeMessages
-      .filter((message) => message.topic === activeTopic)
+    const topicMessages = realtimeMessages.filter((message) => message.topic === activeTopic);
+    const projectedMessages = topicMessages
       .map((message) =>
         withRealtimeReceiptStatus(
           buildRealtimeUiMessage(message, realtimeUserId),
@@ -6367,28 +6387,55 @@ export default function Home() {
       )
       .filter((message): message is Message => Boolean(message));
     const latestMessage = projectedMessages.at(-1);
+    const latestServerSeq = getLatestRealtimeSeq(
+      topicMessages,
+      activeTopic,
+      subscription.seq ?? 0,
+    );
+    const effectiveReadSeq = Math.max(
+      subscription.read ?? 0,
+      realtimeReadSeqByTopic[activeTopic] ?? 0,
+    );
+    const unread = getRealtimeUnreadCount(
+      topicMessages,
+      activeTopic,
+      realtimeUserId,
+      effectiveReadSeq,
+      latestServerSeq,
+    );
+    const previousActivity = realtimeActivityRef.current[activeTopic];
+
+    if (!previousActivity || latestServerSeq > previousActivity.seq) {
+      realtimeActivityRef.current[activeTopic] = {
+        seq: latestServerSeq,
+        order: ++activitySequenceRef.current,
+      };
+    }
+
+    const realtimeActivityOrder =
+      realtimeActivityRef.current[activeTopic]?.order ??
+      ++activitySequenceRef.current;
     const title = getRealtimeChatTitle(subscription);
+    const realtimeKind: Chat["kind"] =
+      activeTopic.startsWith("grp") || activeTopic.startsWith("chn")
+        ? "group"
+        : "work";
     const realtimeChat: Chat = {
       id: activeTopic,
       title,
       subtitle: latestMessage
-        ? getMessageSnippet(latestMessage)
+        ? getChatPreview(latestMessage, realtimeKind)
         : "Реальный чат Tinode",
       time:
         latestMessage?.time ||
         formatRealtimeTimestamp(
           subscription.touchedAt || subscription.updatedAt,
         ),
-      unread: 0,
+      unread,
       avatar: getRealtimeAvatar(title),
       gradient: "linear-gradient(145deg, #0f766e, #2563eb)",
-      kind:
-        activeTopic.startsWith("grp") || activeTopic.startsWith("chn")
-          ? "group"
-          : "work",
-      lastActivityOrder:
-        1_000_000 +
-        (latestMessage?.id || subscription.seq || 0),
+      kind: realtimeKind,
+      lastActivityOrder: realtimeActivityOrder,
       ...(latestMessage
         ? {
             lastMessageId: latestMessage.id,
@@ -6425,6 +6472,7 @@ export default function Home() {
     realtimeChatStatus,
     realtimeMessages,
     realtimeObservedTopic,
+    realtimeReadSeqByTopic,
     realtimeReceipts,
     realtimeSubscriptions,
     realtimeUserId,
@@ -6465,6 +6513,11 @@ export default function Home() {
       if (latestIncomingSeq > 0) {
         try {
           realtimeClient.markRead(topic, latestIncomingSeq);
+          setRealtimeReadSeqByTopic((current) =>
+            latestIncomingSeq > (current[topic] ?? 0)
+              ? { ...current, [topic]: latestIncomingSeq }
+              : current,
+          );
         } catch {
           // Connection cleanup may race with a visibility change.
         }
@@ -6756,12 +6809,30 @@ export default function Home() {
     0,
   );
 
+  const acknowledgeRealtimeChatOpen = (id: string) => {
+    if (id !== realtimeObservedTopic || !realtimeUserId) return;
+
+    const latestIncomingSeq = getLatestIncomingRealtimeSeq(
+      realtimeMessages,
+      id,
+      realtimeUserId,
+    );
+    if (latestIncomingSeq > 0) {
+      setRealtimeReadSeqByTopic((current) =>
+        latestIncomingSeq > (current[id] ?? 0)
+          ? { ...current, [id]: latestIncomingSeq }
+          : current,
+      );
+    }
+  };
+
   const openChat = (id: string) => {
     setChatItems((current) =>
       current.map((chat) =>
         chat.id === id && chat.unread > 0 ? { ...chat, unread: 0 } : chat,
       ),
     );
+    acknowledgeRealtimeChatOpen(id);
     setSelectedChatId(id);
     setComposeOpen(false);
   };
@@ -6840,6 +6911,8 @@ export default function Home() {
   setRealtimeChatStatus("idle");
   setRealtimePublishStatus("idle");
   setRealtimePublishedSeq(null);
+  setRealtimeReadSeqByTopic({});
+  realtimeActivityRef.current = {};
 
   try {
     await apiClientRef.current?.logout();
@@ -7122,6 +7195,11 @@ export default function Home() {
         .then((result) => {
           setRealtimePublishedSeq(result.seq);
           setRealtimePublishStatus("published");
+          setRealtimeReadSeqByTopic((current) =>
+            result.seq > (current[chatId] ?? 0)
+              ? { ...current, [chatId]: result.seq }
+              : current,
+          );
         })
         .catch(() => {
           setRealtimePublishStatus("error");
@@ -7291,6 +7369,24 @@ export default function Home() {
       data-realtime-ui-message-count={
         realtimeUiTopicRef.current
           ? (messagesByChat[realtimeUiTopicRef.current]?.length ?? 0)
+          : 0
+      }
+      data-realtime-unread-count={
+        realtimeUiTopicRef.current
+          ? (chatItems.find(
+              (chat) => chat.id === realtimeUiTopicRef.current,
+            )?.unread ?? 0)
+          : 0
+      }
+      data-realtime-local-read-seq={
+        realtimeUiTopicRef.current
+          ? (realtimeReadSeqByTopic[realtimeUiTopicRef.current] ?? 0)
+          : 0
+      }
+      data-realtime-activity-order={
+        realtimeUiTopicRef.current
+          ? (realtimeActivityRef.current[realtimeUiTopicRef.current]?.order ??
+            0)
           : 0
       }
     >
