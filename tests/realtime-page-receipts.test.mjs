@@ -24,7 +24,7 @@ test("bridges Tinode receipts into real message delivery statuses", async () => 
   assert.match(page, /\? "read"[\s\S]*?\? "delivered"[\s\S]*?: "sent"/);
   assert.match(
     page,
-    /withRealtimeReceiptStatus\([\s\S]*?buildRealtimeUiMessage\(message, realtimeUserId\),[\s\S]*?realtimeReceipts/,
+    /withRealtimeReceiptStatus\([\s\S]*?buildRealtimeUiMessage\([\s\S]*?message,[\s\S]*?realtimeUserId,[\s\S]*?participantNameById\.get\(message\.from\)[\s\S]*?\),[\s\S]*?message,[\s\S]*?realtimeUserId,[\s\S]*?realtimeReceipts/,
   );
   assert.match(page, /data-realtime-receipt-count=/);
   assert.match(page, /data-realtime-remote-recv-seq=/);
