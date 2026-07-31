@@ -4,7 +4,7 @@ import test from "node:test";
 
 const pageUrl = new URL("../app/page.tsx", import.meta.url);
 
-test("projects the observed Tinode topic and server messages into the chat UI", async () => {
+test("projects every attached Tinode topic and server message into the chat UI", async () => {
   const page = await readFile(pageUrl, "utf8");
 
   assert.match(
@@ -19,20 +19,21 @@ test("projects the observed Tinode topic and server messages into the chat UI", 
   assert.match(page, /deliveryStatus: "sent" as const/);
   assert.match(
     page,
-    /realtimeMessages[\s\S]*?\.filter\(\(message\) => message\.topic === activeTopic\)[\s\S]*?buildRealtimeUiMessage\(message, realtimeUserId\)/,
+    /activeSubscriptions\.map\(\(subscription\) =>[\s\S]*?realtimeMessages\.filter\([\s\S]*?message\.topic === activeTopic[\s\S]*?buildRealtimeUiMessage\(message, realtimeUserId\)/,
   );
-  assert.match(page, /const realtimeChat: Chat = \{/);
+  assert.match(page, /projectedMessagesByTopic\[activeTopic\] = projectedMessages/);
   assert.match(page, /id: activeTopic/);
   assert.match(page, /title,[\s\S]*?subtitle: latestMessage/);
   assert.match(
     page,
-    /setMessagesByChat\(\(current\) => \(\{[\s\S]*?\[activeTopic\]: projectedMessages/,
+    /for \(const \[topic, messages\] of Object\.entries\([\s\S]*?projectedMessagesByTopic[\s\S]*?next\[topic\] = messages/,
   );
   assert.match(
     page,
-    /return \[realtimeChat, \.\.\.withoutRealtimeTopics\]/,
+    /return \[\.\.\.nextRealtimeChats, \.\.\.withoutRealtimeTopics\]/,
   );
   assert.match(page, /data-realtime-ui-topic=/);
+  assert.match(page, /data-realtime-ui-topic-count=/);
   assert.match(page, /data-realtime-ui-message-count=/);
 });
 
