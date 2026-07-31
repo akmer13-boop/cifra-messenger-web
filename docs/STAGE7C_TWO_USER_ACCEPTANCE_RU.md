@@ -1,4 +1,4 @@
-[STAGE7C_TWO_USER_ACCEPTANCE_RU.md](https://github.com/user-attachments/files/30587292/STAGE7C_TWO_USER_ACCEPTANCE_RU.md)
+[STAGE7C_TWO_USER_ACCEPTANCE_RU.md](https://github.com/user-attachments/files/30587516/STAGE7C_TWO_USER_ACCEPTANCE_RU.md)
 # Stage 7C — проверка Web ↔ Tinode двумя пользователями
 
 Документ предназначен для финальной проверки staging после безопасного слияния Step 14. На Step 13 автоматические тесты используют два независимых клиента и общий имитатор Tinode. Это проверяет клиентскую логику, но не заменяет проверку реальных сервисов Amvera.
