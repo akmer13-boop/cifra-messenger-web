@@ -4,7 +4,7 @@ import test from "node:test";
 
 const pageUrl = new URL("../app/page.tsx", import.meta.url);
 
-test("routes only the observed attached real chat through Tinode publish", async () => {
+test("routes every attached real chat through Tinode publish", async () => {
   const page = await readFile(pageUrl, "utf8");
 
   assert.match(page, /type RealtimePublishStatus =/);
@@ -18,7 +18,11 @@ test("routes only the observed attached real chat through Tinode publish", async
   );
   assert.match(
     page,
-    /chatId === realtimeObservedTopic[\s\S]*?realtimeStatus === "connected"[\s\S]*?realtimeChatStatus === "subscribed"[\s\S]*?realtimeClient\.isTopicSubscribed\(chatId\)/,
+    /const isAttachedRealtimeChat =[\s\S]*?realtimeAttachedTopics\.includes\(chatId\)/,
+  );
+  assert.match(
+    page,
+    /isAttachedRealtimeChat[\s\S]*?realtimeStatus === "connected"[\s\S]*?realtimeChatStatus === "subscribed"[\s\S]*?realtimeClient\.isTopicSubscribed\(chatId\)/,
   );
   assert.match(
     page,
@@ -37,7 +41,6 @@ test("routes only the observed attached real chat through Tinode publish", async
     /data-realtime-published-seq=\{realtimePublishedSeq \?\? ""\}/,
   );
 
-  // Mock chats keep their existing behavior until real topic IDs are added to the UI.
   assert.match(page, /const deliveredTimer = window\.setTimeout/);
   assert.match(page, /const readTimer = window\.setTimeout/);
   assert.doesNotMatch(page, /cifra:realtime-publish-text/);
