@@ -32,6 +32,7 @@ export interface RealtimeConnectParams {
   readonly apiBaseUrl: string;
   readonly accessToken: string;
   readonly deviceId: string;
+  readonly ticketProvider?: () => Promise<unknown>;
 }
 
 export interface RealtimeChatSubscription {
@@ -122,6 +123,11 @@ type RealtimeMetadataListener = (
   metadata: readonly RealtimeChatMetadata[],
 ) => void;
 
+export interface RealtimeClientOptions {
+  readonly reconnectBaseDelayMs?: number;
+  readonly reconnectMaxDelayMs?: number;
+}
+
 interface TinodeSubscriptionBatch {
   readonly topic: string;
   readonly requestId?: string;
@@ -157,6 +163,11 @@ export class CifraRealtimeClient {
   >();
   private chatSubscribePromises = new Map<string, Promise<void>>();
   private attachingTopics = new Set<string>();
+  private desiredChatSubscriptions = new Map<string, number>();
+  private connectionParams: RealtimeConnectParams | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempt = 0;
+  private reconnectEnabled = false;
   private connectionAttempt = 0;
 
   constructor(
@@ -169,6 +180,7 @@ export class CifraRealtimeClient {
       () => undefined,
     private readonly onMetadata: RealtimeMetadataListener =
       () => undefined,
+    private readonly options: RealtimeClientOptions = {},
   ) {}
 
   getStatus(): RealtimeStatus {
@@ -236,19 +248,11 @@ export class CifraRealtimeClient {
       return this.tinodeUserId;
     }
 
-    if (this.connectPromise) {
-      return this.connectPromise;
-    }
+    this.connectionParams = params;
+    this.reconnectEnabled = true;
+    this.cancelReconnectTimer();
 
-    const attempt = ++this.connectionAttempt;
-    const connectPromise = this.connectInternal(params, attempt).finally(() => {
-      if (this.connectPromise === connectPromise) {
-        this.connectPromise = null;
-      }
-    });
-
-    this.connectPromise = connectPromise;
-    return connectPromise;
+    return this.startConnection(params, false);
   }
 
   async subscribeToChat(
@@ -282,7 +286,10 @@ export class CifraRealtimeClient {
       throw new CifraRealtimeError("realtime_not_connected");
     }
 
+    const historyLimit = normalizeHistoryLimit(options.historyLimit);
+
     if (this.subscribedTopics.has(topic)) {
+      this.desiredChatSubscriptions.set(topic, historyLimit);
       return;
     }
 
@@ -292,14 +299,15 @@ export class CifraRealtimeClient {
       return pending;
     }
 
-    const historyLimit = normalizeHistoryLimit(options.historyLimit);
     this.attachingTopics.add(topic);
 
     const subscribePromise = this.subscribeToChatInternal(
       socket,
       topic,
       historyLimit,
-    ).finally(() => {
+    ).then(() => {
+      this.desiredChatSubscriptions.set(topic, historyLimit);
+    }).finally(() => {
       if (this.chatSubscribePromises.get(topic) === subscribePromise) {
         this.chatSubscribePromises.delete(topic);
       }
@@ -432,9 +440,9 @@ export class CifraRealtimeClient {
     const socket = this.socket;
 
     if (
-      !this.isConnected() ||
       !socket ||
-      socket.readyState !== WebSocket.OPEN
+      socket.readyState !== WebSocket.OPEN ||
+      (this.status !== "connected" && this.status !== "reconnecting")
     ) {
       throw new CifraRealtimeError("realtime_not_connected");
     }
@@ -481,8 +489,12 @@ export class CifraRealtimeClient {
   }
 
   disconnect(): void {
+    this.reconnectEnabled = false;
+    this.connectionParams = null;
+    this.cancelReconnectTimer();
     this.connectionAttempt += 1;
     this.connectPromise = null;
+    this.reconnectAttempt = 0;
 
     const socket = this.socket;
 
@@ -491,6 +503,7 @@ export class CifraRealtimeClient {
     this.subscribedTopics.clear();
     this.chatSubscribePromises.clear();
     this.attachingTopics.clear();
+    this.desiredChatSubscriptions.clear();
     this.localReceiptProgress.clear();
     this.clearChatSubscriptions();
     this.clearChatMessages();
@@ -511,19 +524,24 @@ export class CifraRealtimeClient {
   private async connectInternal(
     params: RealtimeConnectParams,
     attempt: number,
+    isReconnect: boolean,
   ): Promise<string> {
     const previousSocket = this.socket;
+    const previousUserId = this.tinodeUserId;
 
     this.socket = null;
-    this.tinodeUserId = null;
+    if (!isReconnect) {
+      this.tinodeUserId = null;
+      this.desiredChatSubscriptions.clear();
+      this.localReceiptProgress.clear();
+      this.clearChatSubscriptions();
+      this.clearChatMessages();
+      this.clearChatReceipts();
+      this.clearChatMetadata();
+    }
     this.subscribedTopics.clear();
     this.chatSubscribePromises.clear();
     this.attachingTopics.clear();
-    this.localReceiptProgress.clear();
-    this.clearChatSubscriptions();
-    this.clearChatMessages();
-    this.clearChatReceipts();
-    this.clearChatMetadata();
 
     if (
       previousSocket &&
@@ -533,15 +551,12 @@ export class CifraRealtimeClient {
       previousSocket.close(1000, "client_reconnect");
     }
 
-    this.setStatus("connecting");
+    this.setStatus(isReconnect ? "reconnecting" : "connecting");
 
     let attemptSocket: WebSocket | null = null;
 
     try {
-      const ticket = await issueRealtimeTicket(
-        params.apiBaseUrl,
-        params.accessToken,
-      );
+      const ticket = await issueRealtimeTicketForConnection(params);
 
       this.ensureActiveAttempt(attempt);
 
@@ -613,6 +628,10 @@ export class CifraRealtimeClient {
         authLevel !== "auth"
       ) {
         throw new CifraRealtimeError("tinode_login_rejected");
+      }
+
+      if (isReconnect && previousUserId && previousUserId !== user) {
+        throw new CifraRealtimeError("tinode_reconnect_user_mismatch");
       }
 
       if (
@@ -708,29 +727,50 @@ export class CifraRealtimeClient {
       this.subscribedTopics.add("me");
 
       socket.addEventListener("close", () => {
-        if (this.socket === socket) {
-          this.socket = null;
-          this.tinodeUserId = null;
-          this.subscribedTopics.clear();
-          this.chatSubscribePromises.clear();
-          this.attachingTopics.clear();
-          this.localReceiptProgress.clear();
-          this.clearChatSubscriptions();
-          this.clearChatMessages();
-          this.clearChatReceipts();
-          this.clearChatMetadata();
-          this.setStatus("disconnected");
+        if (this.socket !== socket) {
+          return;
         }
+
+        this.socket = null;
+        this.subscribedTopics.clear();
+        this.chatSubscribePromises.clear();
+        this.attachingTopics.clear();
+
+        if (this.reconnectEnabled && this.connectionParams) {
+          this.scheduleReconnect("websocket_closed");
+          return;
+        }
+
+        this.tinodeUserId = null;
+        this.setStatus("disconnected");
       });
 
       socket.addEventListener("error", () => {
-        if (this.socket === socket) {
-          this.setStatus("error", "websocket_failed");
+        if (this.socket !== socket) {
+          return;
         }
+
+        if (
+          this.reconnectEnabled &&
+          socket.readyState !== WebSocket.CLOSED &&
+          socket.readyState !== WebSocket.CLOSING
+        ) {
+          socket.close(1011, "websocket_failed");
+          return;
+        }
+
+        this.setStatus("error", "websocket_failed");
       });
 
       this.ensureActiveAttempt(attempt, socket);
       this.tinodeUserId = user;
+
+      if (isReconnect) {
+        await this.restoreDesiredChatSubscriptions(socket);
+        this.ensureActiveAttempt(attempt, socket);
+      }
+
+      this.reconnectAttempt = 0;
       this.setStatus("connected");
 
       return user;
@@ -739,15 +779,17 @@ export class CifraRealtimeClient {
 
       if (this.socket === socket) {
         this.socket = null;
-        this.tinodeUserId = null;
+        if (!isReconnect) {
+          this.tinodeUserId = null;
+          this.localReceiptProgress.clear();
+          this.clearChatSubscriptions();
+          this.clearChatMessages();
+          this.clearChatReceipts();
+          this.clearChatMetadata();
+        }
         this.subscribedTopics.clear();
         this.chatSubscribePromises.clear();
         this.attachingTopics.clear();
-        this.localReceiptProgress.clear();
-        this.clearChatSubscriptions();
-        this.clearChatMessages();
-        this.clearChatReceipts();
-        this.clearChatMetadata();
       }
 
       if (
@@ -769,10 +811,115 @@ export class CifraRealtimeClient {
           error.code === "realtime_connection_cancelled");
 
       if (!cancelled) {
-        this.setStatus("error", code);
+        this.setStatus(isReconnect ? "reconnecting" : "error", code);
       }
 
       throw error;
+    }
+  }
+
+  private startConnection(
+    params: RealtimeConnectParams,
+    isReconnect: boolean,
+  ): Promise<string> {
+    if (this.connectPromise) {
+      return this.connectPromise;
+    }
+
+    const attempt = ++this.connectionAttempt;
+    const connectPromise = this.connectInternal(
+      params,
+      attempt,
+      isReconnect,
+    ).finally(() => {
+      if (this.connectPromise === connectPromise) {
+        this.connectPromise = null;
+      }
+    });
+
+    this.connectPromise = connectPromise;
+    return connectPromise;
+  }
+
+  private scheduleReconnect(error?: string): void {
+    if (
+      !this.reconnectEnabled ||
+      !this.connectionParams ||
+      this.reconnectTimer ||
+      this.connectPromise
+    ) {
+      return;
+    }
+
+    const delay = getRealtimeReconnectDelay(
+      this.reconnectAttempt,
+      this.options.reconnectBaseDelayMs,
+      this.options.reconnectMaxDelayMs,
+    );
+    this.reconnectAttempt += 1;
+    this.setStatus("reconnecting", error);
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      const params = this.connectionParams;
+
+      if (!this.reconnectEnabled || !params) {
+        return;
+      }
+
+      void this.startConnection(params, true).catch(() => {
+        if (this.reconnectEnabled) {
+          this.scheduleReconnect("realtime_reconnect_failed");
+        }
+      });
+    }, delay);
+  }
+
+  private cancelReconnectTimer(): void {
+    if (!this.reconnectTimer) {
+      return;
+    }
+
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  private async restoreDesiredChatSubscriptions(
+    socket: WebSocket,
+  ): Promise<void> {
+    const subscriptions = Array.from(
+      this.desiredChatSubscriptions.entries(),
+    ).filter(([topic]) => {
+      const subscription = this.chatSubscriptions.get(topic);
+      return (
+        subscription &&
+        (!subscription.access?.mode ||
+          subscription.access.mode.includes("R"))
+      );
+    });
+
+    const results = await Promise.allSettled(
+      subscriptions.map(async ([topic, historyLimit]) => {
+        this.attachingTopics.add(topic);
+        try {
+          await this.subscribeToChatInternal(
+            socket,
+            topic,
+            historyLimit,
+          );
+        } finally {
+          this.attachingTopics.delete(topic);
+        }
+      }),
+    );
+
+    if (
+      results.some((result) => result.status === "rejected") &&
+      results.every((result) => result.status === "rejected")
+    ) {
+      throw new CifraRealtimeError(
+        "tinode_chat_restore_rejected",
+      );
     }
   }
 
@@ -794,9 +941,12 @@ export class CifraRealtimeClient {
             sub: {
               limit: 100,
             },
-            data: {
-              limit: historyLimit,
-            },
+            data: buildTinodeHistoryQuery(
+              topic,
+              historyLimit,
+              this.getChatMessages(topic),
+              this.chatSubscriptions.get(topic)?.seq,
+            ),
           },
         },
       }),
@@ -867,6 +1017,11 @@ export class CifraRealtimeClient {
 
   private upsertChatMessage(message: RealtimeChatMessage): void {
     const key = `${message.topic}:${message.seq}`;
+
+    if (this.chatMessages.has(key)) {
+      return;
+    }
+
     this.chatMessages.set(key, message);
     this.onMessages(this.getChatMessages());
   }
@@ -947,6 +1102,28 @@ export class CifraRealtimeClient {
     this.status = status;
     this.onStatus(status, error);
   }
+}
+
+async function issueRealtimeTicketForConnection(
+  params: RealtimeConnectParams,
+): Promise<RealtimeTicketResponse> {
+  if (!params.ticketProvider) {
+    return issueRealtimeTicket(
+      params.apiBaseUrl,
+      params.accessToken,
+    );
+  }
+
+  const payload = await params.ticketProvider();
+
+  if (!isRealtimeTicketResponse(payload)) {
+    throw new CifraRealtimeError(
+      "realtime_ticket_response_invalid",
+    );
+  }
+
+  validateTicketExpiry(payload);
+  return payload;
 }
 
 export async function issueRealtimeTicket(
@@ -1616,6 +1793,54 @@ function parsePositiveInteger(value: unknown): number | null {
   return Number.isInteger(value) && Number(value) > 0
     ? Number(value)
     : null;
+}
+
+export function getRealtimeReconnectDelay(
+  attempt: number,
+  baseDelayMs = 1_000,
+  maxDelayMs = 30_000,
+): number {
+  const safeAttempt = Number.isInteger(attempt)
+    ? Math.max(0, Number(attempt))
+    : 0;
+  const safeBase = Number.isFinite(baseDelayMs)
+    ? Math.max(0, Number(baseDelayMs))
+    : 1_000;
+  const safeMax = Number.isFinite(maxDelayMs)
+    ? Math.max(safeBase, Number(maxDelayMs))
+    : 30_000;
+
+  return Math.min(safeMax, safeBase * 2 ** safeAttempt);
+}
+
+export function buildTinodeHistoryQuery(
+  topic: string,
+  historyLimit: number,
+  messages: readonly RealtimeChatMessage[],
+  serverSeq?: number,
+): { readonly since?: number; readonly limit: number } {
+  const normalizedLimit = normalizeHistoryLimit(historyLimit);
+  const latestLocalSeq = messages.reduce(
+    (latest, message) =>
+      message.topic === topic &&
+      Number.isInteger(message.seq) &&
+      message.seq > latest
+        ? message.seq
+        : latest,
+    0,
+  );
+
+  if (latestLocalSeq === 0) {
+    return { limit: normalizedLimit };
+  }
+
+  const normalizedServerSeq = parseNonNegativeInteger(serverSeq) ?? 0;
+  const missingCount = Math.max(0, normalizedServerSeq - latestLocalSeq);
+
+  return {
+    since: latestLocalSeq + 1,
+    limit: Math.min(100, Math.max(normalizedLimit, missingCount)),
+  };
 }
 
 function normalizeHistoryLimit(value: number | undefined): number {
