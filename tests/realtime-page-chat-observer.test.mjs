@@ -4,7 +4,7 @@ import test from "node:test";
 
 const pageUrl = new URL("../app/page.tsx", import.meta.url);
 
-test("observes every readable Tinode chat without replacing the mock chat UI", async () => {
+test("observes every readable Tinode chat while retaining mock UI only in demo mode", async () => {
   const page = await readFile(pageUrl, "utf8");
 
   assert.match(page, /type RealtimeChatMessage/);
@@ -32,7 +32,8 @@ test("observes every readable Tinode chat without replacing the mock chat UI", a
   assert.match(page, /setRealtimeMessages\(\[\]\)/);
 
   assert.match(page, /useState<Chat\[]>\(initialChats\)/);
-  assert.match(page, /withoutRealtimeTopics/);
+  assert.match(page, /const withoutRealtimeTopics = canUseLocalChatFallback\(authMode\)/);
+  assert.match(page, /filterChatsForRuntimeMode/);
   assert.match(page, /const sendMessage = \(/);
   assert.match(page, /window\.setTimeout/);
 });
