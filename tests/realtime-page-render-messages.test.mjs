@@ -28,16 +28,14 @@ test("projects every attached Tinode topic and server message into the chat UI",
     page,
     /for \(const \[topic, messages\] of Object\.entries\([\s\S]*?projectedMessagesByTopic[\s\S]*?next\[topic\] = messages/,
   );
-  assert.match(
-    page,
-    /return \[\.\.\.nextRealtimeChats, \.\.\.withoutRealtimeTopics\]/,
-  );
+  assert.match(page, /filterChatsForRuntimeMode/);
+  assert.match(page, /filterMessagesForRuntimeMode/);
   assert.match(page, /data-realtime-ui-topic=/);
   assert.match(page, /data-realtime-ui-topic-count=/);
   assert.match(page, /data-realtime-ui-message-count=/);
 });
 
-test("keeps mock delivery timers outside the real Tinode publish path", async () => {
+test("keeps demo delivery timers behind the backend source guard", async () => {
   const page = await readFile(pageUrl, "utf8");
   const publishBranch = page.indexOf("realtimeClient.isTopicSubscribed(chatId)");
   const mockTimer = page.indexOf("const deliveredTimer = window.setTimeout");
@@ -45,5 +43,5 @@ test("keeps mock delivery timers outside the real Tinode publish path", async ()
   assert.ok(publishBranch >= 0);
   assert.ok(mockTimer > publishBranch);
   assert.match(page, /publishText\(chatId, normalizedText\)/);
-  assert.match(page, /return true;[\s\S]*?const now = formatMessageTime\(\)/);
+  assert.match(page, /return true;[\s\S]*?canUseLocalChatFallback\(authMode\)[\s\S]*?const now = formatMessageTime\(\)/);
 });
