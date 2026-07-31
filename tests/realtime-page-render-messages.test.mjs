@@ -19,7 +19,7 @@ test("projects every attached Tinode topic and server message into the chat UI",
   assert.match(page, /deliveryStatus: "sent" as const/);
   assert.match(
     page,
-    /activeSubscriptions\.map\(\(subscription\) =>[\s\S]*?realtimeMessages\.filter\([\s\S]*?message\.topic === activeTopic[\s\S]*?buildRealtimeUiMessage\(message, realtimeUserId\)/,
+    /activeSubscriptions\.map\(\(subscription\) =>[\s\S]*?realtimeMessages\.filter\([\s\S]*?message\.topic === activeTopic[\s\S]*?buildRealtimeUiMessage\([\s\S]*?message,[\s\S]*?realtimeUserId,[\s\S]*?participantNameById\.get\(message\.from\)/,
   );
   assert.match(page, /projectedMessagesByTopic\[activeTopic\] = projectedMessages/);
   assert.match(page, /id: activeTopic/);
