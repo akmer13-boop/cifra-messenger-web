@@ -96,6 +96,7 @@ import {
   type RealtimeChatMetadata,
   type RealtimeChatReceipt,
   type RealtimeChatSubscription,
+  type RealtimeDiagnostics,
   type RealtimeStatus,
 } from "./cifra-realtime";
 import {
@@ -137,6 +138,12 @@ type RealtimePublishStatus =
   | "publishing"
   | "published"
   | "error";
+
+const EMPTY_REALTIME_DIAGNOSTICS: RealtimeDiagnostics = {
+  connectionGeneration: 0,
+  reconnectSuccessCount: 0,
+  duplicateMessageCount: 0,
+};
 type ChatPanel =
   | "attachments"
   | "emoji"
@@ -6123,6 +6130,8 @@ export default function Home() {
   const [realtimePublishedSeq, setRealtimePublishedSeq] = useState<
     number | null
   >(null);
+  const [realtimeDiagnostics, setRealtimeDiagnostics] =
+    useState<RealtimeDiagnostics>(EMPTY_REALTIME_DIAGNOSTICS);
   const [authMode, setAuthMode] = useState<RuntimeMode>("demo");
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
@@ -6213,6 +6222,7 @@ export default function Home() {
       setRealtimeChatStatus("idle");
       setRealtimePublishStatus("idle");
       setRealtimePublishedSeq(null);
+      setRealtimeDiagnostics(EMPTY_REALTIME_DIAGNOSTICS);
       setRealtimeReadSeqByTopic({});
       realtimeActivityRef.current = {};
       realtimeUiTopicsRef.current = new Set();
@@ -6238,6 +6248,11 @@ export default function Home() {
       },
       (metadata) => {
         setRealtimeMetadata([...metadata]);
+      },
+      {
+        onDiagnostics: (diagnostics) => {
+          setRealtimeDiagnostics({ ...diagnostics });
+        },
       },
     );
 
@@ -7128,12 +7143,14 @@ export default function Home() {
   setRealtimeSubscriptions([]);
   setRealtimeAttachedTopics([]);
   setRealtimeMessages([]);
+  setRealtimeMetadata([]);
   setRealtimeReceipts([]);
   setRealtimeUserId(null);
   setRealtimeObservedTopic(null);
   setRealtimeChatStatus("idle");
   setRealtimePublishStatus("idle");
   setRealtimePublishedSeq(null);
+  setRealtimeDiagnostics(EMPTY_REALTIME_DIAGNOSTICS);
   setRealtimeReadSeqByTopic({});
   realtimeActivityRef.current = {};
   realtimeUiTopicsRef.current = new Set();
@@ -7144,6 +7161,7 @@ export default function Home() {
   } finally {
     setAuthSession(null);
     setSessionActive(false);
+    setSelectedChatId(null);
     setComposeOpen(false);
     setCallOpen(false);
     setSelectedProfileUserId(null);
@@ -7572,6 +7590,24 @@ export default function Home() {
       data-chat-source={authMode === "backend" ? "tinode" : "demo"}
       data-local-chat-fallback={canUseLocalChatFallback(authMode)}
       data-realtime-status={realtimeStatus}
+      data-realtime-user-id={realtimeUserId ?? ""}
+      data-realtime-session-ready={
+        realtimeStatus === "connected" &&
+        Boolean(realtimeUserId) &&
+        realtimeAttachedTopics.length > 0
+          ? "true"
+          : "false"
+      }
+      data-realtime-connection-generation={
+        realtimeDiagnostics.connectionGeneration
+      }
+      data-realtime-reconnect-success-count={
+        realtimeDiagnostics.reconnectSuccessCount
+      }
+      data-realtime-duplicate-message-count={
+        realtimeDiagnostics.duplicateMessageCount
+      }
+      data-realtime-last-error={realtimeDiagnostics.lastError ?? ""}
       data-realtime-preserved-during-reconnect={
         realtimeStatus === "reconnecting" &&
         realtimeAttachedTopics.length > 0
