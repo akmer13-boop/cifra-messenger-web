@@ -102,6 +102,10 @@ import {
   getLatestRealtimeSeq,
   getRealtimeUnreadCount,
 } from "./realtime-chat-list-policy.mjs";
+import {
+  getReadableRealtimeSubscriptions,
+  resolveRealtimeObservedTopic,
+} from "./realtime-multi-chat-policy.mjs";
 
 import {
   clampSwipeOffset,
@@ -6098,6 +6102,7 @@ export default function Home() {
   const apiClientRef = useRef<CifraApiClient | null>(null);
   const realtimeClientRef = useRef<CifraRealtimeClient | null>(null);
   const realtimeUiTopicRef = useRef<string | null>(null);
+  const realtimeUiTopicsRef = useRef<Set<string>>(new Set());
   const realtimeActivityRef = useRef<
     Record<string, { seq: number; order: number }>
   >({});
@@ -6108,6 +6113,9 @@ export default function Home() {
     useState<RealtimeStatus>("disconnected");
   const [realtimeSubscriptions, setRealtimeSubscriptions] = useState<
     readonly RealtimeChatSubscription[]
+  >([]);
+  const [realtimeAttachedTopics, setRealtimeAttachedTopics] = useState<
+    readonly string[]
   >([]);
   const [realtimeMessages, setRealtimeMessages] = useState<
     readonly RealtimeChatMessage[]
@@ -6207,6 +6215,7 @@ export default function Home() {
       realtimeClientRef.current = null;
       setRealtimeStatus("disconnected");
       setRealtimeSubscriptions([]);
+      setRealtimeAttachedTopics([]);
       setRealtimeMessages([]);
       setRealtimeReceipts([]);
       setRealtimeUserId(null);
@@ -6216,6 +6225,8 @@ export default function Home() {
       setRealtimePublishedSeq(null);
       setRealtimeReadSeqByTopic({});
       realtimeActivityRef.current = {};
+      realtimeUiTopicsRef.current = new Set();
+      realtimeUiTopicRef.current = null;
       return;
     }
 
@@ -6289,6 +6300,7 @@ export default function Home() {
       realtimeStatus !== "connected" ||
       !realtimeClient
     ) {
+      setRealtimeAttachedTopics([]);
       setRealtimeObservedTopic(null);
       setRealtimeChatStatus("idle");
       setRealtimePublishStatus("idle");
@@ -6296,13 +6308,11 @@ export default function Home() {
       return;
     }
 
-    const subscription = realtimeSubscriptions.find(
-      (candidate) =>
-        !candidate.access?.mode ||
-        candidate.access.mode.includes("R"),
-    );
+    const readableSubscriptions =
+      getReadableRealtimeSubscriptions(realtimeSubscriptions);
 
-    if (!subscription) {
+    if (readableSubscriptions.length === 0) {
+      setRealtimeAttachedTopics([]);
       setRealtimeObservedTopic(null);
       setRealtimeChatStatus("idle");
       setRealtimePublishStatus("idle");
@@ -6311,176 +6321,275 @@ export default function Home() {
     }
 
     let cancelled = false;
-    setRealtimeObservedTopic(subscription.topic);
     setRealtimeChatStatus("subscribing");
-    setRealtimePublishStatus("idle");
-    setRealtimePublishedSeq(null);
 
-    void realtimeClient
-      .subscribeToChat(subscription.topic, {
+    const subscriptionTasks = readableSubscriptions.map((subscription) =>
+      realtimeClient.subscribeToChat(subscription.topic, {
         historyLimit: 20,
-      })
-      .then(() => {
-        if (!cancelled) {
-          setRealtimeChatStatus("subscribed");
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setRealtimeChatStatus("error");
-        }
-      });
+      }),
+    );
+
+    void Promise.allSettled(subscriptionTasks).then((results) => {
+      if (cancelled) return;
+
+      const attachedTopics = readableSubscriptions.flatMap(
+        (subscription, index) =>
+          results[index]?.status === "fulfilled" &&
+          realtimeClient.isTopicSubscribed(subscription.topic)
+            ? [subscription.topic]
+            : [],
+      );
+
+      setRealtimeAttachedTopics(attachedTopics);
+      setRealtimeObservedTopic((current) =>
+        resolveRealtimeObservedTopic(null, current, attachedTopics),
+      );
+      setRealtimeChatStatus(
+        attachedTopics.length > 0 ? "subscribed" : "error",
+      );
+
+      if (attachedTopics.length === 0) {
+        setRealtimePublishStatus("idle");
+        setRealtimePublishedSeq(null);
+      }
+    });
 
     return () => {
       cancelled = true;
     };
   }, [realtimeStatus, realtimeSubscriptions, sessionActive]);
   useEffect(() => {
-    const previousTopic = realtimeUiTopicRef.current;
-    const activeTopic =
-      sessionActive &&
-      realtimeChatStatus === "subscribed" &&
-      realtimeObservedTopic &&
-      realtimeUserId
-        ? realtimeObservedTopic
-        : null;
+    const nextObservedTopic = resolveRealtimeObservedTopic(
+      selectedChatId,
+      realtimeObservedTopic,
+      realtimeAttachedTopics,
+    );
 
-    if (!activeTopic || !realtimeUserId) {
-      if (previousTopic) {
+    if (nextObservedTopic !== realtimeObservedTopic) {
+      setRealtimeObservedTopic(nextObservedTopic);
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
+    }
+  }, [
+    realtimeAttachedTopics,
+    realtimeObservedTopic,
+    selectedChatId,
+  ]);
+  useEffect(() => {
+    const previousTopics = realtimeUiTopicsRef.current;
+    const attachedTopicSet = new Set(realtimeAttachedTopics);
+    const activeSubscriptions = realtimeSubscriptions.filter(
+      (subscription) => attachedTopicSet.has(subscription.topic),
+    );
+
+    if (
+      !sessionActive ||
+      !realtimeUserId ||
+      activeSubscriptions.length === 0
+    ) {
+      if (previousTopics.size > 0) {
         setChatItems((current) =>
-          current.filter((chat) => chat.id !== previousTopic),
+          current.filter((chat) => !previousTopics.has(chat.id)),
         );
         setSelectedChatId((current) =>
-          current === previousTopic ? null : current,
+          current && previousTopics.has(current) ? null : current,
         );
         setMessagesByChat((current) => {
           const next = { ...current };
-          delete next[previousTopic];
+          for (const topic of previousTopics) {
+            delete next[topic];
+          }
           return next;
         });
         setRealtimeReadSeqByTopic((current) => {
-          if (!(previousTopic in current)) return current;
           const next = { ...current };
-          delete next[previousTopic];
-          return next;
+          let changed = false;
+          for (const topic of previousTopics) {
+            if (topic in next) {
+              delete next[topic];
+              changed = true;
+            }
+          }
+          return changed ? next : current;
         });
-        delete realtimeActivityRef.current[previousTopic];
-        realtimeUiTopicRef.current = null;
+        for (const topic of previousTopics) {
+          delete realtimeActivityRef.current[topic];
+        }
       }
+
+      realtimeUiTopicsRef.current = new Set();
+      realtimeUiTopicRef.current = null;
       return;
     }
 
-    const subscription = realtimeSubscriptions.find(
-      (candidate) => candidate.topic === activeTopic,
-    );
-    if (!subscription) return;
+    const projectedMessagesByTopic: Record<string, Message[]> = {};
+    const realtimeChats = activeSubscriptions.map((subscription) => {
+      const activeTopic = subscription.topic;
+      const topicMessages = realtimeMessages.filter(
+        (message) => message.topic === activeTopic,
+      );
+      const projectedMessages = topicMessages
+        .map((message) =>
+          withRealtimeReceiptStatus(
+            buildRealtimeUiMessage(message, realtimeUserId),
+            message,
+            realtimeUserId,
+            realtimeReceipts,
+          ),
+        )
+        .filter((message): message is Message => Boolean(message));
+      projectedMessagesByTopic[activeTopic] = projectedMessages;
 
-    const topicMessages = realtimeMessages.filter((message) => message.topic === activeTopic);
-    const projectedMessages = topicMessages
-      .map((message) =>
-        withRealtimeReceiptStatus(
-          buildRealtimeUiMessage(message, realtimeUserId),
-          message,
-          realtimeUserId,
-          realtimeReceipts,
-        ),
-      )
-      .filter((message): message is Message => Boolean(message));
-    const latestMessage = projectedMessages.at(-1);
-    const latestServerSeq = getLatestRealtimeSeq(
-      topicMessages,
-      activeTopic,
-      subscription.seq ?? 0,
-    );
-    const effectiveReadSeq = Math.max(
-      subscription.read ?? 0,
-      realtimeReadSeqByTopic[activeTopic] ?? 0,
-    );
-    const unread = getRealtimeUnreadCount(
-      topicMessages,
-      activeTopic,
-      realtimeUserId,
-      effectiveReadSeq,
-      latestServerSeq,
-    );
-    const previousActivity = realtimeActivityRef.current[activeTopic];
+      const latestMessage = projectedMessages.at(-1);
+      const latestServerSeq = getLatestRealtimeSeq(
+        topicMessages,
+        activeTopic,
+        subscription.seq ?? 0,
+      );
+      const effectiveReadSeq = Math.max(
+        subscription.read ?? 0,
+        realtimeReadSeqByTopic[activeTopic] ?? 0,
+      );
+      const unread = getRealtimeUnreadCount(
+        topicMessages,
+        activeTopic,
+        realtimeUserId,
+        effectiveReadSeq,
+        latestServerSeq,
+      );
+      const previousActivity = realtimeActivityRef.current[activeTopic];
 
-    if (!previousActivity || latestServerSeq > previousActivity.seq) {
-      realtimeActivityRef.current[activeTopic] = {
-        seq: latestServerSeq,
-        order: ++activitySequenceRef.current,
-      };
-    }
+      if (!previousActivity || latestServerSeq > previousActivity.seq) {
+        realtimeActivityRef.current[activeTopic] = {
+          seq: latestServerSeq,
+          order: ++activitySequenceRef.current,
+        };
+      }
 
-    const realtimeActivityOrder =
-      realtimeActivityRef.current[activeTopic]?.order ??
-      ++activitySequenceRef.current;
-    const title = getRealtimeChatTitle(subscription);
-    const realtimeKind: Chat["kind"] =
-      activeTopic.startsWith("grp") || activeTopic.startsWith("chn")
-        ? "group"
-        : "work";
-    const realtimeChat: Chat = {
-      id: activeTopic,
-      title,
-      subtitle: latestMessage
-        ? getChatPreview(latestMessage, realtimeKind)
-        : "Реальный чат Tinode",
-      time:
-        latestMessage?.time ||
-        formatRealtimeTimestamp(
-          subscription.touchedAt || subscription.updatedAt,
-        ),
-      unread,
-      avatar: getRealtimeAvatar(title),
-      gradient: "linear-gradient(145deg, #0f766e, #2563eb)",
-      kind: realtimeKind,
-      lastActivityOrder: realtimeActivityOrder,
-      ...(latestMessage
-        ? {
-            lastMessageId: latestMessage.id,
-            lastMessageSide: latestMessage.side,
-            ...(latestMessage.deliveryStatus
-              ? { lastDeliveryStatus: latestMessage.deliveryStatus }
-              : {}),
-          }
-        : {}),
-      ...(typeof subscription.online === "boolean"
-        ? { online: subscription.online }
-        : {}),
-    };
+      const realtimeActivityOrder =
+        realtimeActivityRef.current[activeTopic]?.order ??
+        ++activitySequenceRef.current;
+      const title = getRealtimeChatTitle(subscription);
+      const realtimeKind: Chat["kind"] =
+        activeTopic.startsWith("grp") || activeTopic.startsWith("chn")
+          ? "group"
+          : "work";
 
-    setMessagesByChat((current) => ({
-      ...current,
-      [activeTopic]: projectedMessages,
-    }));
+      return {
+        id: activeTopic,
+        title,
+        subtitle: latestMessage
+          ? getChatPreview(latestMessage, realtimeKind)
+          : "Реальный чат Tinode",
+        time:
+          latestMessage?.time ||
+          formatRealtimeTimestamp(
+            subscription.touchedAt || subscription.updatedAt,
+          ),
+        unread,
+        avatar: getRealtimeAvatar(title),
+        gradient: "linear-gradient(145deg, #0f766e, #2563eb)",
+        kind: realtimeKind,
+        lastActivityOrder: realtimeActivityOrder,
+        ...(latestMessage
+          ? {
+              lastMessageId: latestMessage.id,
+              lastMessageSide: latestMessage.side,
+              ...(latestMessage.deliveryStatus
+                ? { lastDeliveryStatus: latestMessage.deliveryStatus }
+                : {}),
+            }
+          : {}),
+        ...(typeof subscription.online === "boolean"
+          ? { online: subscription.online }
+          : {}),
+      } satisfies Chat;
+    });
+
+    const currentTopics = new Set(
+      activeSubscriptions.map((subscription) => subscription.topic),
+    );
+
+    setMessagesByChat((current) => {
+      const next = { ...current };
+      for (const topic of previousTopics) {
+        if (!currentTopics.has(topic)) {
+          delete next[topic];
+        }
+      }
+      for (const [topic, messages] of Object.entries(
+        projectedMessagesByTopic,
+      )) {
+        next[topic] = messages;
+      }
+      return next;
+    });
     setChatItems((current) => {
+      const existingById = new Map(current.map((chat) => [chat.id, chat]));
       const withoutRealtimeTopics = current.filter(
         (chat) =>
-          chat.id !== activeTopic &&
-          (!previousTopic || chat.id !== previousTopic),
+          !previousTopics.has(chat.id) && !currentTopics.has(chat.id),
       );
-      return [realtimeChat, ...withoutRealtimeTopics];
+      const nextRealtimeChats = realtimeChats.map((chat) => {
+        const existing = existingById.get(chat.id);
+        if (!existing) return chat;
+
+        return {
+          ...chat,
+          ...(existing.pinned ? { pinned: true } : {}),
+          ...(existing.muted ? { muted: true } : {}),
+          ...(existing.archived ? { archived: true } : {}),
+          ...(existing.deleted ? { deleted: true } : {}),
+        };
+      });
+
+      return [...nextRealtimeChats, ...withoutRealtimeTopics];
     });
-    if (previousTopic && previousTopic !== activeTopic) {
-      setSelectedChatId((current) =>
-        current === previousTopic ? activeTopic : current,
-      );
+    setSelectedChatId((current) =>
+      current && previousTopics.has(current) && !currentTopics.has(current)
+        ? null
+        : current,
+    );
+    setRealtimeReadSeqByTopic((current) => {
+      const next = { ...current };
+      let changed = false;
+      for (const topic of previousTopics) {
+        if (!currentTopics.has(topic) && topic in next) {
+          delete next[topic];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+    for (const topic of previousTopics) {
+      if (!currentTopics.has(topic)) {
+        delete realtimeActivityRef.current[topic];
+      }
     }
-    realtimeUiTopicRef.current = activeTopic;
+
+    realtimeUiTopicsRef.current = currentTopics;
+    realtimeUiTopicRef.current = resolveRealtimeObservedTopic(
+      selectedChatId,
+      realtimeObservedTopic,
+      realtimeAttachedTopics,
+    );
   }, [
-    realtimeChatStatus,
+    realtimeAttachedTopics,
     realtimeMessages,
     realtimeObservedTopic,
     realtimeReadSeqByTopic,
     realtimeReceipts,
     realtimeSubscriptions,
     realtimeUserId,
+    selectedChatId,
     sessionActive,
   ]);
   useEffect(() => {
     const realtimeClient = realtimeClientRef.current;
-    const topic = realtimeObservedTopic;
+    const topic =
+      selectedChatId && realtimeAttachedTopics.includes(selectedChatId)
+        ? selectedChatId
+        : null;
     const userId = realtimeUserId;
 
     if (
@@ -6537,9 +6646,9 @@ export default function Home() {
       );
     };
   }, [
+    realtimeAttachedTopics,
     realtimeChatStatus,
     realtimeMessages,
-    realtimeObservedTopic,
     realtimeStatus,
     realtimeUserId,
     selectedChatId,
@@ -6810,7 +6919,9 @@ export default function Home() {
   );
 
   const acknowledgeRealtimeChatOpen = (id: string) => {
-    if (id !== realtimeObservedTopic || !realtimeUserId) return;
+    if (!realtimeUserId || !realtimeAttachedTopics.includes(id)) {
+      return;
+    }
 
     const latestIncomingSeq = getLatestIncomingRealtimeSeq(
       realtimeMessages,
@@ -6833,6 +6944,11 @@ export default function Home() {
       ),
     );
     acknowledgeRealtimeChatOpen(id);
+    if (realtimeAttachedTopics.includes(id)) {
+      setRealtimeObservedTopic(id);
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
+    }
     setSelectedChatId(id);
     setComposeOpen(false);
   };
@@ -6904,6 +7020,7 @@ export default function Home() {
   realtimeClientRef.current = null;
   setRealtimeStatus("disconnected");
   setRealtimeSubscriptions([]);
+  setRealtimeAttachedTopics([]);
   setRealtimeMessages([]);
   setRealtimeReceipts([]);
   setRealtimeUserId(null);
@@ -6913,6 +7030,8 @@ export default function Home() {
   setRealtimePublishedSeq(null);
   setRealtimeReadSeqByTopic({});
   realtimeActivityRef.current = {};
+  realtimeUiTopicsRef.current = new Set();
+  realtimeUiTopicRef.current = null;
 
   try {
     await apiClientRef.current?.logout();
@@ -7170,9 +7289,12 @@ export default function Home() {
 
     const realtimeClient = realtimeClientRef.current;
 
+    const isAttachedRealtimeChat =
+      realtimeAttachedTopics.includes(chatId);
+
     if (
       realtimeClient &&
-      chatId === realtimeObservedTopic &&
+      isAttachedRealtimeChat &&
       realtimeStatus === "connected" &&
       realtimeChatStatus === "subscribed" &&
       realtimeClient.isTopicSubscribed(chatId)
@@ -7333,8 +7455,15 @@ export default function Home() {
       className={`prototype-shell theme-${theme}`}
       data-realtime-status={realtimeStatus}
       data-realtime-topic-count={realtimeSubscriptions.length}
+      data-realtime-attached-topic-count={realtimeAttachedTopics.length}
+      data-realtime-ui-topic-count={realtimeUiTopicsRef.current.size}
       data-realtime-chat-status={realtimeChatStatus}
       data-realtime-observed-topic={realtimeObservedTopic ?? ""}
+      data-realtime-selected-topic={
+        selectedChatId && realtimeAttachedTopics.includes(selectedChatId)
+          ? selectedChatId
+          : ""
+      }
       data-realtime-message-count={
         realtimeObservedTopic
           ? realtimeMessages.filter(
