@@ -92,8 +92,32 @@ import {
 import {
   CifraRealtimeClient,
   CifraRealtimeError,
+  type RealtimeChatMessage,
+  type RealtimeChatMetadata,
+  type RealtimeChatReceipt,
+  type RealtimeChatSubscription,
+  type RealtimeDiagnostics,
   type RealtimeStatus,
 } from "./cifra-realtime";
+import {
+  getLatestIncomingRealtimeSeq,
+  getLatestRealtimeSeq,
+  getRealtimeUnreadCount,
+} from "./realtime-chat-list-policy.mjs";
+import {
+  getReadableRealtimeSubscriptions,
+  resolveRealtimeObservedTopic,
+} from "./realtime-multi-chat-policy.mjs";
+import {
+  buildRealtimeParticipantProfiles,
+  projectRealtimeChatMetadata,
+} from "./realtime-chat-metadata-policy.mjs";
+import {
+  canUseLocalChatFallback,
+  filterChatsForRuntimeMode,
+  filterMessagesForRuntimeMode,
+  keepSelectedChatForRuntimeMode,
+} from "./chat-source-policy.mjs";
 
 import {
   clampSwipeOffset,
@@ -104,6 +128,22 @@ import {
 type Tab = "chats" | "teams" | "calls" | "profile";
 type Filter = string;
 type Theme = "navy" | "black" | "sage" | "gray" | "sunset";
+type RealtimeChatObserverStatus =
+  | "idle"
+  | "subscribing"
+  | "subscribed"
+  | "error";
+type RealtimePublishStatus =
+  | "idle"
+  | "publishing"
+  | "published"
+  | "error";
+
+const EMPTY_REALTIME_DIAGNOSTICS: RealtimeDiagnostics = {
+  connectionGeneration: 0,
+  reconnectSuccessCount: 0,
+  duplicateMessageCount: 0,
+};
 type ChatPanel =
   | "attachments"
   | "emoji"
@@ -147,8 +187,10 @@ type Chat = {
   time: string;
   unread: number;
   avatar: string;
+  avatarUrl?: string;
   gradient: string;
   kind: "work" | "personal" | "group";
+  realtimeType?: "direct" | "group" | "channel";
   lastActivityOrder: number;
   lastMessageId?: number;
   lastMessageSide?: "in" | "out";
@@ -826,6 +868,109 @@ const formatMessageTime = () =>
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date());
+
+const formatRealtimeTimestamp = (value?: string) => {
+  if (!value) return "";
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "";
+
+  return new Intl.DateTimeFormat("ru-RU", {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(timestamp));
+};
+
+const isRealtimeRecord = (
+  value: unknown,
+): value is Readonly<Record<string, unknown>> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+const getRealtimeMessageText = (content: unknown) => {
+  if (typeof content === "string") {
+    return content.trim() || undefined;
+  }
+
+  if (isRealtimeRecord(content)) {
+    const text = content["txt"];
+    if (typeof text === "string" && text.trim()) {
+      return text.trim();
+    }
+  }
+
+  return undefined;
+};
+
+const getRealtimeReceiptSeq = (
+  receipts: readonly RealtimeChatReceipt[],
+  topic: string,
+  what: "recv" | "read",
+  selfUserId: string,
+) =>
+  receipts.reduce(
+    (highest, receipt) =>
+      receipt.topic === topic &&
+      receipt.what === what &&
+      receipt.from !== selfUserId
+        ? Math.max(highest, receipt.seq)
+        : highest,
+    0,
+  );
+
+const buildRealtimeUiMessage = (
+  message: RealtimeChatMessage,
+  selfUserId: string,
+  authorName?: string,
+): Message | null => {
+  const text = getRealtimeMessageText(message.content);
+  if (!text) return null;
+
+  const outgoing = message.from === selfUserId;
+
+  return {
+    id: message.seq,
+    side: outgoing ? "out" : "in",
+    text,
+    time: formatRealtimeTimestamp(message.timestamp) || formatMessageTime(),
+    ...(outgoing ? { deliveryStatus: "sent" as const } : {}),
+    ...(!outgoing && message.from
+      ? { author: authorName || message.from }
+      : {}),
+  };
+};
+
+const withRealtimeReceiptStatus = (
+  projected: Message | null,
+  message: RealtimeChatMessage,
+  selfUserId: string,
+  receipts: readonly RealtimeChatReceipt[],
+): Message | null => {
+  if (!projected || projected.side !== "out") {
+    return projected;
+  }
+
+  const remoteReadSeq = getRealtimeReceiptSeq(
+    receipts,
+    message.topic,
+    "read",
+    selfUserId,
+  );
+  const remoteReceivedSeq = getRealtimeReceiptSeq(
+    receipts,
+    message.topic,
+    "recv",
+    selfUserId,
+  );
+
+  return {
+    ...projected,
+    deliveryStatus:
+      message.seq <= remoteReadSeq
+        ? "read"
+        : message.seq <= remoteReceivedSeq
+          ? "delivered"
+          : "sent",
+  };
+};
 
 const getMessageSnippet = (message: Message) =>
   message.text?.trim() ||
@@ -1707,6 +1852,7 @@ function SwipeableChatRow({
         <Avatar
           label={chat.avatar}
           gradient={chat.gradient}
+          imageUrl={chat.avatarUrl}
           online={chat.online}
         />
         <span className="chat-copy">
@@ -2178,6 +2324,7 @@ function ChatsView({
                     <Avatar
                       label={chat.avatar}
                       gradient={chat.gradient}
+                      imageUrl={chat.avatarUrl}
                       online={chat.online}
                     />
                     <span className="chat-copy">
@@ -2379,6 +2526,7 @@ function ChatsView({
                       <Avatar
                         label={chat.avatar}
                         gradient={chat.gradient}
+                        imageUrl={chat.avatarUrl}
                         size="small"
                       />
                       <span>{chat.title}</span>
@@ -2522,9 +2670,11 @@ function ChatView({
     (user) => user.online,
   ).length;
   const conversationStatus =
-    chat.kind === "group"
-      ? `${participantCountLabel} · ${onlineParticipantCount} в сети`
-      : profileUser?.online
+    chat.realtimeType === "channel"
+      ? `Канал · ${participantCountLabel}`
+      : chat.kind === "group"
+        ? `${participantCountLabel} · ${onlineParticipantCount} в сети`
+        : profileUser?.online
         ? "в сети"
         : "не в сети";
   const panelsReturningToMenu: ActiveChatPanel[] = [
@@ -2867,6 +3017,7 @@ function ChatView({
           <Avatar
             label={chat.avatar}
             gradient={chat.gradient}
+            imageUrl={chat.avatarUrl}
             size="small"
             online={chat.online}
           />
@@ -3519,7 +3670,7 @@ function ChatView({
                   <Avatar
                     label={profileUser?.avatar ?? chat.avatar}
                     gradient={profileUser?.gradient ?? chat.gradient}
-                    imageUrl={profileUser?.avatarUrl}
+                    imageUrl={profileUser?.avatarUrl ?? chat.avatarUrl}
                     size="hero"
                     online={profileUser?.online ?? chat.online}
                   />
@@ -3747,7 +3898,7 @@ function ChatView({
                   <Avatar
                     label={profileUser?.avatar ?? chat.avatar}
                     gradient={profileUser?.gradient ?? chat.gradient}
-                    imageUrl={profileUser?.avatarUrl}
+                    imageUrl={profileUser?.avatarUrl ?? chat.avatarUrl}
                     size="large"
                     online={profileUser?.online ?? chat.online}
                   />
@@ -5527,6 +5678,7 @@ function AuditOverlay({
               <Avatar
                 label={chat.avatar}
                 gradient={chat.gradient}
+                imageUrl={chat.avatarUrl}
                 online={chat.online}
               />
               <span>
@@ -5939,10 +6091,47 @@ export default function Home() {
   const [notificationUntil, setNotificationUntil] = useState<number | null>(
     null,
   );
-    const apiClientRef = useRef<CifraApiClient | null>(null);
+  const apiClientRef = useRef<CifraApiClient | null>(null);
   const realtimeClientRef = useRef<CifraRealtimeClient | null>(null);
+  const realtimeUiTopicRef = useRef<string | null>(null);
+  const realtimeUiTopicsRef = useRef<Set<string>>(new Set());
+  const realtimeParticipantIdsRef = useRef<Set<string>>(new Set());
+  const realtimeActivityRef = useRef<
+    Record<string, { seq: number; order: number }>
+  >({});
+  const [realtimeReadSeqByTopic, setRealtimeReadSeqByTopic] = useState<
+    Record<string, number>
+  >({});
   const [realtimeStatus, setRealtimeStatus] =
     useState<RealtimeStatus>("disconnected");
+  const [realtimeSubscriptions, setRealtimeSubscriptions] = useState<
+    readonly RealtimeChatSubscription[]
+  >([]);
+  const [realtimeAttachedTopics, setRealtimeAttachedTopics] = useState<
+    readonly string[]
+  >([]);
+  const [realtimeMessages, setRealtimeMessages] = useState<
+    readonly RealtimeChatMessage[]
+  >([]);
+  const [realtimeMetadata, setRealtimeMetadata] = useState<
+    readonly RealtimeChatMetadata[]
+  >([]);
+  const [realtimeReceipts, setRealtimeReceipts] = useState<
+    readonly RealtimeChatReceipt[]
+  >([]);
+  const [realtimeUserId, setRealtimeUserId] = useState<string | null>(null);
+  const [realtimeObservedTopic, setRealtimeObservedTopic] = useState<
+    string | null
+  >(null);
+  const [realtimeChatStatus, setRealtimeChatStatus] =
+    useState<RealtimeChatObserverStatus>("idle");
+  const [realtimePublishStatus, setRealtimePublishStatus] =
+    useState<RealtimePublishStatus>("idle");
+  const [realtimePublishedSeq, setRealtimePublishedSeq] = useState<
+    number | null
+  >(null);
+  const [realtimeDiagnostics, setRealtimeDiagnostics] =
+    useState<RealtimeDiagnostics>(EMPTY_REALTIME_DIAGNOSTICS);
   const [authMode, setAuthMode] = useState<RuntimeMode>("demo");
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
@@ -6023,12 +6212,49 @@ export default function Home() {
       realtimeClientRef.current?.disconnect();
       realtimeClientRef.current = null;
       setRealtimeStatus("disconnected");
+      setRealtimeSubscriptions([]);
+      setRealtimeAttachedTopics([]);
+      setRealtimeMessages([]);
+      setRealtimeMetadata([]);
+      setRealtimeReceipts([]);
+      setRealtimeUserId(null);
+      setRealtimeObservedTopic(null);
+      setRealtimeChatStatus("idle");
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
+      setRealtimeDiagnostics(EMPTY_REALTIME_DIAGNOSTICS);
+      setRealtimeReadSeqByTopic({});
+      realtimeActivityRef.current = {};
+      realtimeUiTopicsRef.current = new Set();
+      realtimeUiTopicRef.current = null;
       return;
     }
 
-    const realtimeClient = new CifraRealtimeClient((status) => {
-      setRealtimeStatus(status);
-    });
+    const realtimeClient = new CifraRealtimeClient(
+      (status) => {
+        setRealtimeStatus(status);
+        if (status === "disconnected") {
+          setRealtimeUserId(null);
+        }
+      },
+      (subscriptions) => {
+        setRealtimeSubscriptions([...subscriptions]);
+      },
+      (messages) => {
+        setRealtimeMessages([...messages]);
+      },
+      (receipts) => {
+        setRealtimeReceipts([...receipts]);
+      },
+      (metadata) => {
+        setRealtimeMetadata([...metadata]);
+      },
+      {
+        onDiagnostics: (diagnostics) => {
+          setRealtimeDiagnostics({ ...diagnostics });
+        },
+      },
+    );
 
     realtimeClientRef.current?.disconnect();
     realtimeClientRef.current = realtimeClient;
@@ -6040,27 +6266,31 @@ export default function Home() {
         apiBaseUrl: apiClient.config.apiBaseUrl,
         accessToken: authSession.tokens.access_token,
         deviceId: apiClient.currentDeviceId,
+        ticketProvider: () => apiClient.issueRealtimeTicket(),
       })
-      .then(() => {
+      .then((userId) => {
         if (cancelled) {
           realtimeClient.disconnect();
+          return;
         }
+
+        setRealtimeUserId(userId);
       })
-.catch((error: unknown) => {
-  if (cancelled) {
-    return;
-  }
+      .catch((error: unknown) => {
+        if (cancelled) {
+          return;
+        }
 
-  if (
-    error instanceof CifraRealtimeError &&
-    error.code === "realtime_connection_cancelled"
-  ) {
-    setRealtimeStatus("disconnected");
-    return;
-  }
+        if (
+          error instanceof CifraRealtimeError &&
+          error.code === "realtime_connection_cancelled"
+        ) {
+          setRealtimeStatus("disconnected");
+          return;
+        }
 
-  setRealtimeStatus("error");
-});
+        setRealtimeStatus("error");
+      });
 
     return () => {
       cancelled = true;
@@ -6071,6 +6301,476 @@ export default function Home() {
       }
     };
   }, [authSession, sessionActive]);
+  useEffect(() => {
+    const realtimeClient = realtimeClientRef.current;
+
+    if (!sessionActive || !realtimeClient) {
+      setRealtimeAttachedTopics([]);
+      setRealtimeObservedTopic(null);
+      setRealtimeChatStatus("idle");
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
+      return;
+    }
+
+    if (realtimeStatus === "reconnecting") {
+      return;
+    }
+
+    if (realtimeStatus !== "connected") {
+      setRealtimeAttachedTopics([]);
+      setRealtimeObservedTopic(null);
+      setRealtimeChatStatus("idle");
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
+      return;
+    }
+
+    const readableSubscriptions =
+      getReadableRealtimeSubscriptions(realtimeSubscriptions);
+
+    if (readableSubscriptions.length === 0) {
+      setRealtimeAttachedTopics([]);
+      setRealtimeObservedTopic(null);
+      setRealtimeChatStatus("idle");
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
+      return;
+    }
+
+    let cancelled = false;
+    setRealtimeChatStatus("subscribing");
+
+    const subscriptionTasks = readableSubscriptions.map((subscription) =>
+      realtimeClient.subscribeToChat(subscription.topic, {
+        historyLimit: 20,
+      }),
+    );
+
+    void Promise.allSettled(subscriptionTasks).then((results) => {
+      if (cancelled) return;
+
+      const attachedTopics = readableSubscriptions.flatMap(
+        (subscription, index) =>
+          results[index]?.status === "fulfilled" &&
+          realtimeClient.isTopicSubscribed(subscription.topic)
+            ? [subscription.topic]
+            : [],
+      );
+
+      setRealtimeAttachedTopics(attachedTopics);
+      setRealtimeObservedTopic((current) =>
+        resolveRealtimeObservedTopic(null, current, attachedTopics),
+      );
+      setRealtimeChatStatus(
+        attachedTopics.length > 0 ? "subscribed" : "error",
+      );
+
+      if (attachedTopics.length === 0) {
+        setRealtimePublishStatus("idle");
+        setRealtimePublishedSeq(null);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [realtimeStatus, realtimeSubscriptions, sessionActive]);
+  useEffect(() => {
+    const nextObservedTopic = resolveRealtimeObservedTopic(
+      selectedChatId,
+      realtimeObservedTopic,
+      realtimeAttachedTopics,
+    );
+
+    if (nextObservedTopic !== realtimeObservedTopic) {
+      setRealtimeObservedTopic(nextObservedTopic);
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
+    }
+  }, [
+    realtimeAttachedTopics,
+    realtimeObservedTopic,
+    selectedChatId,
+  ]);
+  useEffect(() => {
+    const previousTopics = realtimeUiTopicsRef.current;
+    const attachedTopicSet = new Set(realtimeAttachedTopics);
+    const activeSubscriptions = realtimeSubscriptions.filter(
+      (subscription) => attachedTopicSet.has(subscription.topic),
+    );
+    const metadataByTopic = new Map(
+      realtimeMetadata.map((metadata) => [metadata.topic, metadata]),
+    );
+    const participantNameById = new Map(
+      realtimeMetadata.flatMap((metadata) =>
+        buildRealtimeParticipantProfiles(metadata, realtimeUserId).map(
+          (participant) => [participant.id, participant.name] as const,
+        ),
+      ),
+    );
+
+    if (
+      !sessionActive ||
+      !realtimeUserId ||
+      activeSubscriptions.length === 0
+    ) {
+      if (previousTopics.size > 0 || authMode === "backend") {
+        setChatItems((current) => {
+          const withoutDetachedRealtime = current.filter(
+            (chat) => !previousTopics.has(chat.id),
+          );
+          return filterChatsForRuntimeMode(
+            authMode,
+            withoutDetachedRealtime,
+            [],
+          );
+        });
+        setSelectedChatId((current) =>
+          keepSelectedChatForRuntimeMode(authMode, current, []),
+        );
+        setMessagesByChat((current) => {
+          const withoutDetachedRealtime = { ...current };
+          for (const topic of previousTopics) {
+            delete withoutDetachedRealtime[topic];
+          }
+          return filterMessagesForRuntimeMode(
+            authMode,
+            withoutDetachedRealtime,
+            [],
+          );
+        });
+        setRealtimeReadSeqByTopic((current) => {
+          const next = { ...current };
+          let changed = false;
+          for (const topic of previousTopics) {
+            if (topic in next) {
+              delete next[topic];
+              changed = true;
+            }
+          }
+          return changed ? next : current;
+        });
+        for (const topic of previousTopics) {
+          delete realtimeActivityRef.current[topic];
+        }
+      }
+
+      realtimeUiTopicsRef.current = new Set();
+      realtimeUiTopicRef.current = null;
+      return;
+    }
+
+    const projectedMessagesByTopic: Record<string, Message[]> = {};
+    const realtimeChats = activeSubscriptions.map((subscription) => {
+      const activeTopic = subscription.topic;
+      const topicMessages = realtimeMessages.filter(
+        (message) => message.topic === activeTopic,
+      );
+      const projectedMessages = topicMessages
+        .map((message) =>
+          withRealtimeReceiptStatus(
+            buildRealtimeUiMessage(
+              message,
+              realtimeUserId,
+              message.from
+                ? participantNameById.get(message.from)
+                : undefined,
+            ),
+            message,
+            realtimeUserId,
+            realtimeReceipts,
+          ),
+        )
+        .filter((message): message is Message => Boolean(message));
+      projectedMessagesByTopic[activeTopic] = projectedMessages;
+
+      const latestMessage = projectedMessages.at(-1);
+      const latestServerSeq = getLatestRealtimeSeq(
+        topicMessages,
+        activeTopic,
+        subscription.seq ?? 0,
+      );
+      const effectiveReadSeq = Math.max(
+        subscription.read ?? 0,
+        realtimeReadSeqByTopic[activeTopic] ?? 0,
+      );
+      const unread = getRealtimeUnreadCount(
+        topicMessages,
+        activeTopic,
+        realtimeUserId,
+        effectiveReadSeq,
+        latestServerSeq,
+      );
+      const previousActivity = realtimeActivityRef.current[activeTopic];
+
+      if (!previousActivity || latestServerSeq > previousActivity.seq) {
+        realtimeActivityRef.current[activeTopic] = {
+          seq: latestServerSeq,
+          order: ++activitySequenceRef.current,
+        };
+      }
+
+      const realtimeActivityOrder =
+        realtimeActivityRef.current[activeTopic]?.order ??
+        ++activitySequenceRef.current;
+      const metadataProjection = projectRealtimeChatMetadata(
+        subscription,
+        metadataByTopic.get(activeTopic),
+        realtimeUserId,
+      );
+      const realtimeKind = metadataProjection.kind as Chat["kind"];
+
+      return {
+        id: activeTopic,
+        title: metadataProjection.title,
+        subtitle: latestMessage
+          ? getChatPreview(latestMessage, realtimeKind)
+          : "Реальный чат Tinode",
+        time:
+          latestMessage?.time ||
+          formatRealtimeTimestamp(
+            subscription.touchedAt || subscription.updatedAt,
+          ),
+        unread,
+        avatar: metadataProjection.avatar,
+        ...(metadataProjection.avatarUrl
+          ? { avatarUrl: metadataProjection.avatarUrl }
+          : {}),
+        gradient: "linear-gradient(145deg, #0f766e, #2563eb)",
+        kind: realtimeKind,
+        realtimeType: metadataProjection.type,
+        memberIds: metadataProjection.memberIds,
+        lastActivityOrder: realtimeActivityOrder,
+        ...(latestMessage
+          ? {
+              lastMessageId: latestMessage.id,
+              lastMessageSide: latestMessage.side,
+              ...(latestMessage.deliveryStatus
+                ? { lastDeliveryStatus: latestMessage.deliveryStatus }
+                : {}),
+            }
+          : {}),
+        ...(typeof subscription.online === "boolean"
+          ? { online: subscription.online }
+          : {}),
+      } satisfies Chat;
+    });
+
+    const currentTopics = new Set(
+      activeSubscriptions.map((subscription) => subscription.topic),
+    );
+
+    setMessagesByChat((current) => {
+      const next = canUseLocalChatFallback(authMode) ? { ...current } : {};
+      for (const topic of previousTopics) {
+        if (!currentTopics.has(topic)) {
+          delete next[topic];
+        }
+      }
+      for (const [topic, messages] of Object.entries(
+        projectedMessagesByTopic,
+      )) {
+        next[topic] = messages;
+      }
+      return filterMessagesForRuntimeMode(
+        authMode,
+        next,
+        currentTopics,
+      );
+    });
+    setChatItems((current) => {
+      const existingById = new Map(current.map((chat) => [chat.id, chat]));
+      const withoutRealtimeTopics = canUseLocalChatFallback(authMode)
+        ? current.filter(
+            (chat) =>
+              !previousTopics.has(chat.id) && !currentTopics.has(chat.id),
+          )
+        : [];
+      const nextRealtimeChats = realtimeChats.map((chat) => {
+        const existing = existingById.get(chat.id);
+        if (!existing) return chat;
+
+        return {
+          ...chat,
+          ...(existing.pinned ? { pinned: true } : {}),
+          ...(existing.muted ? { muted: true } : {}),
+          ...(existing.archived ? { archived: true } : {}),
+          ...(existing.deleted ? { deleted: true } : {}),
+        };
+      });
+
+      return filterChatsForRuntimeMode(
+        authMode,
+        [...nextRealtimeChats, ...withoutRealtimeTopics],
+        currentTopics,
+      );
+    });
+    setSelectedChatId((current) =>
+      keepSelectedChatForRuntimeMode(authMode, current, currentTopics),
+    );
+    setRealtimeReadSeqByTopic((current) => {
+      const next = { ...current };
+      let changed = false;
+      for (const topic of previousTopics) {
+        if (!currentTopics.has(topic) && topic in next) {
+          delete next[topic];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+    for (const topic of previousTopics) {
+      if (!currentTopics.has(topic)) {
+        delete realtimeActivityRef.current[topic];
+      }
+    }
+
+    realtimeUiTopicsRef.current = currentTopics;
+    realtimeUiTopicRef.current = resolveRealtimeObservedTopic(
+      selectedChatId,
+      realtimeObservedTopic,
+      realtimeAttachedTopics,
+    );
+  }, [
+    authMode,
+    realtimeAttachedTopics,
+    realtimeMessages,
+    realtimeMetadata,
+    realtimeObservedTopic,
+    realtimeReadSeqByTopic,
+    realtimeReceipts,
+    realtimeSubscriptions,
+    realtimeUserId,
+    selectedChatId,
+    sessionActive,
+  ]);
+  useEffect(() => {
+    const previousParticipantIds = realtimeParticipantIdsRef.current;
+    const participantProfiles = realtimeMetadata.flatMap((metadata) =>
+      buildRealtimeParticipantProfiles(metadata, realtimeUserId),
+    );
+    const uniqueProfiles = Array.from(
+      new Map(
+        participantProfiles.map((participant) => [
+          participant.id,
+          participant,
+        ]),
+      ).values(),
+    );
+    const currentParticipantIds = new Set(
+      uniqueProfiles.map((participant) => participant.id),
+    );
+
+    setUsers((current) => {
+      const retained = current.filter(
+        (user) => !previousParticipantIds.has(user.id),
+      );
+      const retainedIds = new Set(retained.map((user) => user.id));
+      const generated = uniqueProfiles
+        .filter((participant) => !retainedIds.has(participant.id))
+        .map(
+          (participant): MessengerUser => ({
+            id: participant.id,
+            name: participant.name,
+            email: "",
+            username: participant.id,
+            phone: "",
+            avatar: participant.avatar,
+            ...(participant.avatarUrl
+              ? { avatarUrl: participant.avatarUrl }
+              : {}),
+            gradient: "linear-gradient(145deg, #0f766e, #2563eb)",
+            role: "employee",
+            online: participant.online,
+            position: "Участник Tinode",
+          }),
+        );
+
+      if (
+        generated.length === 0 &&
+        retained.length === current.length
+      ) {
+        return current;
+      }
+
+      return [...retained, ...generated];
+    });
+
+    realtimeParticipantIdsRef.current = currentParticipantIds;
+  }, [realtimeMetadata, realtimeUserId]);
+
+  useEffect(() => {
+    const realtimeClient = realtimeClientRef.current;
+    const topic =
+      selectedChatId && realtimeAttachedTopics.includes(selectedChatId)
+        ? selectedChatId
+        : null;
+    const userId = realtimeUserId;
+
+    if (
+      !sessionActive ||
+      realtimeStatus !== "connected" ||
+      realtimeChatStatus !== "subscribed" ||
+      !realtimeClient ||
+      !topic ||
+      !userId ||
+      selectedChatId !== topic
+    ) {
+      return;
+    }
+
+    const markLatestIncomingAsRead = () => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
+
+      const latestIncomingSeq = realtimeMessages.reduce(
+        (highest, message) =>
+          message.topic === topic &&
+          message.from &&
+          message.from !== userId
+            ? Math.max(highest, message.seq)
+            : highest,
+        0,
+      );
+
+      if (latestIncomingSeq > 0) {
+        try {
+          realtimeClient.markRead(topic, latestIncomingSeq);
+          setRealtimeReadSeqByTopic((current) =>
+            latestIncomingSeq > (current[topic] ?? 0)
+              ? { ...current, [topic]: latestIncomingSeq }
+              : current,
+          );
+        } catch {
+          // Connection cleanup may race with a visibility change.
+        }
+      }
+    };
+
+    markLatestIncomingAsRead();
+    document.addEventListener(
+      "visibilitychange",
+      markLatestIncomingAsRead,
+    );
+
+    return () => {
+      document.removeEventListener(
+        "visibilitychange",
+        markLatestIncomingAsRead,
+      );
+    };
+  }, [
+    realtimeAttachedTopics,
+    realtimeChatStatus,
+    realtimeMessages,
+    realtimeStatus,
+    realtimeUserId,
+    selectedChatId,
+    sessionActive,
+  ]);
+
   useEffect(() => {
     let frameId: number | undefined;
     try {
@@ -6319,8 +7019,9 @@ export default function Home() {
     }
   };
 
-  const selectedChat =
-    chatItems.find((chat) => chat.id === selectedChatId) ?? chatItems[0];
+  const selectedChat = selectedChatId
+    ? (chatItems.find((chat) => chat.id === selectedChatId) ?? null)
+    : null;
   const selectedMessages = selectedChat
     ? (messagesByChat[selectedChat.id] ?? [])
     : [];
@@ -6334,12 +7035,37 @@ export default function Home() {
     0,
   );
 
+  const acknowledgeRealtimeChatOpen = (id: string) => {
+    if (!realtimeUserId || !realtimeAttachedTopics.includes(id)) {
+      return;
+    }
+
+    const latestIncomingSeq = getLatestIncomingRealtimeSeq(
+      realtimeMessages,
+      id,
+      realtimeUserId,
+    );
+    if (latestIncomingSeq > 0) {
+      setRealtimeReadSeqByTopic((current) =>
+        latestIncomingSeq > (current[id] ?? 0)
+          ? { ...current, [id]: latestIncomingSeq }
+          : current,
+      );
+    }
+  };
+
   const openChat = (id: string) => {
     setChatItems((current) =>
       current.map((chat) =>
         chat.id === id && chat.unread > 0 ? { ...chat, unread: 0 } : chat,
       ),
     );
+    acknowledgeRealtimeChatOpen(id);
+    if (realtimeAttachedTopics.includes(id)) {
+      setRealtimeObservedTopic(id);
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
+    }
     setSelectedChatId(id);
     setComposeOpen(false);
   };
@@ -6348,6 +7074,10 @@ export default function Home() {
     const directChat = chatItems.find((chat) => chat.id === id);
     if (directChat) {
       openChat(directChat.id);
+      return;
+    }
+    if (!canUseLocalChatFallback(authMode)) {
+      setComposeOpen(false);
       return;
     }
     const user = users.find((person) => person.id === id);
@@ -6410,12 +7140,28 @@ export default function Home() {
   realtimeClientRef.current?.disconnect();
   realtimeClientRef.current = null;
   setRealtimeStatus("disconnected");
+  setRealtimeSubscriptions([]);
+  setRealtimeAttachedTopics([]);
+  setRealtimeMessages([]);
+  setRealtimeMetadata([]);
+  setRealtimeReceipts([]);
+  setRealtimeUserId(null);
+  setRealtimeObservedTopic(null);
+  setRealtimeChatStatus("idle");
+  setRealtimePublishStatus("idle");
+  setRealtimePublishedSeq(null);
+  setRealtimeDiagnostics(EMPTY_REALTIME_DIAGNOSTICS);
+  setRealtimeReadSeqByTopic({});
+  realtimeActivityRef.current = {};
+  realtimeUiTopicsRef.current = new Set();
+  realtimeUiTopicRef.current = null;
 
   try {
     await apiClientRef.current?.logout();
   } finally {
     setAuthSession(null);
     setSessionActive(false);
+    setSelectedChatId(null);
     setComposeOpen(false);
     setCallOpen(false);
     setSelectedProfileUserId(null);
@@ -6626,6 +7372,10 @@ export default function Home() {
   };
 
   const createGroup = (name: string, memberIds: string[]) => {
+    if (!canUseLocalChatFallback(authMode)) {
+      setComposeOpen(false);
+      return;
+    }
     const newChat: Chat = {
       id: `group-${Date.now()}`,
       title: name,
@@ -6664,6 +7414,54 @@ export default function Home() {
     const normalizedText = text.trim();
     const voice = options.voice?.trim();
     if (!normalizedText && !voice) return false;
+
+    const realtimeClient = realtimeClientRef.current;
+
+    const isAttachedRealtimeChat =
+      realtimeAttachedTopics.includes(chatId);
+
+    if (
+      realtimeClient &&
+      isAttachedRealtimeChat &&
+      realtimeStatus === "connected" &&
+      realtimeChatStatus === "subscribed" &&
+      realtimeClient.isTopicSubscribed(chatId)
+    ) {
+      if (
+        !normalizedText ||
+        voice ||
+        options.replyToId !== undefined ||
+        options.forwardedFrom
+      ) {
+        setRealtimePublishStatus("error");
+        return false;
+      }
+
+      setRealtimePublishStatus("publishing");
+      setRealtimePublishedSeq(null);
+
+      void realtimeClient
+        .publishText(chatId, normalizedText)
+        .then((result) => {
+          setRealtimePublishedSeq(result.seq);
+          setRealtimePublishStatus("published");
+          setRealtimeReadSeqByTopic((current) =>
+            result.seq > (current[chatId] ?? 0)
+              ? { ...current, [chatId]: result.seq }
+              : current,
+          );
+        })
+        .catch(() => {
+          setRealtimePublishStatus("error");
+        });
+
+      return true;
+    }
+
+    if (!canUseLocalChatFallback(authMode)) {
+      setRealtimePublishStatus("error");
+      return false;
+    }
 
     const now = formatMessageTime();
     const messageId = Date.now();
@@ -6760,6 +7558,7 @@ export default function Home() {
   };
 
   const clearMessages = (chatId: string) => {
+    if (!canUseLocalChatFallback(authMode)) return;
     setMessagesByChat((current) => ({ ...current, [chatId]: [] }));
     setChatItems((current) =>
       current.map((chat) =>
@@ -6788,7 +7587,104 @@ export default function Home() {
     return (
     <main
       className={`prototype-shell theme-${theme}`}
+      data-chat-source={authMode === "backend" ? "tinode" : "demo"}
+      data-local-chat-fallback={canUseLocalChatFallback(authMode)}
       data-realtime-status={realtimeStatus}
+      data-realtime-user-id={realtimeUserId ?? ""}
+      data-realtime-session-ready={
+        realtimeStatus === "connected" &&
+        Boolean(realtimeUserId) &&
+        realtimeAttachedTopics.length > 0
+          ? "true"
+          : "false"
+      }
+      data-realtime-connection-generation={
+        realtimeDiagnostics.connectionGeneration
+      }
+      data-realtime-reconnect-success-count={
+        realtimeDiagnostics.reconnectSuccessCount
+      }
+      data-realtime-duplicate-message-count={
+        realtimeDiagnostics.duplicateMessageCount
+      }
+      data-realtime-last-error={realtimeDiagnostics.lastError ?? ""}
+      data-realtime-preserved-during-reconnect={
+        realtimeStatus === "reconnecting" &&
+        realtimeAttachedTopics.length > 0
+          ? "true"
+          : "false"
+      }
+      data-realtime-topic-count={realtimeSubscriptions.length}
+      data-realtime-metadata-count={realtimeMetadata.length}
+      data-realtime-attached-topic-count={realtimeAttachedTopics.length}
+      data-realtime-ui-topic-count={realtimeUiTopicsRef.current.size}
+      data-realtime-chat-status={realtimeChatStatus}
+      data-realtime-observed-topic={realtimeObservedTopic ?? ""}
+      data-realtime-selected-topic={
+        selectedChatId && realtimeAttachedTopics.includes(selectedChatId)
+          ? selectedChatId
+          : ""
+      }
+      data-realtime-message-count={
+        realtimeObservedTopic
+          ? realtimeMessages.filter(
+              (message) => message.topic === realtimeObservedTopic,
+            ).length
+          : 0
+      }
+      data-realtime-publish-status={realtimePublishStatus}
+      data-realtime-published-seq={realtimePublishedSeq ?? ""}
+      data-realtime-receipt-count={realtimeReceipts.length}
+      data-realtime-remote-recv-seq={
+        realtimeObservedTopic && realtimeUserId
+          ? getRealtimeReceiptSeq(
+              realtimeReceipts,
+              realtimeObservedTopic,
+              "recv",
+              realtimeUserId,
+            )
+          : 0
+      }
+      data-realtime-remote-read-seq={
+        realtimeObservedTopic && realtimeUserId
+          ? getRealtimeReceiptSeq(
+              realtimeReceipts,
+              realtimeObservedTopic,
+              "read",
+              realtimeUserId,
+            )
+          : 0
+      }
+      data-realtime-ui-topic={realtimeUiTopicRef.current ?? ""}
+      data-realtime-selected-participant-count={
+        selectedChatId
+          ? (chatItems.find((chat) => chat.id === selectedChatId)?.memberIds
+              ?.length ?? 0)
+          : 0
+      }
+      data-realtime-ui-message-count={
+        realtimeUiTopicRef.current
+          ? (messagesByChat[realtimeUiTopicRef.current]?.length ?? 0)
+          : 0
+      }
+      data-realtime-unread-count={
+        realtimeUiTopicRef.current
+          ? (chatItems.find(
+              (chat) => chat.id === realtimeUiTopicRef.current,
+            )?.unread ?? 0)
+          : 0
+      }
+      data-realtime-local-read-seq={
+        realtimeUiTopicRef.current
+          ? (realtimeReadSeqByTopic[realtimeUiTopicRef.current] ?? 0)
+          : 0
+      }
+      data-realtime-activity-order={
+        realtimeUiTopicRef.current
+          ? (realtimeActivityRef.current[realtimeUiTopicRef.current]?.order ??
+            0)
+          : 0
+      }
     >
       <div className="device-stage">
         <div className="device-glow" />
@@ -6838,7 +7734,7 @@ export default function Home() {
                         className="conversation-stage"
                         aria-label="Область переписки"
                       >
-                        {selectedChatId ? (
+                        {selectedChat ? (
                           <ChatView
                             key={selectedChat.id}
                             chat={selectedChat}

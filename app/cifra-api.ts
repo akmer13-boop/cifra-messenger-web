@@ -409,6 +409,13 @@ get currentDeviceId(): string {
     this.clearSession();
   }
 
+  async issueRealtimeTicket(): Promise<unknown> {
+    return this.request<unknown>("/api/v1/realtime/tickets", {
+      method: "POST",
+      body: JSON.stringify({ channel: "tinode" }),
+    });
+  }
+
   async request<T>(
     path: string,
     init: RequestInit = {},
