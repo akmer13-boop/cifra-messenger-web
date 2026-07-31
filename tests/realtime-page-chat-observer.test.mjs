@@ -4,7 +4,7 @@ import test from "node:test";
 
 const pageUrl = new URL("../app/page.tsx", import.meta.url);
 
-test("observes one readable Tinode chat without replacing the mock chat UI", async () => {
+test("observes every readable Tinode chat without replacing the mock chat UI", async () => {
   const page = await readFile(pageUrl, "utf8");
 
   assert.match(page, /type RealtimeChatMessage/);
@@ -16,27 +16,23 @@ test("observes one readable Tinode chat without replacing the mock chat UI", asy
     page,
     /new CifraRealtimeClient\([\s\S]*?\(messages\) => \{[\s\S]*?setRealtimeMessages\(\[\.\.\.messages\]\);[\s\S]*?\},[\s\S]*?\);/,
   );
+  assert.match(page, /getReadableRealtimeSubscriptions\(realtimeSubscriptions\)/);
   assert.match(
     page,
-    /realtimeSubscriptions\.find\([\s\S]*?candidate\.access\.mode\.includes\("R"\)/,
+    /readableSubscriptions\.map\(\(subscription\) =>[\s\S]*?subscribeToChat\(subscription\.topic, \{[\s\S]*?historyLimit: 20/,
   );
-  assert.match(
-    page,
-    /subscribeToChat\(subscription\.topic, \{[\s\S]*?historyLimit: 20/,
-  );
+  assert.match(page, /Promise\.allSettled\(subscriptionTasks\)/);
   assert.match(page, /data-realtime-chat-status=\{realtimeChatStatus\}/);
   assert.match(
     page,
     /data-realtime-observed-topic=\{realtimeObservedTopic \?\? ""\}/,
   );
+  assert.match(page, /data-realtime-attached-topic-count=/);
   assert.match(page, /data-realtime-message-count=/);
   assert.match(page, /setRealtimeMessages\(\[\]\)/);
 
   assert.match(page, /useState<Chat\[]>\(initialChats\)/);
-  assert.doesNotMatch(
-    page,
-    /setChatItems\([\s\S]{0,300}(?:realtimeMessages|realtimeObservedTopic)/,
-  );
+  assert.match(page, /withoutRealtimeTopics/);
   assert.match(page, /const sendMessage = \(/);
   assert.match(page, /window\.setTimeout/);
 });
