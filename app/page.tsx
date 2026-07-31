@@ -111,6 +111,12 @@ import {
   buildRealtimeParticipantProfiles,
   projectRealtimeChatMetadata,
 } from "./realtime-chat-metadata-policy.mjs";
+import {
+  canUseLocalChatFallback,
+  filterChatsForRuntimeMode,
+  filterMessagesForRuntimeMode,
+  keepSelectedChatForRuntimeMode,
+} from "./chat-source-policy.mjs";
 
 import {
   clampSwipeOffset,
@@ -6394,19 +6400,30 @@ export default function Home() {
       !realtimeUserId ||
       activeSubscriptions.length === 0
     ) {
-      if (previousTopics.size > 0) {
-        setChatItems((current) =>
-          current.filter((chat) => !previousTopics.has(chat.id)),
-        );
+      if (previousTopics.size > 0 || authMode === "backend") {
+        setChatItems((current) => {
+          const withoutDetachedRealtime = current.filter(
+            (chat) => !previousTopics.has(chat.id),
+          );
+          return filterChatsForRuntimeMode(
+            authMode,
+            withoutDetachedRealtime,
+            [],
+          );
+        });
         setSelectedChatId((current) =>
-          current && previousTopics.has(current) ? null : current,
+          keepSelectedChatForRuntimeMode(authMode, current, []),
         );
         setMessagesByChat((current) => {
-          const next = { ...current };
+          const withoutDetachedRealtime = { ...current };
           for (const topic of previousTopics) {
-            delete next[topic];
+            delete withoutDetachedRealtime[topic];
           }
-          return next;
+          return filterMessagesForRuntimeMode(
+            authMode,
+            withoutDetachedRealtime,
+            [],
+          );
         });
         setRealtimeReadSeqByTopic((current) => {
           const next = { ...current };
@@ -6530,7 +6547,7 @@ export default function Home() {
     );
 
     setMessagesByChat((current) => {
-      const next = { ...current };
+      const next = canUseLocalChatFallback(authMode) ? { ...current } : {};
       for (const topic of previousTopics) {
         if (!currentTopics.has(topic)) {
           delete next[topic];
@@ -6541,14 +6558,20 @@ export default function Home() {
       )) {
         next[topic] = messages;
       }
-      return next;
+      return filterMessagesForRuntimeMode(
+        authMode,
+        next,
+        currentTopics,
+      );
     });
     setChatItems((current) => {
       const existingById = new Map(current.map((chat) => [chat.id, chat]));
-      const withoutRealtimeTopics = current.filter(
-        (chat) =>
-          !previousTopics.has(chat.id) && !currentTopics.has(chat.id),
-      );
+      const withoutRealtimeTopics = canUseLocalChatFallback(authMode)
+        ? current.filter(
+            (chat) =>
+              !previousTopics.has(chat.id) && !currentTopics.has(chat.id),
+          )
+        : [];
       const nextRealtimeChats = realtimeChats.map((chat) => {
         const existing = existingById.get(chat.id);
         if (!existing) return chat;
@@ -6562,12 +6585,14 @@ export default function Home() {
         };
       });
 
-      return [...nextRealtimeChats, ...withoutRealtimeTopics];
+      return filterChatsForRuntimeMode(
+        authMode,
+        [...nextRealtimeChats, ...withoutRealtimeTopics],
+        currentTopics,
+      );
     });
     setSelectedChatId((current) =>
-      current && previousTopics.has(current) && !currentTopics.has(current)
-        ? null
-        : current,
+      keepSelectedChatForRuntimeMode(authMode, current, currentTopics),
     );
     setRealtimeReadSeqByTopic((current) => {
       const next = { ...current };
@@ -6593,6 +6618,7 @@ export default function Home() {
       realtimeAttachedTopics,
     );
   }, [
+    authMode,
     realtimeAttachedTopics,
     realtimeMessages,
     realtimeMetadata,
@@ -6978,8 +7004,9 @@ export default function Home() {
     }
   };
 
-  const selectedChat =
-    chatItems.find((chat) => chat.id === selectedChatId) ?? chatItems[0];
+  const selectedChat = selectedChatId
+    ? (chatItems.find((chat) => chat.id === selectedChatId) ?? null)
+    : null;
   const selectedMessages = selectedChat
     ? (messagesByChat[selectedChat.id] ?? [])
     : [];
@@ -7032,6 +7059,10 @@ export default function Home() {
     const directChat = chatItems.find((chat) => chat.id === id);
     if (directChat) {
       openChat(directChat.id);
+      return;
+    }
+    if (!canUseLocalChatFallback(authMode)) {
+      setComposeOpen(false);
       return;
     }
     const user = users.find((person) => person.id === id);
@@ -7323,6 +7354,10 @@ export default function Home() {
   };
 
   const createGroup = (name: string, memberIds: string[]) => {
+    if (!canUseLocalChatFallback(authMode)) {
+      setComposeOpen(false);
+      return;
+    }
     const newChat: Chat = {
       id: `group-${Date.now()}`,
       title: name,
@@ -7403,6 +7438,11 @@ export default function Home() {
         });
 
       return true;
+    }
+
+    if (!canUseLocalChatFallback(authMode)) {
+      setRealtimePublishStatus("error");
+      return false;
     }
 
     const now = formatMessageTime();
@@ -7500,6 +7540,7 @@ export default function Home() {
   };
 
   const clearMessages = (chatId: string) => {
+    if (!canUseLocalChatFallback(authMode)) return;
     setMessagesByChat((current) => ({ ...current, [chatId]: [] }));
     setChatItems((current) =>
       current.map((chat) =>
@@ -7528,6 +7569,8 @@ export default function Home() {
     return (
     <main
       className={`prototype-shell theme-${theme}`}
+      data-chat-source={authMode === "backend" ? "tinode" : "demo"}
+      data-local-chat-fallback={canUseLocalChatFallback(authMode)}
       data-realtime-status={realtimeStatus}
       data-realtime-preserved-during-reconnect={
         realtimeStatus === "reconnecting" &&
@@ -7655,7 +7698,7 @@ export default function Home() {
                         className="conversation-stage"
                         aria-label="Область переписки"
                       >
-                        {selectedChatId ? (
+                        {selectedChat ? (
                           <ChatView
                             key={selectedChat.id}
                             chat={selectedChat}
