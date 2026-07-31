@@ -64,6 +64,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
+  getChatPreview,
   hydrateChatsWithMessages,
   sortChatsByActivity,
   withLatestDeliveryStatus,
