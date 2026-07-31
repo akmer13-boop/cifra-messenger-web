@@ -93,6 +93,7 @@ import {
   CifraRealtimeClient,
   CifraRealtimeError,
   type RealtimeChatMessage,
+  type RealtimeChatMetadata,
   type RealtimeChatReceipt,
   type RealtimeChatSubscription,
   type RealtimeStatus,
@@ -106,6 +107,10 @@ import {
   getReadableRealtimeSubscriptions,
   resolveRealtimeObservedTopic,
 } from "./realtime-multi-chat-policy.mjs";
+import {
+  buildRealtimeParticipantProfiles,
+  projectRealtimeChatMetadata,
+} from "./realtime-chat-metadata-policy.mjs";
 
 import {
   clampSwipeOffset,
@@ -169,8 +174,10 @@ type Chat = {
   time: string;
   unread: number;
   avatar: string;
+  avatarUrl?: string;
   gradient: string;
   kind: "work" | "personal" | "group";
+  realtimeType?: "direct" | "group" | "channel";
   lastActivityOrder: number;
   lastMessageId?: number;
   lastMessageSide?: "in" | "out";
@@ -865,44 +872,6 @@ const isRealtimeRecord = (
 ): value is Readonly<Record<string, unknown>> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
-const readRealtimeLabel = (
-  source: Readonly<Record<string, unknown>> | undefined,
-  keys: readonly string[],
-) => {
-  if (!source) return undefined;
-
-  for (const key of keys) {
-    const value = source[key];
-    if (typeof value === "string" && value.trim()) {
-      return value.trim();
-    }
-  }
-
-  return undefined;
-};
-
-const getRealtimeChatTitle = (
-  subscription: RealtimeChatSubscription,
-) =>
-  readRealtimeLabel(subscription.public, ["fn", "title", "name"]) ||
-  readRealtimeLabel(subscription.private, ["title", "name", "comment"]) ||
-  (subscription.topic.startsWith("grp")
-    ? "Групповой чат Tinode"
-    : subscription.topic.startsWith("chn")
-      ? "Канал Tinode"
-      : "Личный чат Tinode");
-
-const getRealtimeAvatar = (title: string) => {
-  const initials = title
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0]?.toLocaleUpperCase("ru"))
-    .join("");
-
-  return initials || "RT";
-};
-
 const getRealtimeMessageText = (content: unknown) => {
   if (typeof content === "string") {
     return content.trim() || undefined;
@@ -937,6 +906,7 @@ const getRealtimeReceiptSeq = (
 const buildRealtimeUiMessage = (
   message: RealtimeChatMessage,
   selfUserId: string,
+  authorName?: string,
 ): Message | null => {
   const text = getRealtimeMessageText(message.content);
   if (!text) return null;
@@ -949,7 +919,9 @@ const buildRealtimeUiMessage = (
     text,
     time: formatRealtimeTimestamp(message.timestamp) || formatMessageTime(),
     ...(outgoing ? { deliveryStatus: "sent" as const } : {}),
-    ...(!outgoing && message.from ? { author: message.from } : {}),
+    ...(!outgoing && message.from
+      ? { author: authorName || message.from }
+      : {}),
   };
 };
 
@@ -1867,6 +1839,7 @@ function SwipeableChatRow({
         <Avatar
           label={chat.avatar}
           gradient={chat.gradient}
+          imageUrl={chat.avatarUrl}
           online={chat.online}
         />
         <span className="chat-copy">
@@ -2338,6 +2311,7 @@ function ChatsView({
                     <Avatar
                       label={chat.avatar}
                       gradient={chat.gradient}
+                      imageUrl={chat.avatarUrl}
                       online={chat.online}
                     />
                     <span className="chat-copy">
@@ -2539,6 +2513,7 @@ function ChatsView({
                       <Avatar
                         label={chat.avatar}
                         gradient={chat.gradient}
+                        imageUrl={chat.avatarUrl}
                         size="small"
                       />
                       <span>{chat.title}</span>
@@ -2682,9 +2657,11 @@ function ChatView({
     (user) => user.online,
   ).length;
   const conversationStatus =
-    chat.kind === "group"
-      ? `${participantCountLabel} · ${onlineParticipantCount} в сети`
-      : profileUser?.online
+    chat.realtimeType === "channel"
+      ? `Канал · ${participantCountLabel}`
+      : chat.kind === "group"
+        ? `${participantCountLabel} · ${onlineParticipantCount} в сети`
+        : profileUser?.online
         ? "в сети"
         : "не в сети";
   const panelsReturningToMenu: ActiveChatPanel[] = [
@@ -3027,6 +3004,7 @@ function ChatView({
           <Avatar
             label={chat.avatar}
             gradient={chat.gradient}
+            imageUrl={chat.avatarUrl}
             size="small"
             online={chat.online}
           />
@@ -3679,7 +3657,7 @@ function ChatView({
                   <Avatar
                     label={profileUser?.avatar ?? chat.avatar}
                     gradient={profileUser?.gradient ?? chat.gradient}
-                    imageUrl={profileUser?.avatarUrl}
+                    imageUrl={profileUser?.avatarUrl ?? chat.avatarUrl}
                     size="hero"
                     online={profileUser?.online ?? chat.online}
                   />
@@ -3907,7 +3885,7 @@ function ChatView({
                   <Avatar
                     label={profileUser?.avatar ?? chat.avatar}
                     gradient={profileUser?.gradient ?? chat.gradient}
-                    imageUrl={profileUser?.avatarUrl}
+                    imageUrl={profileUser?.avatarUrl ?? chat.avatarUrl}
                     size="large"
                     online={profileUser?.online ?? chat.online}
                   />
@@ -5687,6 +5665,7 @@ function AuditOverlay({
               <Avatar
                 label={chat.avatar}
                 gradient={chat.gradient}
+                imageUrl={chat.avatarUrl}
                 online={chat.online}
               />
               <span>
@@ -6103,6 +6082,7 @@ export default function Home() {
   const realtimeClientRef = useRef<CifraRealtimeClient | null>(null);
   const realtimeUiTopicRef = useRef<string | null>(null);
   const realtimeUiTopicsRef = useRef<Set<string>>(new Set());
+  const realtimeParticipantIdsRef = useRef<Set<string>>(new Set());
   const realtimeActivityRef = useRef<
     Record<string, { seq: number; order: number }>
   >({});
@@ -6119,6 +6099,9 @@ export default function Home() {
   >([]);
   const [realtimeMessages, setRealtimeMessages] = useState<
     readonly RealtimeChatMessage[]
+  >([]);
+  const [realtimeMetadata, setRealtimeMetadata] = useState<
+    readonly RealtimeChatMetadata[]
   >([]);
   const [realtimeReceipts, setRealtimeReceipts] = useState<
     readonly RealtimeChatReceipt[]
@@ -6217,6 +6200,7 @@ export default function Home() {
       setRealtimeSubscriptions([]);
       setRealtimeAttachedTopics([]);
       setRealtimeMessages([]);
+      setRealtimeMetadata([]);
       setRealtimeReceipts([]);
       setRealtimeUserId(null);
       setRealtimeObservedTopic(null);
@@ -6245,6 +6229,9 @@ export default function Home() {
       },
       (receipts) => {
         setRealtimeReceipts([...receipts]);
+      },
+      (metadata) => {
+        setRealtimeMetadata([...metadata]);
       },
     );
 
@@ -6381,6 +6368,16 @@ export default function Home() {
     const activeSubscriptions = realtimeSubscriptions.filter(
       (subscription) => attachedTopicSet.has(subscription.topic),
     );
+    const metadataByTopic = new Map(
+      realtimeMetadata.map((metadata) => [metadata.topic, metadata]),
+    );
+    const participantNameById = new Map(
+      realtimeMetadata.flatMap((metadata) =>
+        buildRealtimeParticipantProfiles(metadata, realtimeUserId).map(
+          (participant) => [participant.id, participant.name] as const,
+        ),
+      ),
+    );
 
     if (
       !sessionActive ||
@@ -6431,7 +6428,13 @@ export default function Home() {
       const projectedMessages = topicMessages
         .map((message) =>
           withRealtimeReceiptStatus(
-            buildRealtimeUiMessage(message, realtimeUserId),
+            buildRealtimeUiMessage(
+              message,
+              realtimeUserId,
+              message.from
+                ? participantNameById.get(message.from)
+                : undefined,
+            ),
             message,
             realtimeUserId,
             realtimeReceipts,
@@ -6469,15 +6472,16 @@ export default function Home() {
       const realtimeActivityOrder =
         realtimeActivityRef.current[activeTopic]?.order ??
         ++activitySequenceRef.current;
-      const title = getRealtimeChatTitle(subscription);
-      const realtimeKind: Chat["kind"] =
-        activeTopic.startsWith("grp") || activeTopic.startsWith("chn")
-          ? "group"
-          : "work";
+      const metadataProjection = projectRealtimeChatMetadata(
+        subscription,
+        metadataByTopic.get(activeTopic),
+        realtimeUserId,
+      );
+      const realtimeKind = metadataProjection.kind as Chat["kind"];
 
       return {
         id: activeTopic,
-        title,
+        title: metadataProjection.title,
         subtitle: latestMessage
           ? getChatPreview(latestMessage, realtimeKind)
           : "Реальный чат Tinode",
@@ -6487,9 +6491,14 @@ export default function Home() {
             subscription.touchedAt || subscription.updatedAt,
           ),
         unread,
-        avatar: getRealtimeAvatar(title),
+        avatar: metadataProjection.avatar,
+        ...(metadataProjection.avatarUrl
+          ? { avatarUrl: metadataProjection.avatarUrl }
+          : {}),
         gradient: "linear-gradient(145deg, #0f766e, #2563eb)",
         kind: realtimeKind,
+        realtimeType: metadataProjection.type,
+        memberIds: metadataProjection.memberIds,
         lastActivityOrder: realtimeActivityOrder,
         ...(latestMessage
           ? {
@@ -6576,6 +6585,7 @@ export default function Home() {
   }, [
     realtimeAttachedTopics,
     realtimeMessages,
+    realtimeMetadata,
     realtimeObservedTopic,
     realtimeReadSeqByTopic,
     realtimeReceipts,
@@ -6584,6 +6594,61 @@ export default function Home() {
     selectedChatId,
     sessionActive,
   ]);
+  useEffect(() => {
+    const previousParticipantIds = realtimeParticipantIdsRef.current;
+    const participantProfiles = realtimeMetadata.flatMap((metadata) =>
+      buildRealtimeParticipantProfiles(metadata, realtimeUserId),
+    );
+    const uniqueProfiles = Array.from(
+      new Map(
+        participantProfiles.map((participant) => [
+          participant.id,
+          participant,
+        ]),
+      ).values(),
+    );
+    const currentParticipantIds = new Set(
+      uniqueProfiles.map((participant) => participant.id),
+    );
+
+    setUsers((current) => {
+      const retained = current.filter(
+        (user) => !previousParticipantIds.has(user.id),
+      );
+      const retainedIds = new Set(retained.map((user) => user.id));
+      const generated = uniqueProfiles
+        .filter((participant) => !retainedIds.has(participant.id))
+        .map(
+          (participant): MessengerUser => ({
+            id: participant.id,
+            name: participant.name,
+            email: "",
+            username: participant.id,
+            phone: "",
+            avatar: participant.avatar,
+            ...(participant.avatarUrl
+              ? { avatarUrl: participant.avatarUrl }
+              : {}),
+            gradient: "linear-gradient(145deg, #0f766e, #2563eb)",
+            role: "employee",
+            online: participant.online,
+            position: "Участник Tinode",
+          }),
+        );
+
+      if (
+        generated.length === 0 &&
+        retained.length === current.length
+      ) {
+        return current;
+      }
+
+      return [...retained, ...generated];
+    });
+
+    realtimeParticipantIdsRef.current = currentParticipantIds;
+  }, [realtimeMetadata, realtimeUserId]);
+
   useEffect(() => {
     const realtimeClient = realtimeClientRef.current;
     const topic =
@@ -7455,6 +7520,7 @@ export default function Home() {
       className={`prototype-shell theme-${theme}`}
       data-realtime-status={realtimeStatus}
       data-realtime-topic-count={realtimeSubscriptions.length}
+      data-realtime-metadata-count={realtimeMetadata.length}
       data-realtime-attached-topic-count={realtimeAttachedTopics.length}
       data-realtime-ui-topic-count={realtimeUiTopicsRef.current.size}
       data-realtime-chat-status={realtimeChatStatus}
@@ -7495,6 +7561,12 @@ export default function Home() {
           : 0
       }
       data-realtime-ui-topic={realtimeUiTopicRef.current ?? ""}
+      data-realtime-selected-participant-count={
+        selectedChatId
+          ? (chatItems.find((chat) => chat.id === selectedChatId)?.memberIds
+              ?.length ?? 0)
+          : 0
+      }
       data-realtime-ui-message-count={
         realtimeUiTopicRef.current
           ? (messagesByChat[realtimeUiTopicRef.current]?.length ?? 0)
