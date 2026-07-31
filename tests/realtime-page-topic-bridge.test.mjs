@@ -4,7 +4,7 @@ import test from "node:test";
 
 const pageUrl = new URL("../app/page.tsx", import.meta.url);
 
-test("bridges Tinode me-topic subscriptions into page state without replacing mock chats", async () => {
+test("bridges Tinode me-topic subscriptions without mutating chat rows directly", async () => {
   const page = await readFile(pageUrl, "utf8");
 
   assert.match(page, /type RealtimeChatSubscription/);
