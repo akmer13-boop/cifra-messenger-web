@@ -199,7 +199,8 @@ test("subscribes to one discovered chat and captures data arriving before ctrl",
 
     assert.equal(chatSubscriptions.length, 1);
     assert.deepEqual(chatSubscriptions[0].sub.get, {
-      what: "desc data",
+      what: "desc sub data",
+      sub: { limit: 100 },
       data: { limit: 20 },
     });
     assert.equal(client.isTopicSubscribed("usrZyXwVuTsR10"), true);
