@@ -254,7 +254,7 @@ test("shows sent, delivered and read states for outgoing messages", async () => 
   assert.match(page, /deliveryStatus: "sent"/);
   assert.match(page, /updateDeliveryStatus\("delivered"\)/);
   assert.match(page, /updateDeliveryStatus\("read"\)/);
-  assert.match(page, /message\.deliveryStatus === "sent" \? \(/);
+  assert.match(page, /visibleDeliveryStatus === "sent" \? \(/);
   assert.match(page, /aria-label=[\s\S]*?"Отправлено"[\s\S]*?"Доставлено"[\s\S]*?"Прочитано"/);
   assert.match(
     css,

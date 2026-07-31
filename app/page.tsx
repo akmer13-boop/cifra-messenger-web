@@ -2637,6 +2637,9 @@ function ChatView({
     "settings" | "profile"
   >("settings");
   const panelTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const messageCanvasRef = useRef<HTMLDivElement | null>(null);
+  const messageEndRef = useRef<HTMLDivElement | null>(null);
+  const previousChatIdRef = useRef<string | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const longPressTimerRef = useRef<number | null>(null);
   const actionNoticeTimerRef = useRef<number | null>(null);
@@ -2704,6 +2707,34 @@ function ChatView({
     },
     [],
   );
+
+  const latestMessageId = messages.at(-1)?.id ?? null;
+
+  useEffect(() => {
+    const canvas = messageCanvasRef.current;
+    if (!canvas) return;
+
+    const chatChanged = previousChatIdRef.current !== chat.id;
+    previousChatIdRef.current = chat.id;
+
+    const scrollToLatestMessage = () => {
+      canvas.scrollTop = canvas.scrollHeight;
+      messageEndRef.current?.scrollIntoView({
+        behavior: chatChanged ? "auto" : "smooth",
+        block: "end",
+      });
+    };
+
+    const frameId = window.requestAnimationFrame(scrollToLatestMessage);
+    const settleTimerIds = [80, 280].map((delay) =>
+      window.setTimeout(scrollToLatestMessage, delay),
+    );
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      settleTimerIds.forEach((timerId) => window.clearTimeout(timerId));
+    };
+  }, [chat.id, latestMessageId, messages.length]);
 
   const openPanel = (panel: ActiveChatPanel, trigger: HTMLButtonElement) => {
     panelTriggerRef.current = trigger;
@@ -3073,7 +3104,7 @@ function ChatView({
         </button>
       ) : null}
 
-      <div className="message-canvas">
+      <div className="message-canvas" ref={messageCanvasRef}>
         {chatPatternEnabled ? <div className="pattern" aria-hidden="true" /> : null}
         <div className="day-chip">Сегодня</div>
         <div className="security-chip">
@@ -3087,6 +3118,8 @@ function ChatView({
               : undefined;
             const swipeOffset =
               messageSwipe.id === message.id ? messageSwipe.offset : 0;
+            const visibleDeliveryStatus =
+              message.side === "in" ? "read" : message.deliveryStatus;
 
             return (
               <div
@@ -3206,19 +3239,19 @@ function ChatView({
                           aria-label="Закреплено"
                         />
                       ) : null}
-                      {message.side === "out" && message.deliveryStatus ? (
+                      {visibleDeliveryStatus ? (
                         <span
-                          className={`message-delivery-status is-${message.deliveryStatus}`}
+                          className={`message-delivery-status is-${visibleDeliveryStatus}`}
                           role="img"
                           aria-label={
-                            message.deliveryStatus === "sent"
+                            visibleDeliveryStatus === "sent"
                               ? "Отправлено"
-                              : message.deliveryStatus === "delivered"
+                              : visibleDeliveryStatus === "delivered"
                                 ? "Доставлено"
                                 : "Прочитано"
                           }
                         >
-                          {message.deliveryStatus === "sent" ? (
+                          {visibleDeliveryStatus === "sent" ? (
                             <Check
                               size={14}
                               strokeWidth={2.3}
@@ -3249,6 +3282,11 @@ function ChatView({
               </div>
             );
           })}
+          <div
+            ref={messageEndRef}
+            className="message-list-end"
+            aria-hidden="true"
+          />
         </div>
       </div>
 
