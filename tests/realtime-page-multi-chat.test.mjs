@@ -16,13 +16,14 @@ test("attaches every readable Tinode topic and tracks successful subscriptions",
   assert.match(page, /data-realtime-attached-topic-count=/);
 });
 
-test("projects and switches all attached real chats without replacing mock chats", async () => {
+test("projects all attached real chats and excludes mock chats in backend mode", async () => {
   const page = await readFile(pageUrl, "utf8");
 
   assert.match(page, /const realtimeUiTopicsRef = useRef<Set<string>>/);
   assert.match(page, /activeSubscriptions\.map\(\(subscription\) =>/);
   assert.match(page, /projectedMessagesByTopic\[activeTopic\] = projectedMessages/);
-  assert.match(page, /return \[\.\.\.nextRealtimeChats, \.\.\.withoutRealtimeTopics\]/);
+  assert.match(page, /const withoutRealtimeTopics = canUseLocalChatFallback\(authMode\)/);
+  assert.match(page, /filterChatsForRuntimeMode/);
   assert.match(page, /resolveRealtimeObservedTopic\([\s\S]*?selectedChatId/);
   assert.match(page, /realtimeAttachedTopics\.includes\(id\)/);
   assert.match(page, /realtimeAttachedTopics\.includes\(chatId\)/);
