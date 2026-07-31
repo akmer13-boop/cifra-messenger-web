@@ -6217,7 +6217,7 @@ export default function Home() {
     const realtimeClient = new CifraRealtimeClient(
       (status) => {
         setRealtimeStatus(status);
-        if (status !== "connected") {
+        if (status === "disconnected") {
           setRealtimeUserId(null);
         }
       },
@@ -6245,6 +6245,7 @@ export default function Home() {
         apiBaseUrl: apiClient.config.apiBaseUrl,
         accessToken: authSession.tokens.access_token,
         deviceId: apiClient.currentDeviceId,
+        ticketProvider: () => apiClient.issueRealtimeTicket(),
       })
       .then((userId) => {
         if (cancelled) {
@@ -6282,11 +6283,20 @@ export default function Home() {
   useEffect(() => {
     const realtimeClient = realtimeClientRef.current;
 
-    if (
-      !sessionActive ||
-      realtimeStatus !== "connected" ||
-      !realtimeClient
-    ) {
+    if (!sessionActive || !realtimeClient) {
+      setRealtimeAttachedTopics([]);
+      setRealtimeObservedTopic(null);
+      setRealtimeChatStatus("idle");
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
+      return;
+    }
+
+    if (realtimeStatus === "reconnecting") {
+      return;
+    }
+
+    if (realtimeStatus !== "connected") {
       setRealtimeAttachedTopics([]);
       setRealtimeObservedTopic(null);
       setRealtimeChatStatus("idle");
@@ -7519,6 +7529,12 @@ export default function Home() {
     <main
       className={`prototype-shell theme-${theme}`}
       data-realtime-status={realtimeStatus}
+      data-realtime-preserved-during-reconnect={
+        realtimeStatus === "reconnecting" &&
+        realtimeAttachedTopics.length > 0
+          ? "true"
+          : "false"
+      }
       data-realtime-topic-count={realtimeSubscriptions.length}
       data-realtime-metadata-count={realtimeMetadata.length}
       data-realtime-attached-topic-count={realtimeAttachedTopics.length}
