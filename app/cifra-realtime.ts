@@ -123,9 +123,17 @@ type RealtimeMetadataListener = (
   metadata: readonly RealtimeChatMetadata[],
 ) => void;
 
+export interface RealtimeDiagnostics {
+  readonly connectionGeneration: number;
+  readonly reconnectSuccessCount: number;
+  readonly duplicateMessageCount: number;
+  readonly lastError?: string;
+}
+
 export interface RealtimeClientOptions {
   readonly reconnectBaseDelayMs?: number;
   readonly reconnectMaxDelayMs?: number;
+  readonly onDiagnostics?: (diagnostics: RealtimeDiagnostics) => void;
 }
 
 interface TinodeSubscriptionBatch {
@@ -169,6 +177,10 @@ export class CifraRealtimeClient {
   private reconnectAttempt = 0;
   private reconnectEnabled = false;
   private connectionAttempt = 0;
+  private connectionGeneration = 0;
+  private reconnectSuccessCount = 0;
+  private duplicateMessageCount = 0;
+  private lastError: string | undefined;
 
   constructor(
     private readonly onStatus: RealtimeStatusListener = () => undefined,
@@ -189,6 +201,15 @@ export class CifraRealtimeClient {
 
   getTinodeUserId(): string | null {
     return this.tinodeUserId;
+  }
+
+  getDiagnostics(): RealtimeDiagnostics {
+    return {
+      connectionGeneration: this.connectionGeneration,
+      reconnectSuccessCount: this.reconnectSuccessCount,
+      duplicateMessageCount: this.duplicateMessageCount,
+      ...(this.lastError ? { lastError: this.lastError } : {}),
+    };
   }
 
   getSubscribedTopics(): readonly string[] {
@@ -495,6 +516,10 @@ export class CifraRealtimeClient {
     this.connectionAttempt += 1;
     this.connectPromise = null;
     this.reconnectAttempt = 0;
+    this.connectionGeneration = 0;
+    this.reconnectSuccessCount = 0;
+    this.duplicateMessageCount = 0;
+    this.lastError = undefined;
 
     const socket = this.socket;
 
@@ -771,6 +796,10 @@ export class CifraRealtimeClient {
       }
 
       this.reconnectAttempt = 0;
+      this.connectionGeneration += 1;
+      if (isReconnect) {
+        this.reconnectSuccessCount += 1;
+      }
       this.setStatus("connected");
 
       return user;
@@ -1019,6 +1048,8 @@ export class CifraRealtimeClient {
     const key = `${message.topic}:${message.seq}`;
 
     if (this.chatMessages.has(key)) {
+      this.duplicateMessageCount += 1;
+      this.emitDiagnostics();
       return;
     }
 
@@ -1100,7 +1131,17 @@ export class CifraRealtimeClient {
     error?: string,
   ): void {
     this.status = status;
+    if (error) {
+      this.lastError = error;
+    } else if (status === "connected" || status === "disconnected") {
+      this.lastError = undefined;
+    }
     this.onStatus(status, error);
+    this.emitDiagnostics();
+  }
+
+  private emitDiagnostics(): void {
+    this.options.onDiagnostics?.(this.getDiagnostics());
   }
 }
 
