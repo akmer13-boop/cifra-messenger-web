@@ -160,16 +160,21 @@ test("global notification modes persist and the one-hour mode expires", async ()
   assert.match(source, /onNotificationModeChange\(option\.id\)/);
 });
 
-test("admin audit is read-only, complete and does not save draft edits", async () => {
+test("admin audit is read-only, selected-user scoped and server backed", async () => {
   const { source } = await parsePage();
 
   assert.match(source, /messagesByChat: Record<string, Message\[]>/);
   assert.match(source, /selectedAuditMessages/);
-  assert.match(source, /\{chats\.map\(\(chat\) =>/);
-  assert.doesNotMatch(source, /chats\.slice\(0, 5\)/);
+  assert.match(source, /buildLocalAuditDataset\(/);
+  assert.match(source, /buildComplianceAuditDataset\(/);
+  assert.match(source, /dataset\.chats\.map\(\(chat\) =>/);
+  assert.match(source, /client\.searchComplianceMetadata\(\{/);
+  assert.match(source, /author_id: user\.backendId/);
+  assert.match(source, /topic_id: topicId/);
   assert.match(source, /onClick=\{\(\) => onAudit\(user\)\}/);
   assert.doesNotMatch(source, /onClick=\{\(\) => onAudit\(draft\)\}/);
   assert.match(source, /Только чтение/);
+  assert.match(source, /текст сообщений текущим API не раскрывается/);
 });
 
 test("admin form validates identity fields before saving", async () => {
