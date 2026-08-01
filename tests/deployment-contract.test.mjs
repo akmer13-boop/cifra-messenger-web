@@ -7,11 +7,13 @@ const amveraUrl = new URL("../amvera.yml", import.meta.url);
 const pageUrl = new URL("../app/page.tsx", import.meta.url);
 const cssUrl = new URL("../app/globals.css", import.meta.url);
 const postcssUrl = new URL("../postcss.config.mjs", import.meta.url);
+const npmConfigUrl = new URL("../.npmrc", import.meta.url);
 
 test("uses a static Next.js export for Amvera Browser", async () => {
-  const [packageSource, amvera] = await Promise.all([
+  const [packageSource, amvera, npmConfig] = await Promise.all([
     readFile(packageUrl, "utf8"),
     readFile(amveraUrl, "utf8"),
+    readFile(npmConfigUrl, "utf8"),
   ]);
   const packageJson = JSON.parse(packageSource);
 
@@ -25,6 +27,9 @@ test("uses a static Next.js export for Amvera Browser", async () => {
   assert.match(amvera, /"out\/\*":\s*\//);
   assert.doesNotMatch(amvera, /run:/);
   assert.doesNotMatch(amvera, /containerPort:/);
+  assert.match(npmConfig, /^legacy-peer-deps=true$/m);
+  assert.match(npmConfig, /^audit=false$/m);
+  assert.match(npmConfig, /^fund=false$/m);
 });
 
 test("contains desktop split view and mobile chat navigation contracts", async () => {
