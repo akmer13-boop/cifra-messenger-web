@@ -84,6 +84,7 @@ import {
   loadRuntimeConfig,
   type AuthSession,
   type BackendUser,
+  type ComplianceMessageMetadata,
   type CorporateRole,
   type LoginOutcome,
   type RuntimeMode,
@@ -100,6 +101,15 @@ import {
   type RealtimeDiagnostics,
   type RealtimeStatus,
 } from "./cifra-realtime";
+import {
+  buildRealtimeDirectoryQueries,
+  findDirectChatForUser,
+  resolveRealtimeUserId as resolveUserRealtimeId,
+} from "./direct-chat-policy.mjs";
+import {
+  buildComplianceAuditDataset,
+  buildLocalAuditDataset,
+} from "./audit-chat-policy.mjs";
 import {
   getLatestIncomingRealtimeSeq,
   getLatestRealtimeSeq,
@@ -232,6 +242,12 @@ type Message = {
   pinnedAt?: number;
 };
 
+type AuditDataset = {
+  chats: Chat[];
+  messagesByChat: Record<string, Message[]>;
+  metadataOnly: boolean;
+};
+
 type CallRecord = {
   participantIds: string[];
   name: string;
@@ -320,7 +336,7 @@ const themeOptions: {
   {
     id: "mirror",
     title: "Зеркальная",
-    description: "Полупрозрачное переливающееся стекло",
+    description: "Серебристое зеркало · переливающийся металл",
     symbol: "◇",
   },
 ];
@@ -776,6 +792,9 @@ function backendUserToMessenger(
   return {
     id: user.id === currentUserId ? "self" : user.id,
     backendId: user.id,
+    ...(user.realtime_user_id || user.tinode_uid
+      ? { realtimeUserId: user.realtime_user_id ?? user.tinode_uid ?? undefined }
+      : {}),
     backendVersion: user.version,
     backendRoles: user.roles,
     name,
@@ -901,11 +920,6 @@ const formatRealtimeTimestamp = (value?: string) => {
     minute: "2-digit",
   }).format(new Date(timestamp));
 };
-
-const isRealtimeRecord = (
-  value: unknown,
-): value is Readonly<Record<string, unknown>> =>
-  value !== null && typeof value === "object" && !Array.isArray(value);
 
 const getRealtimeReceiptSeq = (
   receipts: readonly RealtimeChatReceipt[],
@@ -5660,25 +5674,84 @@ function AdminUserSheet({
 function AuditOverlay({
   user,
   viewerRole,
+  runtimeMode,
   chats,
   messagesByChat,
+  onLoadCompliance,
   onClose,
 }: {
   user: MessengerUser;
   viewerRole: UserRole;
+  runtimeMode: RuntimeMode;
   chats: Chat[];
   messagesByChat: Record<string, Message[]>;
+  onLoadCompliance: (
+    user: MessengerUser,
+  ) => Promise<ComplianceMessageMetadata[]>;
   onClose: () => void;
 }) {
   const [selectedAuditChatId, setSelectedAuditChatId] = useState<string | null>(
     null,
   );
-  const selectedAuditChat = chats.find(
+  const [serverItems, setServerItems] = useState<
+    ComplianceMessageMetadata[]
+  >([]);
+  const [loading, setLoading] = useState(runtimeMode === "backend");
+  const [loadError, setLoadError] = useState("");
+  const localDataset = useMemo(
+    () =>
+      buildLocalAuditDataset(
+        chats,
+        messagesByChat,
+        user,
+      ) as AuditDataset,
+    [chats, messagesByChat, user],
+  );
+  const serverDataset = useMemo(
+    () =>
+      buildComplianceAuditDataset(
+        serverItems,
+        user,
+        chats,
+      ) as AuditDataset,
+    [chats, serverItems, user],
+  );
+  const dataset = runtimeMode === "backend" ? serverDataset : localDataset;
+  const selectedAuditChat = dataset.chats.find(
     (chat) => chat.id === selectedAuditChatId,
   );
   const selectedAuditMessages = selectedAuditChatId
-    ? (messagesByChat[selectedAuditChatId] ?? [])
+    ? (dataset.messagesByChat[selectedAuditChatId] ?? [])
     : [];
+
+  useEffect(() => {
+    if (runtimeMode !== "backend") return;
+
+    let cancelled = false;
+
+    void onLoadCompliance(user)
+      .then((items) => {
+        if (!cancelled) setServerItems(items);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setLoadError(
+          error instanceof CifraApiError && error.code === "ROLE_REQUIRED"
+            ? "У текущей роли нет доступа к compliance-поиску."
+            : error instanceof CifraApiError &&
+                error.code === "STEP_UP_REQUIRED"
+              ? "Для аудита требуется повторно войти с подтверждением MFA."
+              : "Не удалось загрузить метаданные переписок с сервера.",
+        );
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [onLoadCompliance, runtimeMode, user]);
 
   return (
     <div
@@ -5725,10 +5798,14 @@ function AuditOverlay({
         </span>
         <p>
           {viewerRole === "moderator" ? "Модератор" : "Администратор"}{" "}
-          просматривает данные в режиме только для чтения.
-          Действие записано в журнал, отправка сообщений отключена.
+          просматривает данные в режиме только для чтения. Действие
+          записывается в журнал, отправка сообщений отключена.
         </p>
-        <small>Сеанс AUD-2026-0727 · журналирование включено</small>
+        <small>
+          {dataset.metadataOnly
+            ? "Сервер возвращает метаданные; текст сообщений текущим API не раскрывается"
+            : "Демонстрационные данные · журналирование включено"}
+        </small>
       </div>
 
       {selectedAuditChat ? (
@@ -5768,7 +5845,19 @@ function AuditOverlay({
       ) : (
         <div className="audit-chat-list">
           <span className="settings-label">ПЕРЕПИСКИ ПОЛЬЗОВАТЕЛЯ</span>
-          {chats.map((chat) => (
+          {loading ? (
+            <div className="panel-empty audit-state-card" role="status">
+              <Search size={23} />
+              <span>Загружаем метаданные переписок…</span>
+            </div>
+          ) : loadError ? (
+            <div className="panel-empty audit-state-card" role="alert">
+              <ShieldCheck size={23} />
+              <span>{loadError}</span>
+            </div>
+          ) : null}
+          {!loading && !loadError
+            ? dataset.chats.map((chat) => (
             <button
               type="button"
               key={chat.id}
@@ -5789,7 +5878,16 @@ function AuditOverlay({
               </span>
               <ChevronRight size={18} />
             </button>
-          ))}
+              ))
+            : null}
+          {!loading && !loadError && dataset.chats.length === 0 ? (
+            <div className="panel-empty audit-state-card">
+              <MessageCircle size={23} />
+              <span>
+                Переписки этого пользователя в доступных данных не найдены
+              </span>
+            </div>
+          ) : null}
         </div>
       )}
     </div>
@@ -6260,6 +6358,8 @@ export default function Home() {
     string | null
   >(null);
   const [auditUserId, setAuditUserId] = useState<string | null>(null);
+  const [chatOpenError, setChatOpenError] = useState("");
+  const openingDirectUsersRef = useRef<Set<string>>(new Set());
 
   const activateSession = useCallback((session: AuthSession) => {
     setAuthSession(session);
@@ -6422,14 +6522,23 @@ export default function Home() {
   }, [authSession, sessionActive]);
   useEffect(() => {
     const realtimeClient = realtimeClientRef.current;
+    let cancelled = false;
+    const scheduleReset = () => {
+      queueMicrotask(() => {
+        if (cancelled) return;
+        setRealtimeAttachedTopics([]);
+        setRealtimeObservedTopic(null);
+        setRealtimeChatStatus("idle");
+        setRealtimePublishStatus("idle");
+        setRealtimePublishedSeq(null);
+      });
+    };
 
     if (!sessionActive || !realtimeClient) {
-      setRealtimeAttachedTopics([]);
-      setRealtimeObservedTopic(null);
-      setRealtimeChatStatus("idle");
-      setRealtimePublishStatus("idle");
-      setRealtimePublishedSeq(null);
-      return;
+      scheduleReset();
+      return () => {
+        cancelled = true;
+      };
     }
 
     if (realtimeStatus === "reconnecting") {
@@ -6437,58 +6546,55 @@ export default function Home() {
     }
 
     if (realtimeStatus !== "connected") {
-      setRealtimeAttachedTopics([]);
-      setRealtimeObservedTopic(null);
-      setRealtimeChatStatus("idle");
-      setRealtimePublishStatus("idle");
-      setRealtimePublishedSeq(null);
-      return;
+      scheduleReset();
+      return () => {
+        cancelled = true;
+      };
     }
 
     const readableSubscriptions =
       getReadableRealtimeSubscriptions(realtimeSubscriptions);
 
     if (readableSubscriptions.length === 0) {
-      setRealtimeAttachedTopics([]);
-      setRealtimeObservedTopic(null);
-      setRealtimeChatStatus("idle");
-      setRealtimePublishStatus("idle");
-      setRealtimePublishedSeq(null);
-      return;
+      scheduleReset();
+      return () => {
+        cancelled = true;
+      };
     }
 
-    let cancelled = false;
-    setRealtimeChatStatus("subscribing");
-
-    const subscriptionTasks = readableSubscriptions.map((subscription) =>
-      realtimeClient.subscribeToChat(subscription.topic, {
-        historyLimit: 20,
-      }),
-    );
-
-    void Promise.allSettled(subscriptionTasks).then((results) => {
+    queueMicrotask(() => {
       if (cancelled) return;
-
-      const attachedTopics = readableSubscriptions.flatMap(
-        (subscription, index) =>
-          results[index]?.status === "fulfilled" &&
-          realtimeClient.isTopicSubscribed(subscription.topic)
-            ? [subscription.topic]
-            : [],
+      setRealtimeChatStatus("subscribing");
+      const subscriptionTasks = readableSubscriptions.map((subscription) =>
+        realtimeClient.subscribeToChat(subscription.topic, {
+          historyLimit: 20,
+        }),
       );
 
-      setRealtimeAttachedTopics(attachedTopics);
-      setRealtimeObservedTopic((current) =>
-        resolveRealtimeObservedTopic(null, current, attachedTopics),
-      );
-      setRealtimeChatStatus(
-        attachedTopics.length > 0 ? "subscribed" : "error",
-      );
+      void Promise.allSettled(subscriptionTasks).then((results) => {
+        if (cancelled) return;
 
-      if (attachedTopics.length === 0) {
-        setRealtimePublishStatus("idle");
-        setRealtimePublishedSeq(null);
-      }
+        const attachedTopics = readableSubscriptions.flatMap(
+          (subscription, index) =>
+            results[index]?.status === "fulfilled" &&
+            realtimeClient.isTopicSubscribed(subscription.topic)
+              ? [subscription.topic]
+              : [],
+        );
+
+        setRealtimeAttachedTopics(attachedTopics);
+        setRealtimeObservedTopic((current) =>
+          resolveRealtimeObservedTopic(null, current, attachedTopics),
+        );
+        setRealtimeChatStatus(
+          attachedTopics.length > 0 ? "subscribed" : "error",
+        );
+
+        if (attachedTopics.length === 0) {
+          setRealtimePublishStatus("idle");
+          setRealtimePublishedSeq(null);
+        }
+      });
     });
 
     return () => {
@@ -6503,9 +6609,16 @@ export default function Home() {
     );
 
     if (nextObservedTopic !== realtimeObservedTopic) {
-      setRealtimeObservedTopic(nextObservedTopic);
-      setRealtimePublishStatus("idle");
-      setRealtimePublishedSeq(null);
+      let cancelled = false;
+      queueMicrotask(() => {
+        if (cancelled) return;
+        setRealtimeObservedTopic(nextObservedTopic);
+        setRealtimePublishStatus("idle");
+        setRealtimePublishedSeq(null);
+      });
+      return () => {
+        cancelled = true;
+      };
     }
   }, [
     realtimeAttachedTopics,
@@ -7154,37 +7267,141 @@ export default function Home() {
       setRealtimePublishStatus("idle");
       setRealtimePublishedSeq(null);
     }
+    setActiveTab("chats");
     setSelectedChatId(id);
     setComposeOpen(false);
+    setSelectedProfileUserId(null);
+    setChatOpenError("");
   };
 
-  const openUserChat = (id: string) => {
-    const directChat = chatItems.find((chat) => chat.id === id);
+  const openUserChat = async (id: string) => {
+    const user = users.find((person) => person.id === id);
+    if (!user || user.id === "self") return;
+
+    const directChat = findDirectChatForUser(chatItems, user);
     if (directChat) {
       openChat(directChat.id);
       return;
     }
-    if (!canUseLocalChatFallback(authMode)) {
-      setComposeOpen(false);
+
+    if (canUseLocalChatFallback(authMode)) {
+      const newChat: Chat = {
+        id: user.id,
+        title: user.name,
+        subtitle: "Новая переписка",
+        time: "Сейчас",
+        unread: 0,
+        lastActivityOrder: ++activitySequenceRef.current,
+        avatar: user.avatar,
+        gradient: user.gradient,
+        kind: "work",
+        online: user.online,
+      };
+      setChatItems((current) => [newChat, ...current]);
+      setMessagesByChat((current) => ({ ...current, [newChat.id]: [] }));
+      openChat(newChat.id);
       return;
     }
-    const user = users.find((person) => person.id === id);
-    if (!user) return;
-    const newChat: Chat = {
-      id: user.id,
-      title: user.name,
-      subtitle: "Новая переписка",
-      time: "Сейчас",
-      unread: 0,
-      lastActivityOrder: ++activitySequenceRef.current,
-      avatar: user.avatar,
-      gradient: user.gradient,
-      kind: "work",
-      online: user.online,
-    };
-    setChatItems((current) => [newChat, ...current]);
-    setMessagesByChat((current) => ({ ...current, [newChat.id]: [] }));
-    openChat(newChat.id);
+
+    if (openingDirectUsersRef.current.has(id)) return;
+    openingDirectUsersRef.current.add(id);
+    setChatOpenError("");
+
+    try {
+      const realtimeClient = realtimeClientRef.current;
+      if (!realtimeClient || realtimeStatus !== "connected") {
+        throw new CifraRealtimeError("realtime_not_connected");
+      }
+
+      let peerUserId = resolveUserRealtimeId(user);
+      if (!peerUserId) {
+        peerUserId = await realtimeClient.findUserByDirectoryQueries(
+          buildRealtimeDirectoryQueries(user),
+        );
+      }
+      if (!peerUserId) {
+        throw new CifraRealtimeError("tinode_directory_user_not_found");
+      }
+
+      const result = await realtimeClient.openDirectConversation(peerUserId, {
+        historyLimit: 20,
+      });
+      const subscriptions = realtimeClient.getChatSubscriptions();
+      const metadata = realtimeClient.getChatMetadata();
+      const messages = realtimeClient.getChatMessages();
+      const receipts = realtimeClient.getChatReceipts();
+
+      setUsers((current) =>
+        current.map((person) =>
+          person.id === id
+            ? { ...person, realtimeUserId: result.peerUserId }
+            : person,
+        ),
+      );
+      setRealtimeSubscriptions([...subscriptions]);
+      setRealtimeMetadata([...metadata]);
+      setRealtimeMessages([...messages]);
+      setRealtimeReceipts([...receipts]);
+      setRealtimeAttachedTopics((current) =>
+        current.includes(result.topic)
+          ? current
+          : [...current, result.topic],
+      );
+      setRealtimeChatStatus("subscribed");
+      setRealtimeObservedTopic(result.topic);
+      setRealtimePublishStatus("idle");
+      setRealtimePublishedSeq(null);
+      setChatItems((current) => {
+        if (current.some((chat) => chat.id === result.topic)) return current;
+        return [
+          {
+            id: result.topic,
+            title: user.name,
+            subtitle: result.created ? "Новая переписка" : "Чат",
+            time: "Сейчас",
+            unread: 0,
+            lastActivityOrder: ++activitySequenceRef.current,
+            avatar: user.avatar,
+            ...(user.avatarUrl ? { avatarUrl: user.avatarUrl } : {}),
+            gradient: user.gradient,
+            kind: "work",
+            realtimeType: "direct",
+            online: user.online,
+            memberIds: [result.peerUserId],
+          },
+          ...current,
+        ];
+      });
+      setMessagesByChat((current) =>
+        result.topic in current
+          ? current
+          : { ...current, [result.topic]: [] },
+      );
+      openChat(result.topic);
+    } catch (error: unknown) {
+      setComposeOpen(false);
+      if (
+        error instanceof CifraRealtimeError &&
+        error.code === "tinode_directory_user_not_found"
+      ) {
+        setChatOpenError(
+          `Сервер не передал привязку профиля сообщений для ${user.name}. Открыть новый чат пока невозможно.`,
+        );
+      } else if (
+        error instanceof CifraRealtimeError &&
+        error.code === "realtime_not_connected"
+      ) {
+        setChatOpenError(
+          "Нет соединения с сервером сообщений. Повторите попытку после подключения.",
+        );
+      } else {
+        setChatOpenError(
+          `Не удалось открыть переписку с ${user.name}. Повторите попытку.`,
+        );
+      }
+    } finally {
+      openingDirectUsersRef.current.delete(id);
+    }
   };
 
   const getApiClient = async (): Promise<CifraApiClient> => {
@@ -7195,6 +7412,57 @@ export default function Home() {
     setAuthMode(config.mode);
     return client;
   };
+
+  const loadComplianceForAudit = useCallback(
+    async (user: MessengerUser): Promise<ComplianceMessageMetadata[]> => {
+      const client = apiClientRef.current;
+      if (!client || client.mode !== "backend" || !user.backendId) {
+        throw new CifraApiError(
+          "Пользователь не связан с серверным каталогом",
+          400,
+          "AUDIT_USER_NOT_RESOLVED",
+        );
+      }
+
+      const reason = `Просмотр переписок пользователя ${user.username}`;
+      const authored = await client.searchComplianceMetadata({
+        reason,
+        author_id: user.backendId,
+        limit: 200,
+      });
+      const topicIds = Array.from(
+        new Set(
+          authored.items
+            .map((item) => item.topic_id)
+            .filter(Boolean),
+        ),
+      ).slice(0, 30);
+      const topicSearches = await Promise.allSettled(
+        topicIds.map((topicId) =>
+          client.searchComplianceMetadata({
+            reason,
+            topic_id: topicId,
+            limit: 200,
+          }),
+        ),
+      );
+      const combined = [
+        ...authored.items,
+        ...topicSearches.flatMap((result) =>
+          result.status === "fulfilled" ? result.value.items : [],
+        ),
+      ];
+      const unique = new Map<string, ComplianceMessageMetadata>();
+      for (const item of combined) {
+        unique.set(
+          `${item.topic_id}:${item.seq}:${item.client_msg_id ?? ""}`,
+          item,
+        );
+      }
+      return Array.from(unique.values());
+    },
+    [],
+  );
 
   const loginWithCredentials = async (
     login: string,
@@ -7713,6 +7981,15 @@ export default function Home() {
     setCallOpen(true);
   };
 
+  const renderedRealtimeUiTopic = resolveRealtimeObservedTopic(
+    selectedChatId,
+    realtimeObservedTopic,
+    realtimeAttachedTopics,
+  );
+  const renderedRealtimeUiChat = renderedRealtimeUiTopic
+    ? chatItems.find((chat) => chat.id === renderedRealtimeUiTopic)
+    : undefined;
+
     return (
     <main
       className={`prototype-shell theme-${theme}`}
@@ -7746,7 +8023,7 @@ export default function Home() {
       data-realtime-topic-count={realtimeSubscriptions.length}
       data-realtime-metadata-count={realtimeMetadata.length}
       data-realtime-attached-topic-count={realtimeAttachedTopics.length}
-      data-realtime-ui-topic-count={realtimeUiTopicsRef.current.size}
+      data-realtime-ui-topic-count={realtimeAttachedTopics.length}
       data-realtime-chat-status={realtimeChatStatus}
       data-realtime-observed-topic={realtimeObservedTopic ?? ""}
       data-realtime-selected-topic={
@@ -7784,7 +8061,7 @@ export default function Home() {
             )
           : 0
       }
-      data-realtime-ui-topic={realtimeUiTopicRef.current ?? ""}
+      data-realtime-ui-topic={renderedRealtimeUiTopic ?? ""}
       data-realtime-selected-participant-count={
         selectedChatId
           ? (chatItems.find((chat) => chat.id === selectedChatId)?.memberIds
@@ -7792,27 +8069,20 @@ export default function Home() {
           : 0
       }
       data-realtime-ui-message-count={
-        realtimeUiTopicRef.current
-          ? (messagesByChat[realtimeUiTopicRef.current]?.length ?? 0)
+        renderedRealtimeUiTopic
+          ? (messagesByChat[renderedRealtimeUiTopic]?.length ?? 0)
           : 0
       }
       data-realtime-unread-count={
-        realtimeUiTopicRef.current
-          ? (chatItems.find(
-              (chat) => chat.id === realtimeUiTopicRef.current,
-            )?.unread ?? 0)
-          : 0
+        renderedRealtimeUiChat?.unread ?? 0
       }
       data-realtime-local-read-seq={
-        realtimeUiTopicRef.current
-          ? (realtimeReadSeqByTopic[realtimeUiTopicRef.current] ?? 0)
+        renderedRealtimeUiTopic
+          ? (realtimeReadSeqByTopic[renderedRealtimeUiTopic] ?? 0)
           : 0
       }
       data-realtime-activity-order={
-        realtimeUiTopicRef.current
-          ? (realtimeActivityRef.current[realtimeUiTopicRef.current]?.order ??
-            0)
-          : 0
+        renderedRealtimeUiChat?.lastActivityOrder ?? 0
       }
     >
       <div className="device-stage">
@@ -7825,6 +8095,19 @@ export default function Home() {
             }`}
           >
             <StatusBar />
+            {chatOpenError ? (
+              <div className="app-operation-notice" role="alert">
+                <MessageCircle size={17} />
+                <span>{chatOpenError}</span>
+                <button
+                  type="button"
+                  aria-label="Закрыть уведомление"
+                  onClick={() => setChatOpenError("")}
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            ) : null}
             <div className="view-host">
               {!sessionActive ? (
                 <SignedOutView
@@ -8073,8 +8356,10 @@ export default function Home() {
                 key={auditUser.id}
                 user={auditUser}
                 viewerRole={role}
+                runtimeMode={authMode}
                 chats={chatItems}
                 messagesByChat={messagesByChat}
+                onLoadCompliance={loadComplianceForAudit}
                 onClose={() => setAuditUserId(null)}
               />
             ) : null}
