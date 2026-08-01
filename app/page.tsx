@@ -108,6 +108,11 @@ import {
   resolveRealtimeUserId as resolveUserRealtimeId,
 } from "./direct-chat-policy.mjs";
 import {
+  callRestrictionMessage,
+  getDirectCallRestriction,
+  resolveCallParticipants,
+} from "./call-policy.mjs";
+import {
   buildComplianceAuditDataset,
   buildLocalAuditDataset,
 } from "./audit-chat-policy.mjs";
@@ -1980,6 +1985,7 @@ function TabBar({
 function ChatsView({
   chats,
   users,
+  currentUser,
   role,
   onOpenChat,
   onMessageUser,
@@ -1993,6 +1999,7 @@ function ChatsView({
 }: {
   chats: Chat[];
   users: MessengerUser[];
+  currentUser: MessengerUser;
   role: UserRole;
   onOpenChat: (id: string) => void;
   onMessageUser: (id: string) => void;
@@ -2279,7 +2286,12 @@ function ChatsView({
                 aria-label="Найденные сотрудники"
               >
                 <span className="chat-results-heading">Сотрудники</span>
-                {matchingUsers.map((person) => (
+                {matchingUsers.map((person) => {
+                  const callRestriction = getDirectCallRestriction(
+                    currentUser,
+                    person,
+                  );
+                  return (
                   <div className="chat-search-person-row" key={person.id}>
                     <Avatar
                       label={person.avatar}
@@ -2304,14 +2316,20 @@ function ChatsView({
                       <button
                         type="button"
                         aria-label={`Позвонить: ${person.name}`}
-                        title="Позвонить"
+                        title={
+                          callRestriction
+                            ? callRestrictionMessage(callRestriction)
+                            : "Позвонить"
+                        }
+                        disabled={Boolean(callRestriction)}
                         onClick={() => onCallUser(person.id)}
                       >
                         <Phone size={17} />
                       </button>
                     </span>
                   </div>
-                ))}
+                  );
+                })}
               </section>
             ) : null}
 
@@ -2592,6 +2610,7 @@ function ChatView({
   onSend,
   onClear,
   onCall,
+  callUnavailableReason,
   onToggleMute,
   onArchive,
   onUnarchive,
@@ -2609,6 +2628,7 @@ function ChatView({
   onSend: (text: string, options?: SendMessageOptions) => boolean;
   onClear: () => void;
   onCall: () => void;
+  callUnavailableReason?: string;
   onToggleMute: () => void;
   onArchive: () => void;
   onUnarchive: () => void;
@@ -3110,9 +3130,12 @@ function ChatView({
             aria-label={
               chat.deleted
                 ? "Звонок недоступен для удалённого чата"
+                : callUnavailableReason
+                  ? callUnavailableReason
                 : "Видеозвонок"
             }
-            disabled={chat.deleted}
+            title={callUnavailableReason}
+            disabled={chat.deleted || Boolean(callUnavailableReason)}
             onClick={onCall}
           >
             <Video size={20} />
@@ -4669,11 +4692,13 @@ function TeamsView({
 function CallsView({
   calls,
   users,
+  currentUser,
   runtimeMode,
   onCall,
 }: {
   calls: CallRecord[];
   users: MessengerUser[];
+  currentUser: MessengerUser;
   runtimeMode: RuntimeMode;
   onCall: (participantIds: string[]) => void;
 }) {
@@ -4686,7 +4711,7 @@ function CallsView({
   const visibleCalls = filterCallsForRuntime(runtimeMode, calls, users);
   const visibleContacts = users.filter(
     (user) =>
-      user.id !== "self" &&
+      !getDirectCallRestriction(currentUser, user) &&
       (!normalizedQuery ||
         `${user.name} ${user.position}`
           .toLocaleLowerCase("ru")
@@ -6360,6 +6385,7 @@ export default function Home() {
   >(null);
   const [auditUserId, setAuditUserId] = useState<string | null>(null);
   const [chatOpenError, setChatOpenError] = useState("");
+  const [callOpenError, setCallOpenError] = useState("");
   const openingDirectUsersRef = useRef<Set<string>>(new Set());
 
   const activateSession = useCallback((session: AuthSession) => {
@@ -7273,6 +7299,44 @@ export default function Home() {
     setComposeOpen(false);
     setSelectedProfileUserId(null);
     setChatOpenError("");
+    setCallOpenError("");
+  };
+
+  const refreshUserRealtimeProfile = async (
+    user: MessengerUser,
+  ): Promise<MessengerUser> => {
+    const client = apiClientRef.current;
+    if (
+      !authSession ||
+      !user.backendId ||
+      !client ||
+      client.mode !== "backend"
+    ) {
+      return user;
+    }
+
+    try {
+      const page = await client.listUsers(user.username);
+      const backendUser = page.items.find(
+        (candidate) =>
+          candidate.id === user.backendId ||
+          candidate.login.toLocaleLowerCase("ru") ===
+            user.username.toLocaleLowerCase("ru"),
+      );
+      if (!backendUser) return user;
+
+      const refreshed = backendUserToMessenger(
+        backendUser,
+        authSession.context.user_id,
+      );
+      const merged = { ...user, ...refreshed, id: user.id };
+      setUsers((current) =>
+        current.map((person) => (person.id === user.id ? merged : person)),
+      );
+      return merged;
+    } catch {
+      return user;
+    }
   };
 
   const openUserChat = async (id: string) => {
@@ -7314,18 +7378,38 @@ export default function Home() {
         throw new CifraRealtimeError("realtime_not_connected");
       }
 
-      let peerUserId = resolveUserRealtimeId(user);
+      let resolvedUser = user;
+      let peerUserId = resolveUserRealtimeId(resolvedUser);
       if (!peerUserId) {
         peerUserId = findDirectRealtimeTopicForUser(
           realtimeSubscriptions,
           realtimeMetadata,
-          user,
+          resolvedUser,
           realtimeUserId,
         );
       }
       if (!peerUserId) {
+        resolvedUser = await refreshUserRealtimeProfile(resolvedUser);
+        const refreshedDirectChat = findDirectChatForUser(
+          chatItems,
+          resolvedUser,
+        );
+        if (refreshedDirectChat) {
+          openChat(refreshedDirectChat.id);
+          return;
+        }
+        peerUserId =
+          resolveUserRealtimeId(resolvedUser) ??
+          findDirectRealtimeTopicForUser(
+            realtimeSubscriptions,
+            realtimeMetadata,
+            resolvedUser,
+            realtimeUserId,
+          );
+      }
+      if (!peerUserId) {
         peerUserId = await realtimeClient.findUserByDirectoryQueries(
-          buildRealtimeDirectoryQueries(user),
+          buildRealtimeDirectoryQueries(resolvedUser),
         );
       }
       if (!peerUserId) {
@@ -7365,17 +7449,19 @@ export default function Home() {
         return [
           {
             id: result.topic,
-            title: user.name,
+            title: resolvedUser.name,
             subtitle: result.created ? "Новая переписка" : "Чат",
             time: "Сейчас",
             unread: 0,
             lastActivityOrder: ++activitySequenceRef.current,
-            avatar: user.avatar,
-            ...(user.avatarUrl ? { avatarUrl: user.avatarUrl } : {}),
-            gradient: user.gradient,
+            avatar: resolvedUser.avatar,
+            ...(resolvedUser.avatarUrl
+              ? { avatarUrl: resolvedUser.avatarUrl }
+              : {}),
+            gradient: resolvedUser.gradient,
             kind: "work",
             realtimeType: "direct",
-            online: user.online,
+            online: resolvedUser.online,
             memberIds: [result.peerUserId],
           },
           ...current,
@@ -7394,7 +7480,7 @@ export default function Home() {
         error.code === "tinode_directory_user_not_found"
       ) {
         setChatOpenError(
-          `Сервер не передал привязку профиля сообщений для ${user.name}. Открыть новый чат пока невозможно.`,
+          `${user.name} ещё не активировал профиль сообщений. После первого входа сотрудника повторите открытие чата.`,
         );
       } else if (
         error instanceof CifraRealtimeError &&
@@ -7983,12 +8069,46 @@ export default function Home() {
   };
 
   const startCall = (participantIds: string[] = []) => {
+    setChatOpenError("");
+    const resolved = resolveCallParticipants({
+      caller: currentUser,
+      callerRealtimeUserId: realtimeUserId,
+      participantIds,
+      users,
+    });
+    if (resolved.restriction) {
+      setCallOpen(false);
+      setCallParticipantIds([]);
+      setCallOpenError(callRestrictionMessage(resolved.restriction));
+      return;
+    }
+
+    participantIds = resolved.participantIds;
     const record = buildCallRecord(participantIds, "out", users, chatItems);
     if (!record) return;
+    setCallOpenError("");
     setCalls((current) => [record, ...current].slice(0, 100));
     setCallParticipantIds(record.participantIds);
     setCallOpen(true);
   };
+
+  const selectedChatCallParticipants = selectedChat
+    ? selectedChat.kind === "group"
+      ? (selectedChat.memberIds ?? [])
+      : [selectedChat.id]
+    : [];
+  const selectedChatCallResolution = selectedChat
+    ? resolveCallParticipants({
+        caller: currentUser,
+        callerRealtimeUserId: realtimeUserId,
+        participantIds: selectedChatCallParticipants,
+        users,
+      })
+    : null;
+  const selectedChatCallUnavailableReason =
+    selectedChatCallResolution?.restriction
+      ? callRestrictionMessage(selectedChatCallResolution.restriction)
+      : undefined;
 
   const renderedRealtimeUiTopic = resolveRealtimeObservedTopic(
     selectedChatId,
@@ -8117,6 +8237,19 @@ export default function Home() {
                 </button>
               </div>
             ) : null}
+            {callOpenError ? (
+              <div className="app-operation-notice" role="alert">
+                <Phone size={17} />
+                <span>{callOpenError}</span>
+                <button
+                  type="button"
+                  aria-label="Закрыть уведомление"
+                  onClick={() => setCallOpenError("")}
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            ) : null}
             <div className="view-host">
               {!sessionActive ? (
                 <SignedOutView
@@ -8138,6 +8271,7 @@ export default function Home() {
                         <ChatsView
                           chats={chatItems}
                           users={users}
+                          currentUser={currentUser}
                           role={role}
                           onOpenChat={openChat}
                           onMessageUser={openUserChat}
@@ -8169,16 +8303,10 @@ export default function Home() {
                             }
                             onClear={() => clearMessages(selectedChat.id)}
                             onCall={() =>
-                              startCall(
-                                selectedChat.kind === "group"
-                                  ? (selectedChat.memberIds ?? [])
-                                  : users.some(
-                                        (user) =>
-                                          user.id === selectedChat.id,
-                                      )
-                                    ? [selectedChat.id]
-                                    : [],
-                              )
+                              startCall(selectedChatCallParticipants)
+                            }
+                            callUnavailableReason={
+                              selectedChatCallUnavailableReason
                             }
                             onToggleMute={() =>
                               toggleChatMute(selectedChat.id)
@@ -8256,6 +8384,7 @@ export default function Home() {
                         <CallsView
                           calls={calls}
                           users={users}
+                          currentUser={currentUser}
                           runtimeMode={authMode}
                           onCall={startCall}
                         />
