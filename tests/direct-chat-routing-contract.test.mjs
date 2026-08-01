@@ -16,8 +16,13 @@ test("people, search, compose and admin profile share one direct-chat route", as
   assert.match(page, /onSelect=\{openUserChat\}/);
   assert.match(page, /onMessage=\{\(id\) => \{[\s\S]*?openUserChat\(id\)/);
   assert.match(handler, /findDirectChatForUser\(chatItems, user\)/);
+  assert.match(handler, /findDirectRealtimeTopicForUser\(/);
   assert.match(handler, /findUserByDirectoryQueries\(/);
   assert.match(handler, /openDirectConversation\(peerUserId/);
+  assert.ok(
+    handler.indexOf("findDirectRealtimeTopicForUser(") <
+      handler.indexOf("findUserByDirectoryQueries("),
+  );
   assert.doesNotMatch(handler, /role === "employee"|role === "admin"/);
 });
 
@@ -31,4 +36,3 @@ test("opening any conversation switches from People to Chats", async () => {
   assert.match(handler, /setSelectedChatId\(id\)/);
   assert.match(handler, /setSelectedProfileUserId\(null\)/);
 });
-
