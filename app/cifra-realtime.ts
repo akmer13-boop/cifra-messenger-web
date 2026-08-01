@@ -180,6 +180,12 @@ export interface RealtimeCreateGroupResult {
   readonly failedUserIds: readonly string[];
 }
 
+export interface RealtimeOpenDirectResult {
+  readonly topic: string;
+  readonly peerUserId: string;
+  readonly created: boolean;
+}
+
 export type RealtimeReceiptKind = "recv" | "read";
 
 export interface RealtimeChatReceipt {
@@ -229,6 +235,11 @@ interface TinodeSubscriptionBatch {
   readonly subscriptions: readonly RealtimeChatSubscription[];
 }
 
+export interface TinodeDirectoryResults {
+  readonly requestId?: string;
+  readonly userIds: readonly string[];
+}
+
 const REQUEST_TIMEOUT_MS = 15_000;
 const TINODE_VERSION = "0.25";
 
@@ -257,6 +268,10 @@ export class CifraRealtimeClient {
     { recv: number; read: number }
   >();
   private chatSubscribePromises = new Map<string, Promise<void>>();
+  private directOpenPromises = new Map<
+    string,
+    Promise<RealtimeOpenDirectResult>
+  >();
   private attachingTopics = new Set<string>();
   private desiredChatSubscriptions = new Map<string, number>();
   private connectionParams: RealtimeConnectParams | null = null;
@@ -268,6 +283,7 @@ export class CifraRealtimeClient {
   private reconnectSuccessCount = 0;
   private duplicateMessageCount = 0;
   private lastError: string | undefined;
+  private directorySearchQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly onStatus: RealtimeStatusListener = () => undefined,
@@ -424,6 +440,66 @@ export class CifraRealtimeClient {
 
     this.chatSubscribePromises.set(topic, subscribePromise);
     return subscribePromise;
+  }
+
+  async findUserByDirectoryQueries(
+    queries: readonly string[],
+  ): Promise<string | null> {
+    const normalizedQueries = Array.from(
+      new Set(
+        queries
+          .filter((query): query is string => typeof query === "string")
+          .map((query) => query.trim().slice(0, 96))
+          .filter(Boolean),
+      ),
+    );
+
+    if (normalizedQueries.length === 0) return null;
+
+    const search = this.directorySearchQueue.then(() =>
+      this.findUserInDirectoryInternal(normalizedQueries),
+    );
+    this.directorySearchQueue = search.then(
+      () => undefined,
+      () => undefined,
+    );
+    return search;
+  }
+
+  async openDirectConversation(
+    peerUserId: string,
+    options: RealtimeChatSubscribeOptions = {},
+  ): Promise<RealtimeOpenDirectResult> {
+    if (!isUserTopicName(peerUserId)) {
+      throw new CifraRealtimeError("tinode_direct_user_invalid");
+    }
+    if (peerUserId === this.tinodeUserId) {
+      throw new CifraRealtimeError("tinode_direct_self_forbidden");
+    }
+
+    const existing = this.chatSubscriptions.get(peerUserId);
+    if (existing) {
+      await this.subscribeToChat(peerUserId, options);
+      return {
+        topic: peerUserId,
+        peerUserId,
+        created: false,
+      };
+    }
+
+    const pending = this.directOpenPromises.get(peerUserId);
+    if (pending) return pending;
+
+    const openPromise = this.openDirectConversationInternal(
+      peerUserId,
+      normalizeHistoryLimit(options.historyLimit),
+    ).finally(() => {
+      if (this.directOpenPromises.get(peerUserId) === openPromise) {
+        this.directOpenPromises.delete(peerUserId);
+      }
+    });
+    this.directOpenPromises.set(peerUserId, openPromise);
+    return openPromise;
   }
 
   async publishText(
@@ -677,12 +753,12 @@ export class CifraRealtimeClient {
 
     const subscription = this.chatSubscriptions.get(topic);
 
-    if (!subscription) {
+    if (!subscription && !this.attachingTopics.has(topic)) {
       throw new CifraRealtimeError("tinode_chat_topic_unknown");
     }
 
     if (
-      subscription.access?.mode &&
+      subscription?.access?.mode &&
       !subscription.access.mode.includes("R")
     ) {
       throw new CifraRealtimeError("tinode_chat_read_access_denied");
@@ -1182,6 +1258,146 @@ export class CifraRealtimeClient {
     }
   }
 
+  private async findUserInDirectoryInternal(
+    queries: readonly string[],
+  ): Promise<string | null> {
+    const socket = this.socket;
+    if (
+      !this.isConnected() ||
+      !socket ||
+      socket.readyState !== WebSocket.OPEN
+    ) {
+      throw new CifraRealtimeError("realtime_not_connected");
+    }
+
+    if (!this.subscribedTopics.has("fnd")) {
+      const subscribeId = createPacketId("sub-fnd");
+      const subscribeControlPromise = waitForControl(socket, subscribeId);
+      socket.send(
+        JSON.stringify({
+          sub: { id: subscribeId, topic: "fnd" },
+        }),
+      );
+      const subscribeControl = await subscribeControlPromise;
+      if (this.socket !== socket) {
+        throw new CifraRealtimeError("realtime_connection_cancelled");
+      }
+      if (subscribeControl.code < 200 || subscribeControl.code >= 300) {
+        throw new CifraRealtimeError("tinode_directory_subscription_rejected");
+      }
+      this.subscribedTopics.add("fnd");
+    }
+
+    for (const query of queries) {
+      const setId = createPacketId("set-fnd-query");
+      const setControlPromise = waitForControl(socket, setId);
+      socket.send(
+        JSON.stringify({
+          set: {
+            id: setId,
+            topic: "fnd",
+            desc: { public: query },
+          },
+        }),
+      );
+      const setControl = await setControlPromise;
+      if (setControl.code < 200 || setControl.code >= 300) continue;
+
+      const getId = createPacketId("get-fnd-results");
+      const resultsPromise = waitForDirectoryResults(socket, getId);
+      socket.send(
+        JSON.stringify({
+          get: {
+            id: getId,
+            topic: "fnd",
+            what: "sub",
+          },
+        }),
+      );
+      const results = await resultsPromise;
+      if (this.socket !== socket) {
+        throw new CifraRealtimeError("realtime_connection_cancelled");
+      }
+      const matches = results.userIds.filter(
+        (userId) => userId !== this.tinodeUserId,
+      );
+      if (matches.length === 1) return matches[0];
+    }
+
+    return null;
+  }
+
+  private async openDirectConversationInternal(
+    peerUserId: string,
+    historyLimit: number,
+  ): Promise<RealtimeOpenDirectResult> {
+    const socket = this.socket;
+    if (
+      !this.isConnected() ||
+      !socket ||
+      socket.readyState !== WebSocket.OPEN
+    ) {
+      throw new CifraRealtimeError("realtime_not_connected");
+    }
+
+    const requestId = createPacketId("sub-direct");
+    const controlPromise = waitForControl(socket, requestId);
+    this.attachingTopics.add(peerUserId);
+
+    try {
+      socket.send(
+        JSON.stringify({
+          sub: {
+            id: requestId,
+            topic: peerUserId,
+            set: { sub: { mode: "JRWPA" } },
+            get: {
+              what: "desc sub data",
+              sub: { limit: 100 },
+              data: { limit: historyLimit },
+            },
+          },
+        }),
+      );
+
+      const control = await controlPromise;
+      if (this.socket !== socket) {
+        throw new CifraRealtimeError("realtime_connection_cancelled");
+      }
+      if (control.code < 200 || control.code >= 300) {
+        throw new CifraRealtimeError("tinode_direct_subscription_rejected");
+      }
+
+      const timestamp = control.timestamp || new Date().toISOString();
+      const access = parseTinodeAccess(control.params?.["acs"]) ?? {
+        mode: "JRWPA",
+      };
+      this.subscribedTopics.add(peerUserId);
+      this.desiredChatSubscriptions.set(peerUserId, historyLimit);
+      this.upsertChatSubscriptions([
+        {
+          topic: peerUserId,
+          updatedAt: timestamp,
+          touchedAt: timestamp,
+          access,
+        },
+      ]);
+      this.upsertChatMetadata({
+        topic: peerUserId,
+        kind: "direct",
+        participants: [{ userId: peerUserId }],
+      });
+
+      return {
+        topic: peerUserId,
+        peerUserId,
+        created: true,
+      };
+    } finally {
+      this.attachingTopics.delete(peerUserId);
+    }
+  }
+
   private async subscribeToChatInternal(
     socket: WebSocket,
     topic: string,
@@ -1674,6 +1890,81 @@ function waitForControl(
   });
 }
 
+function waitForDirectoryResults(
+  socket: WebSocket,
+  expectedId: string,
+): Promise<TinodeDirectoryResults> {
+  return new Promise((resolve, reject) => {
+    let results: TinodeDirectoryResults | null = null;
+    let controlAccepted = false;
+    let emptyResultsTimer: ReturnType<typeof setTimeout> | null = null;
+    const timeoutTimer = setTimeout(() => {
+      cleanup();
+      reject(new CifraRealtimeError("tinode_directory_timeout"));
+    }, REQUEST_TIMEOUT_MS);
+
+    const finish = (value: TinodeDirectoryResults) => {
+      cleanup();
+      resolve(value);
+    };
+
+    const onMessage = (event: MessageEvent) => {
+      if (typeof event.data !== "string") return;
+
+      const batch = parseTinodeDirectoryResults(event.data);
+      if (
+        batch &&
+        (!batch.requestId || batch.requestId === expectedId)
+      ) {
+        results = batch;
+        if (controlAccepted) finish(batch);
+        return;
+      }
+
+      const control = parseTinodeControl(event.data);
+      if (!control || control.id !== expectedId) return;
+      if (control.code < 200 || control.code >= 300) {
+        cleanup();
+        reject(new CifraRealtimeError("tinode_directory_search_rejected"));
+        return;
+      }
+
+      controlAccepted = true;
+      if (results) {
+        finish(results);
+        return;
+      }
+
+      emptyResultsTimer = setTimeout(
+        () => finish({ requestId: expectedId, userIds: [] }),
+        50,
+      );
+    };
+
+    const onError = () => {
+      cleanup();
+      reject(new CifraRealtimeError("websocket_failed"));
+    };
+
+    const onClose = () => {
+      cleanup();
+      reject(new CifraRealtimeError("websocket_closed_before_directory"));
+    };
+
+    const cleanup = () => {
+      clearTimeout(timeoutTimer);
+      if (emptyResultsTimer) clearTimeout(emptyResultsTimer);
+      socket.removeEventListener("message", onMessage);
+      socket.removeEventListener("error", onError);
+      socket.removeEventListener("close", onClose);
+    };
+
+    socket.addEventListener("message", onMessage);
+    socket.addEventListener("error", onError);
+    socket.addEventListener("close", onClose);
+  });
+}
+
 export function parseTinodeChatReceipt(
   raw: string,
 ): RealtimeChatReceipt | null {
@@ -1847,6 +2138,44 @@ export function parseTinodeChatMetadata(
       ...(publicValue ? { public: publicValue } : {}),
       ...(privateValue ? { private: privateValue } : {}),
       ...(directParticipants ? { participants: directParticipants } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function parseTinodeDirectoryResults(
+  raw: string,
+): TinodeDirectoryResults | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!isRecord(parsed) || !isRecord(parsed["meta"])) return null;
+
+    const meta = parsed["meta"];
+    if (meta["topic"] !== "fnd" || !Array.isArray(meta["sub"])) {
+      return null;
+    }
+
+    const userIds = Array.from(
+      new Set(
+        meta["sub"].flatMap((entry) => {
+          if (!isRecord(entry)) return [];
+          const candidate =
+            typeof entry["user"] === "string"
+              ? entry["user"]
+              : typeof entry["topic"] === "string"
+                ? entry["topic"]
+                : "";
+          return isUserTopicName(candidate) ? [candidate] : [];
+        }),
+      ),
+    );
+
+    return {
+      ...(typeof meta["id"] === "string"
+        ? { requestId: meta["id"] }
+        : {}),
+      userIds,
     };
   } catch {
     return null;
