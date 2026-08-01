@@ -49,6 +49,9 @@ export type LoginOutcome = MfaChallenge | AuthenticatedLogin;
 
 export interface BackendUser {
   id: string;
+  /** Forward-compatible identity fields for a backend directory projection. */
+  realtime_user_id?: string | null;
+  tinode_uid?: string | null;
   login: string;
   first_name: string;
   last_name: string;
@@ -74,6 +77,30 @@ export interface BackendUser {
 export interface UserPage {
   items: BackendUser[];
   next_cursor: string | null;
+}
+
+export interface ComplianceMessageMetadata {
+  topic_id: string;
+  seq: number;
+  sender_id: string | null;
+  client_msg_id: string | null;
+  kind: string;
+  created_at: string;
+  deleted_at: string | null;
+}
+
+export interface ComplianceSearchResponse {
+  items: ComplianceMessageMetadata[];
+  next_cursor?: string | null;
+  protected_text_search_available?: false;
+}
+
+export interface ComplianceSearchInput {
+  reason: string;
+  author_id?: string;
+  topic_id?: string;
+  limit?: number;
+  cursor?: string;
 }
 
 export interface CreateUserInput {
@@ -414,6 +441,22 @@ get currentDeviceId(): string {
       method: "POST",
       body: JSON.stringify({ channel: "tinode" }),
     });
+  }
+
+  async searchComplianceMetadata(
+    input: ComplianceSearchInput,
+  ): Promise<ComplianceSearchResponse> {
+    return this.request<ComplianceSearchResponse>(
+      "/api/v1/compliance/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...input,
+          reason: input.reason.trim().slice(0, 500),
+          limit: Math.min(200, Math.max(1, input.limit ?? 200)),
+        }),
+      },
+    );
   }
 
   async request<T>(

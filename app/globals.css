@@ -1843,6 +1843,48 @@ textarea:focus-visible {
   backdrop-filter: blur(18px);
 }
 
+.app-operation-notice {
+  position: absolute;
+  z-index: 220;
+  top: 56px;
+  left: 50%;
+  display: grid;
+  width: min(520px, calc(100% - 24px));
+  grid-template-columns: auto 1fr 36px;
+  gap: 9px;
+  align-items: center;
+  padding: 9px 8px 9px 12px;
+  transform: translateX(-50%);
+  border: 1px solid color-mix(in srgb, var(--danger) 38%, var(--line));
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--surface-glass) 94%, #5e2732 6%);
+  box-shadow: 0 14px 34px rgba(2, 10, 23, 0.34);
+  color: var(--text);
+  line-height: 1.35;
+  -webkit-backdrop-filter: blur(20px) saturate(1.2);
+  backdrop-filter: blur(20px) saturate(1.2);
+}
+
+.app-operation-notice > svg {
+  color: var(--danger);
+}
+
+.app-operation-notice button {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--surface-muted);
+  color: var(--muted-strong);
+}
+
+@media (max-width: 600px) {
+  .app-operation-notice {
+    top: calc(env(safe-area-inset-top) + 8px);
+  }
+}
+
 .message-context-backdrop,
 .forward-picker-backdrop {
   z-index: 180;
@@ -5460,6 +5502,14 @@ textarea:focus-visible {
   color: var(--accent-deep);
 }
 
+.audit-state-card {
+  min-height: 150px;
+  margin: 4px 0;
+  border: 1px solid var(--line);
+  border-radius: 25px;
+  background: var(--surface);
+}
+
 .audit-conversation {
   display: flex;
   min-height: 0;
@@ -6547,69 +6597,71 @@ textarea:focus-visible {
 
 .theme-option-mirror::before {
   background:
-    linear-gradient(120deg, rgba(255, 255, 255, 0.58), rgba(121, 211, 255, 0.22) 26%, rgba(205, 154, 255, 0.24) 52%, rgba(117, 255, 223, 0.18) 76%, rgba(255, 255, 255, 0.48)),
-    linear-gradient(145deg, #15233a, #071321);
-  background-size: 220% 220%, 100% 100%;
+    linear-gradient(112deg, rgba(255, 255, 255, 0.82), rgba(137, 145, 157, 0.26) 22%, rgba(187, 226, 238, 0.34) 39%, rgba(218, 190, 239, 0.3) 55%, rgba(137, 148, 161, 0.28) 72%, rgba(255, 255, 255, 0.72)),
+    linear-gradient(145deg, #858d98, #282c32 52%, #6a717b);
+  background-size: 240% 220%, 100% 100%;
   animation: mirror-shimmer 8s ease-in-out infinite alternate;
 }
 
 .theme-preview-mirror {
-  border-color: rgba(255, 255, 255, 0.42);
+  border-color: rgba(255, 255, 255, 0.62);
   background:
-    linear-gradient(120deg, rgba(255, 255, 255, 0.68), rgba(111, 210, 255, 0.3) 30%, rgba(213, 151, 255, 0.34) 58%, rgba(121, 255, 221, 0.24) 82%, rgba(255, 255, 255, 0.58)),
-    #102138;
-  background-size: 220% 220%;
+    linear-gradient(112deg, rgba(255, 255, 255, 0.88), rgba(146, 154, 166, 0.34) 25%, rgba(163, 219, 235, 0.4) 43%, rgba(214, 178, 235, 0.38) 58%, rgba(146, 154, 166, 0.32) 76%, rgba(255, 255, 255, 0.78)),
+    #4f5660;
+  background-size: 240% 220%;
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.7),
-    0 8px 22px rgba(93, 179, 227, 0.24);
+    inset 0 1px 0 rgba(255, 255, 255, 0.86),
+    inset 0 -1px 0 rgba(19, 23, 29, 0.34),
+    0 8px 22px rgba(42, 47, 55, 0.34);
   color: #ffffff;
   animation: mirror-shimmer 7s ease-in-out infinite alternate;
 }
 
 .theme-mirror {
-  --page: #091321;
-  --page-soft: #182941;
-  --app-bg: rgba(11, 24, 42, 0.62);
-  --surface: rgba(36, 56, 82, 0.52);
-  --surface-glass: rgba(28, 48, 72, 0.5);
-  --surface-muted: rgba(73, 94, 122, 0.42);
-  --text: #f8fbff;
-  --muted: #a7b7ca;
-  --muted-strong: #d6e1ed;
-  --line: rgba(216, 238, 255, 0.24);
-  --accent: #6ab9dc;
-  --accent-deep: #d9f5ff;
-  --accent-soft: rgba(125, 202, 235, 0.22);
+  --page: #17191e;
+  --page-soft: #30343b;
+  --app-bg: rgba(32, 35, 41, 0.72);
+  --surface: rgba(105, 111, 121, 0.38);
+  --surface-glass: rgba(88, 94, 104, 0.44);
+  --surface-muted: rgba(151, 157, 167, 0.3);
+  --text: #fbfcff;
+  --muted: #b8bec8;
+  --muted-strong: #e0e4ea;
+  --line: rgba(241, 246, 252, 0.25);
+  --accent: #aeb9c6;
+  --accent-deep: #f1f5f8;
+  --accent-soft: rgba(202, 211, 222, 0.2);
   --notification: #1687df;
-  --incoming: linear-gradient(145deg, rgba(89, 113, 144, 0.48), rgba(27, 50, 79, 0.56));
-  --outgoing: linear-gradient(145deg, rgba(72, 178, 218, 0.78), rgba(125, 95, 203, 0.7));
-  --shadow: 0 34px 100px rgba(0, 5, 14, 0.48);
+  --incoming: linear-gradient(145deg, rgba(148, 155, 166, 0.48), rgba(67, 72, 80, 0.62));
+  --outgoing: linear-gradient(135deg, rgba(170, 205, 218, 0.8), rgba(137, 124, 175, 0.76) 58%, rgba(104, 111, 122, 0.82));
+  --shadow: 0 34px 100px rgba(5, 7, 10, 0.56);
 }
 
 .prototype-shell.theme-mirror {
   background:
-    radial-gradient(circle at 14% 18%, rgba(138, 224, 255, 0.34), transparent 34%),
-    radial-gradient(circle at 82% 22%, rgba(218, 161, 255, 0.28), transparent 30%),
-    radial-gradient(circle at 72% 82%, rgba(115, 255, 224, 0.2), transparent 32%),
-    linear-gradient(145deg, #07101d 0%, #142840 48%, #071321 100%);
-  background-size: 140% 140%;
+    radial-gradient(circle at 14% 18%, rgba(205, 231, 239, 0.3), transparent 34%),
+    radial-gradient(circle at 82% 22%, rgba(218, 188, 235, 0.24), transparent 30%),
+    radial-gradient(circle at 72% 82%, rgba(184, 204, 210, 0.2), transparent 32%),
+    linear-gradient(145deg, #171a1f 0%, #555c66 48%, #202329 100%);
+  background-size: 150% 150%;
   animation: mirror-ambient 16s ease-in-out infinite alternate;
 }
 
 .theme-mirror .device-glow {
-  background: linear-gradient(135deg, rgba(119, 221, 255, 0.3), rgba(216, 139, 255, 0.24));
+  background: linear-gradient(135deg, rgba(196, 230, 239, 0.28), rgba(213, 180, 230, 0.24), rgba(203, 210, 219, 0.24));
   filter: blur(92px);
 }
 
 .theme-mirror .iphone {
-  border-color: rgba(235, 248, 255, 0.48);
+  border-color: rgba(244, 247, 250, 0.58);
   background:
-    linear-gradient(145deg, rgba(255, 255, 255, 0.34), rgba(81, 119, 153, 0.18) 35%, rgba(9, 22, 39, 0.72) 70%),
-    #101d2d;
+    linear-gradient(145deg, rgba(255, 255, 255, 0.5), rgba(121, 128, 139, 0.24) 35%, rgba(27, 30, 35, 0.76) 70%),
+    #41464e;
   box-shadow:
-    0 40px 110px rgba(0, 7, 18, 0.58),
-    inset 0 1px 1px rgba(255, 255, 255, 0.72),
-    inset 0 0 0 1px rgba(143, 218, 255, 0.16);
+    0 40px 110px rgba(5, 7, 10, 0.62),
+    inset 0 1px 1px rgba(255, 255, 255, 0.88),
+    inset 0 -1px 1px rgba(8, 10, 13, 0.5),
+    inset 0 0 0 1px rgba(211, 220, 229, 0.2);
 }
 
 .theme-mirror .app-screen,
@@ -6624,10 +6676,13 @@ textarea:focus-visible {
 }
 
 .theme-mirror .app-screen {
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.24);
   background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.1), transparent 38%),
+    linear-gradient(112deg, transparent 8%, rgba(255, 255, 255, 0.05) 28%, rgba(221, 231, 239, 0.2) 43%, rgba(186, 225, 235, 0.14) 49%, rgba(219, 187, 235, 0.14) 55%, transparent 72%),
+    radial-gradient(circle at 18% 12%, rgba(226, 235, 241, 0.12), transparent 38%),
     var(--app-bg);
+  background-size: 260% 100%, 150% 150%, 100% 100%;
+  animation: mirror-reflection 13s ease-in-out infinite;
 }
 
 .theme-mirror .message-bubble,
@@ -6637,10 +6692,14 @@ textarea:focus-visible {
 .theme-mirror .profile-card,
 .theme-mirror .role-preview,
 .theme-mirror .call-link-card {
-  border-color: rgba(230, 247, 255, 0.22);
+  border-color: rgba(239, 244, 249, 0.26);
+  background:
+    linear-gradient(128deg, rgba(255, 255, 255, 0.1), rgba(137, 145, 156, 0.08) 42%, rgba(195, 216, 225, 0.09) 68%, rgba(92, 97, 106, 0.13)),
+    var(--surface);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.16),
-    0 12px 30px rgba(0, 8, 22, 0.2);
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(20, 23, 28, 0.18),
+    0 12px 30px rgba(5, 7, 10, 0.24);
   -webkit-backdrop-filter: blur(18px) saturate(1.25);
   backdrop-filter: blur(18px) saturate(1.25);
 }
@@ -6648,14 +6707,14 @@ textarea:focus-visible {
 .theme-mirror .brand-mark,
 .theme-mirror .workspace-mark {
   background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.68), rgba(82, 191, 229, 0.5), rgba(171, 117, 223, 0.5));
+    linear-gradient(135deg, rgba(255, 255, 255, 0.82), rgba(155, 201, 216, 0.58), rgba(182, 151, 202, 0.54), rgba(111, 117, 127, 0.66));
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.7),
-    0 16px 38px rgba(86, 179, 223, 0.34);
+    inset 0 1px 0 rgba(255, 255, 255, 0.82),
+    0 16px 38px rgba(39, 44, 51, 0.36);
 }
 
 .theme-mirror .prototype-kicker {
-  color: #d9f5ff;
+  color: #eef2f5;
 }
 
 @keyframes mirror-shimmer {
@@ -6668,9 +6727,16 @@ textarea:focus-visible {
   to { background-position: 100% 60%; }
 }
 
+@keyframes mirror-reflection {
+  0%, 12% { background-position: 120% 50%, 0% 30%, 0 0; }
+  55%, 72% { background-position: -120% 50%, 100% 70%, 0 0; }
+  100% { background-position: -120% 50%, 0% 30%, 0 0; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .theme-option-mirror::before,
   .theme-preview-mirror,
+  .theme-mirror .app-screen,
   .prototype-shell.theme-mirror {
     animation: none;
   }
