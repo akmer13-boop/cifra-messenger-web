@@ -17,11 +17,24 @@ test("people, search, compose and admin profile share one direct-chat route", as
   assert.match(page, /onMessage=\{\(id\) => \{[\s\S]*?openUserChat\(id\)/);
   assert.match(handler, /findDirectChatForUser\(chatItems, user\)/);
   assert.match(handler, /findDirectRealtimeTopicForUser\(/);
+  assert.match(handler, /await refreshUserRealtimeProfile\(resolvedUser\)/);
   assert.match(handler, /findUserByDirectoryQueries\(/);
   assert.match(handler, /openDirectConversation\(peerUserId/);
   assert.ok(
     handler.indexOf("findDirectRealtimeTopicForUser(") <
       handler.indexOf("findUserByDirectoryQueries("),
+  );
+  assert.ok(
+    handler.indexOf("refreshUserRealtimeProfile(resolvedUser)") <
+      handler.indexOf("findUserByDirectoryQueries("),
+  );
+  assert.match(
+    page,
+    /const refreshUserRealtimeProfile = async[\s\S]*?client\.listUsers\(user\.username\)/,
+  );
+  assert.doesNotMatch(
+    handler,
+    /Сервер не передал привязку профиля сообщений/,
   );
   assert.doesNotMatch(handler, /role === "employee"|role === "admin"/);
 });
