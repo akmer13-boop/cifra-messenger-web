@@ -28,7 +28,8 @@ test("bridges Tinode chat metadata into chat rows, profiles, and participants", 
   assert.match(page, /realtimeType: metadataProjection\.type/);
   assert.match(page, /memberIds: metadataProjection\.memberIds/);
   assert.match(page, /buildRealtimeParticipantProfiles\(metadata, realtimeUserId\)/);
-  assert.match(page, /position: "Участник Tinode"/);
+  assert.match(page, /mergeRealtimeParticipantsIntoDirectory\(/);
+  assert.doesNotMatch(page, /Участник Tinode/);
   assert.match(page, /participantNameById\.get\(message\.from\)/);
   assert.match(page, /imageUrl=\{chat\.avatarUrl\}/);
   assert.match(page, /chat\.realtimeType === "channel"/);
