@@ -41,11 +41,13 @@ test("filters mock calls in backend mode and offers the mirror glass theme", asy
   assert.match(page, /filterCallsForRuntime\(runtimeMode, calls, users\)/);
   assert.match(page, /runtimeMode=\{authMode\}/);
   assert.match(page, /title: "Зеркальная"/);
-  assert.match(page, /Серебристое зеркало · переливающийся металл/);
+  assert.match(page, /Сине-серебристое зеркало · мягкие переливы/);
   assert.match(css, /\.theme-mirror\s*\{/);
-  assert.match(css, /\.theme-mirror\s*\{[^}]*--page:\s*#17191e/s);
-  assert.match(css, /\.theme-mirror\s*\{[^}]*--muted:\s*#b8bec8/s);
+  assert.match(css, /\.theme-mirror\s*\{[^}]*--page:\s*#061625/s);
+  assert.match(css, /\.theme-mirror\s*\{[^}]*--muted:\s*#aabccb/s);
   assert.match(css, /backdrop-filter:\s*blur\(28px\)/);
   assert.match(css, /@keyframes mirror-shimmer/);
   assert.match(css, /@keyframes mirror-reflection/);
+  assert.match(css, /@keyframes mirror-waves/);
+  assert.match(css, /@keyframes mirror-sheen/);
 });

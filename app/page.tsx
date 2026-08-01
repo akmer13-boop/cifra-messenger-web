@@ -104,6 +104,7 @@ import {
 import {
   buildRealtimeDirectoryQueries,
   findDirectChatForUser,
+  findDirectRealtimeTopicForUser,
   resolveRealtimeUserId as resolveUserRealtimeId,
 } from "./direct-chat-policy.mjs";
 import {
@@ -336,7 +337,7 @@ const themeOptions: {
   {
     id: "mirror",
     title: "Зеркальная",
-    description: "Серебристое зеркало · переливающийся металл",
+    description: "Сине-серебристое зеркало · мягкие переливы",
     symbol: "◇",
   },
 ];
@@ -7314,6 +7315,14 @@ export default function Home() {
       }
 
       let peerUserId = resolveUserRealtimeId(user);
+      if (!peerUserId) {
+        peerUserId = findDirectRealtimeTopicForUser(
+          realtimeSubscriptions,
+          realtimeMetadata,
+          user,
+          realtimeUserId,
+        );
+      }
       if (!peerUserId) {
         peerUserId = await realtimeClient.findUserByDirectoryQueries(
           buildRealtimeDirectoryQueries(user),
