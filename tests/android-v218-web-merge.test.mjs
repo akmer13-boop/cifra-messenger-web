@@ -57,7 +57,7 @@ test("keeps a persistent dynamic call journal and accepts call events", async ()
   assert.match(page, /"cifra-call-history"/);
   assert.match(page, /JSON\.stringify\(calls\.slice\(0, 100\)\)/);
   assert.match(page, /calls=\{calls\}/);
-  assert.match(page, /\{calls\.map\(\(call, index\) =>/);
+  assert.match(page, /\{visibleCalls\.map\(\(call, index\) =>/);
   assert.match(page, /buildCallRecord\(participantIds, "out", users, chatItems\)/);
   assert.match(page, /\[record, \.\.\.current\]\.slice\(0, 100\)/);
   assert.match(page, /"cifra:incoming-call"/);
