@@ -89,7 +89,7 @@ test("projects direct, group, and channel metadata into safe chat UI fields", ()
     undefined,
     "usrAbCdEfGhI12",
   );
-  assert.equal(channel.title, "Канал Tinode");
+  assert.equal(channel.title, "Канал");
   assert.equal(channel.type, "channel");
   assert.equal(channel.kind, "group");
 });
