@@ -134,9 +134,15 @@ export const buildRealtimeParticipantProfiles = (metadata, selfUserId) => {
       participant.private,
       participant.userId,
     );
+    const username = readString(participant.public, [
+      "username",
+      "login",
+      "handle",
+    ]);
     profiles.push({
       id: participant.userId,
       name,
+      ...(username ? { username } : {}),
       avatar: getRealtimeInitials(name),
       avatarUrl: getRealtimeAvatarUrl(
         participant.public,
@@ -160,10 +166,10 @@ export const projectRealtimeChatMetadata = (
     metadata?.public ?? subscription?.public,
     metadata?.private ?? subscription?.private,
     type === "channel"
-      ? "Канал Tinode"
+      ? "Канал"
       : type === "group"
-        ? "Групповой чат Tinode"
-        : "Личный чат Tinode",
+        ? "Групповой чат"
+        : "Личный чат",
   );
   const participants = buildRealtimeParticipantProfiles(metadata, selfUserId);
 
