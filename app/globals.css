@@ -36,9 +36,7 @@ body {
   overflow-x: hidden;
   background: var(--page);
   color: var(--text);
-  font-family:
-    -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
-    var(--font-geist-sans), sans-serif;
+  font-family: Arial, Helvetica, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
