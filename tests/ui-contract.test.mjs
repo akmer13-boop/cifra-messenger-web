@@ -113,7 +113,7 @@ test("shows the real participant list and derives counts from chat membership", 
   assert.doesNotMatch(page, /const conversationParticipants/);
 });
 
-test("offers five persistent profile themes and keeps blue notifications", async () => {
+test("offers six persistent profile themes and keeps blue notifications", async () => {
   const [page, css] = await Promise.all([
     readFile(pageUrl, "utf8"),
     readFile(cssUrl, "utf8"),
@@ -121,15 +121,17 @@ test("offers five persistent profile themes and keeps blue notifications", async
 
   assert.match(
     page,
-    /type Theme = "navy" \| "black" \| "sage" \| "gray" \| "sunset"/,
+    /type Theme = "navy" \| "black" \| "sage" \| "gray" \| "sunset" \| "mirror"/,
   );
   assert.match(page, /Выбрать тему/);
   assert.match(page, /Шалфейная/);
   assert.match(page, /Серая/);
   assert.match(page, /Закат CIFRA/);
+  assert.match(page, /Зеркальная/);
   assert.match(page, /storedTheme === "sage"/);
   assert.match(page, /storedTheme === "gray"/);
   assert.match(page, /storedTheme === "sunset"/);
+  assert.match(page, /storedTheme === "mirror"/);
   assert.match(css, /\.theme-sage\s*\{[^}]*--accent-deep:\s*#99cc99/s);
   assert.match(css, /\.theme-gray\s*\{[^}]*--muted:\s*#999999/s);
   assert.match(css, /\.theme-sunset\s*\{[^}]*--accent-deep:\s*#ffce61/s);
@@ -142,6 +144,8 @@ test("offers five persistent profile themes and keeps blue notifications", async
   assert.match(css, /\.theme-sage\s*\{[^}]*--notification:\s*#0b73d9/s);
   assert.match(css, /\.theme-gray\s*\{[^}]*--notification:\s*#0b73d9/s);
   assert.match(css, /\.theme-sunset\s*\{[^}]*--notification:\s*#0b73d9/s);
+  assert.match(css, /\.theme-mirror\s*\{[^}]*--surface-glass:\s*rgba/s);
+  assert.match(css, /\.prototype-shell\.theme-mirror/);
 });
 
 test("keeps notification badge text at WCAG AA contrast", async () => {
