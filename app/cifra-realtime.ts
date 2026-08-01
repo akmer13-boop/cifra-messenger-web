@@ -1,3 +1,77 @@
+type RealtimeReplyPayload = {
+  readonly id?: number;
+  readonly text?: string;
+  readonly author?: string;
+  readonly authorId?: string;
+};
+
+const normalizeRealtimeText = (value: unknown, limit: number): string =>
+  typeof value === "string"
+    ? value.replace(/\s+/g, " ").trim().slice(0, limit)
+    : "";
+
+const realtimeGraphemes = (value: string): string[] => Array.from(value);
+
+const buildRealtimeTextPayload = (
+  text: string,
+  reply: RealtimeReplyPayload,
+): {
+  readonly head: Readonly<Record<string, unknown>>;
+  readonly content: unknown;
+} | null => {
+  const normalizedText = normalizeRealtimeText(text, 10_000);
+  if (!normalizedText) return null;
+
+  const replyId =
+    Number.isInteger(reply.id) && Number(reply.id) > 0
+      ? Number(reply.id)
+      : undefined;
+  const replyAuthor = normalizeRealtimeText(reply.author, 120);
+  const replyText = normalizeRealtimeText(reply.text, 280);
+
+  if (!replyId || !replyAuthor || !replyText) {
+    return {
+      head: { mime: "text/plain" },
+      content: normalizedText,
+    };
+  }
+
+  const quoteText = `${replyAuthor}\n${replyText}`;
+  const format: Array<Record<string, unknown>> = [
+    {
+      at: 0,
+      len: realtimeGraphemes(quoteText).length,
+      tp: "QQ",
+    },
+  ];
+  const content: Record<string, unknown> = {
+    txt: `${quoteText}\n${normalizedText}`,
+    fmt: format,
+  };
+  const replyAuthorId = normalizeRealtimeText(reply.authorId, 120);
+  if (replyAuthorId) {
+    format.unshift({
+      at: 0,
+      len: realtimeGraphemes(replyAuthor).length,
+      key: 0,
+    });
+    content.ent = [
+      {
+        tp: "MN",
+        data: { val: replyAuthorId },
+      },
+    ];
+  }
+
+  return {
+    head: {
+      mime: "text/x-drafty",
+      "x-cifra-reply-seq": replyId,
+    },
+    content,
+  };
+};
+
 export type RealtimeStatus =
   | "disconnected"
   | "connecting"
@@ -91,6 +165,19 @@ export interface RealtimePublishTextResult {
   readonly topic: string;
   readonly seq: number;
   readonly timestamp?: string;
+}
+
+export interface RealtimePublishTextOptions {
+  readonly replyToId?: number;
+  readonly replyToText?: string;
+  readonly replyToAuthor?: string;
+  readonly replyToAuthorId?: string;
+}
+
+export interface RealtimeCreateGroupResult {
+  readonly topic: string;
+  readonly invitedUserIds: readonly string[];
+  readonly failedUserIds: readonly string[];
 }
 
 export type RealtimeReceiptKind = "recv" | "read";
@@ -342,6 +429,7 @@ export class CifraRealtimeClient {
   async publishText(
     topic: string,
     text: string,
+    options: RealtimePublishTextOptions = {},
   ): Promise<RealtimePublishTextResult> {
     if (!isChatTopicName(topic)) {
       throw new CifraRealtimeError("tinode_chat_topic_invalid");
@@ -380,6 +468,17 @@ export class CifraRealtimeClient {
       throw new CifraRealtimeError("tinode_chat_not_subscribed");
     }
 
+    const payload = buildRealtimeTextPayload(normalizedText, {
+      id: options.replyToId,
+      text: options.replyToText,
+      author: options.replyToAuthor,
+      authorId: options.replyToAuthorId,
+    });
+
+    if (!payload) {
+      throw new CifraRealtimeError("tinode_publish_text_empty");
+    }
+
     const requestId = createPacketId("pub-text");
     const controlPromise = waitForControl(socket, requestId);
 
@@ -389,10 +488,8 @@ export class CifraRealtimeClient {
           id: requestId,
           topic,
           noecho: false,
-          head: {
-            mime: "text/plain",
-          },
-          content: normalizedText,
+          head: payload.head,
+          content: payload.content,
         },
       }),
     );
@@ -419,6 +516,139 @@ export class CifraRealtimeClient {
       ...(control.timestamp
         ? { timestamp: control.timestamp }
         : {}),
+    };
+  }
+
+  async createGroup(
+    name: string,
+    memberUserIds: readonly string[],
+  ): Promise<RealtimeCreateGroupResult> {
+    const normalizedName = name.trim().slice(0, 80);
+    const normalizedMembers = Array.from(
+      new Set(
+        memberUserIds.filter(
+          (userId) =>
+            typeof userId === "string" &&
+            /^usr[A-Za-z0-9_-]+$/.test(userId) &&
+            userId !== this.tinodeUserId,
+        ),
+      ),
+    );
+
+    if (!normalizedName) {
+      throw new CifraRealtimeError("tinode_group_name_empty");
+    }
+
+    if (normalizedMembers.length < 2) {
+      throw new CifraRealtimeError("tinode_group_members_insufficient");
+    }
+
+    const socket = this.socket;
+    if (
+      !this.isConnected() ||
+      !socket ||
+      socket.readyState !== WebSocket.OPEN
+    ) {
+      throw new CifraRealtimeError("realtime_not_connected");
+    }
+
+    const provisionalTopic = `new${Date.now().toString(36)}${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+    const requestId = createPacketId("sub-new-group");
+    const controlPromise = waitForControl(socket, requestId);
+
+    socket.send(
+      JSON.stringify({
+        sub: {
+          id: requestId,
+          topic: provisionalTopic,
+          set: {
+            desc: {
+              public: { fn: normalizedName },
+            },
+          },
+          get: {
+            what: "desc sub",
+            sub: { limit: 100 },
+          },
+        },
+      }),
+    );
+
+    const control = await controlPromise;
+    if (this.socket !== socket) {
+      throw new CifraRealtimeError("realtime_connection_cancelled");
+    }
+    if (control.code < 200 || control.code >= 300) {
+      throw new CifraRealtimeError("tinode_group_create_rejected");
+    }
+
+    const returnedTopic =
+      typeof control.params?.["topic"] === "string"
+        ? control.params["topic"]
+        : control.topic;
+    if (
+      typeof returnedTopic !== "string" ||
+      !/^grp[A-Za-z0-9_-]+$/.test(returnedTopic)
+    ) {
+      throw new CifraRealtimeError("tinode_group_topic_missing");
+    }
+
+    const invitedUserIds: string[] = [];
+    const failedUserIds: string[] = [];
+
+    for (const userId of normalizedMembers) {
+      const inviteId = createPacketId("set-group-member");
+      const inviteControlPromise = waitForControl(socket, inviteId);
+      socket.send(
+        JSON.stringify({
+          set: {
+            id: inviteId,
+            topic: returnedTopic,
+            sub: {
+              user: userId,
+              mode: "JRWPS",
+            },
+          },
+        }),
+      );
+
+      try {
+        const inviteControl = await inviteControlPromise;
+        if (inviteControl.code >= 200 && inviteControl.code < 300) {
+          invitedUserIds.push(userId);
+        } else {
+          failedUserIds.push(userId);
+        }
+      } catch {
+        failedUserIds.push(userId);
+      }
+    }
+
+    const timestamp = control.timestamp || new Date().toISOString();
+    this.subscribedTopics.add(returnedTopic);
+    this.desiredChatSubscriptions.set(returnedTopic, 20);
+    this.chatSubscriptions.set(returnedTopic, {
+      topic: returnedTopic,
+      updatedAt: timestamp,
+      touchedAt: timestamp,
+      access: { mode: "JRWPS" },
+      public: { fn: normalizedName },
+    });
+    this.chatMetadata.set(returnedTopic, {
+      topic: returnedTopic,
+      kind: "group",
+      public: { fn: normalizedName },
+      participants: invitedUserIds.map((userId) => ({ userId })),
+    });
+    this.onSubscriptions(this.getChatSubscriptions());
+    this.onMetadata(this.getChatMetadata());
+
+    return {
+      topic: returnedTopic,
+      invitedUserIds,
+      failedUserIds,
     };
   }
 
