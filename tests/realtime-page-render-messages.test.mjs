@@ -12,8 +12,8 @@ test("projects every attached Tinode topic and server message into the chat UI",
     /const \[realtimeUserId, setRealtimeUserId\] = useState<string \| null>\(null\)/,
   );
   assert.match(page, /\.then\(\(userId\) => \{[\s\S]*?setRealtimeUserId\(userId\)/);
-  assert.match(page, /const getRealtimeMessageText = \(content: unknown\)/);
-  assert.match(page, /content\["txt"\]/);
+  assert.match(page, /parseRealtimeMessageContent\(message\.content, message\.head\)/);
+  assert.match(page, /parsed\.replyPreview/);
   assert.match(page, /const buildRealtimeUiMessage = \(/);
   assert.match(page, /message\.from === selfUserId/);
   assert.match(page, /deliveryStatus: "sent" as const/);
@@ -42,6 +42,6 @@ test("keeps demo delivery timers behind the backend source guard", async () => {
 
   assert.ok(publishBranch >= 0);
   assert.ok(mockTimer > publishBranch);
-  assert.match(page, /publishText\(chatId, normalizedText\)/);
+  assert.match(page, /publishText\(chatId, normalizedText, \{/);
   assert.match(page, /return true;[\s\S]*?canUseLocalChatFallback\(authMode\)[\s\S]*?const now = formatMessageTime\(\)/);
 });

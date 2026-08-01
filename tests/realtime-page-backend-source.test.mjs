@@ -31,11 +31,11 @@ test("does not create or publish local mock data in backend mode", async () => {
   );
   assert.match(
     page,
-    /const createGroup = \(name: string, memberIds: string\[\]\) => \{[\s\S]*?!canUseLocalChatFallback\(authMode\)[\s\S]*?const newChat: Chat/,
+    /const createGroup = async \([\s\S]*?name: string,[\s\S]*?memberIds: string\[\],[\s\S]*?canUseLocalChatFallback\(authMode\)[\s\S]*?const newChat: Chat[\s\S]*?realtimeClient\.createGroup\(name, members\.resolved\)/,
   );
   assert.match(
     page,
-    /realtimeClient\.isTopicSubscribed\(chatId\)[\s\S]*?publishText\(chatId, normalizedText\)[\s\S]*?if \(!canUseLocalChatFallback\(authMode\)\) \{[\s\S]*?return false;[\s\S]*?const now = formatMessageTime\(\)/,
+    /realtimeClient\.isTopicSubscribed\(chatId\)[\s\S]*?publishText\(chatId, normalizedText, \{[\s\S]*?if \(!canUseLocalChatFallback\(authMode\)\) \{[\s\S]*?return false;[\s\S]*?const now = formatMessageTime\(\)/,
   );
   assert.match(
     page,

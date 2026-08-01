@@ -26,7 +26,7 @@ test("routes every attached real chat through Tinode publish", async () => {
   );
   assert.match(
     page,
-    /realtimeClient[\s\S]*?\.publishText\(chatId, normalizedText\)/,
+    /realtimeClient[\s\S]*?\.publishText\(chatId, normalizedText, \{[\s\S]*?replyToId: options\.replyToId/,
   );
   assert.match(page, /setRealtimePublishStatus\("publishing"\)/);
   assert.match(page, /setRealtimePublishStatus\("published"\)/);

@@ -113,6 +113,12 @@ import {
   buildRealtimeParticipantProfiles,
   projectRealtimeChatMetadata,
 } from "./realtime-chat-metadata-policy.mjs";
+import { parseRealtimeMessageContent } from "./realtime-message-policy.mjs";
+import {
+  filterCallsForRuntime,
+  mergeRealtimeParticipantsIntoDirectory,
+  resolveRealtimeMemberIds,
+} from "./contact-directory-policy.mjs";
 import {
   canUseLocalChatFallback,
   filterChatsForRuntimeMode,
@@ -128,7 +134,7 @@ import {
 
 type Tab = "chats" | "teams" | "calls" | "profile";
 type Filter = string;
-type Theme = "navy" | "black" | "sage" | "gray" | "sunset";
+type Theme = "navy" | "black" | "sage" | "gray" | "sunset" | "mirror";
 type RealtimeChatObserverStatus =
   | "idle"
   | "subscribing"
@@ -177,6 +183,9 @@ type IncomingCallDetail = {
 };
 type SendMessageOptions = {
   replyToId?: number;
+  replyToText?: string;
+  replyToAuthor?: string;
+  replyToAuthorId?: string;
   forwardedFrom?: string;
   voice?: string;
 };
@@ -211,8 +220,13 @@ type Message = {
   time: string;
   voice?: string;
   author?: string;
+  authorId?: string;
   deliveryStatus?: MessageDeliveryStatus;
   replyToId?: number;
+  replyPreview?: {
+    author: string;
+    text: string;
+  };
   forwardedFrom?: string;
   pinned?: boolean;
   pinnedAt?: number;
@@ -230,6 +244,7 @@ type CallRecord = {
 type MessengerUser = {
   id: string;
   backendId?: string;
+  realtimeUserId?: string;
   backendVersion?: number;
   backendRoles?: CorporateRole[];
   name: string;
@@ -301,6 +316,12 @@ const themeOptions: {
     title: "Закат CIFRA",
     description: "Солнечный градиент",
     symbol: "✦",
+  },
+  {
+    id: "mirror",
+    title: "Зеркальная",
+    description: "Полупрозрачное переливающееся стекло",
+    symbol: "◇",
   },
 ];
 
@@ -886,21 +907,6 @@ const isRealtimeRecord = (
 ): value is Readonly<Record<string, unknown>> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
-const getRealtimeMessageText = (content: unknown) => {
-  if (typeof content === "string") {
-    return content.trim() || undefined;
-  }
-
-  if (isRealtimeRecord(content)) {
-    const text = content["txt"];
-    if (typeof text === "string" && text.trim()) {
-      return text.trim();
-    }
-  }
-
-  return undefined;
-};
-
 const getRealtimeReceiptSeq = (
   receipts: readonly RealtimeChatReceipt[],
   topic: string,
@@ -922,16 +928,19 @@ const buildRealtimeUiMessage = (
   selfUserId: string,
   authorName?: string,
 ): Message | null => {
-  const text = getRealtimeMessageText(message.content);
-  if (!text) return null;
+  const parsed = parseRealtimeMessageContent(message.content, message.head);
+  if (!parsed) return null;
 
   const outgoing = message.from === selfUserId;
 
   return {
     id: message.seq,
     side: outgoing ? "out" : "in",
-    text,
+    text: parsed.text,
     time: formatRealtimeTimestamp(message.timestamp) || formatMessageTime(),
+    ...(message.from ? { authorId: message.from } : {}),
+    ...(parsed.replyToId ? { replyToId: parsed.replyToId } : {}),
+    ...(parsed.replyPreview ? { replyPreview: parsed.replyPreview } : {}),
     ...(outgoing ? { deliveryStatus: "sent" as const } : {}),
     ...(!outgoing && message.from
       ? { author: authorName || message.from }
@@ -2582,7 +2591,7 @@ function ChatView({
   role: UserRole;
   messages: Message[];
   onBack: () => void;
-  onSend: (text: string, options?: SendMessageOptions) => void;
+  onSend: (text: string, options?: SendMessageOptions) => boolean;
   onClear: () => void;
   onCall: () => void;
   onToggleMute: () => void;
@@ -2950,9 +2959,17 @@ function ChatView({
   const submitMessage = () => {
     const value = draft.trim();
     if (!value) return;
-    onSend(value, {
+    const accepted = onSend(value, {
       replyToId: replyingToMessage?.id,
+      replyToText: replyingToMessage
+        ? getMessageSnippet(replyingToMessage)
+        : undefined,
+      replyToAuthor: replyingToMessage
+        ? getMessageAuthorLabel(replyingToMessage)
+        : undefined,
+      replyToAuthorId: replyingToMessage?.authorId,
     });
+    if (!accepted) return;
     setDraft("");
     setReplyingToMessageId(null);
     window.requestAnimationFrame(() => composerInputRef.current?.focus());
@@ -2960,12 +2977,21 @@ function ChatView({
 
   const handleVoice = () => {
     if (recording) {
-      setRecording(false);
-      onSend("", {
+      const accepted = onSend("", {
         voice: "0:07",
         replyToId: replyingToMessage?.id,
+        replyToText: replyingToMessage
+          ? getMessageSnippet(replyingToMessage)
+          : undefined,
+        replyToAuthor: replyingToMessage
+          ? getMessageAuthorLabel(replyingToMessage)
+          : undefined,
+        replyToAuthorId: replyingToMessage?.authorId,
       });
-      setReplyingToMessageId(null);
+      if (accepted) {
+        setRecording(false);
+        setReplyingToMessageId(null);
+      }
       return;
     }
     setRecording(true);
@@ -2978,24 +3004,29 @@ function ChatView({
     const selectedFiles = Array.from(event.currentTarget.files ?? []);
     if (!selectedFiles.length) return;
 
-    if (kind === "gallery") {
-      onSend(
-        selectedFiles.length === 1
-          ? `🖼️ ${selectedFiles[0].name}`
-          : `🖼️ Медиафайлы · ${selectedFiles.length}`,
-        { replyToId: replyingToMessage?.id },
-      );
-    } else if (kind === "camera") {
-      onSend(`📷 ${selectedFiles[0].name}`, {
-        replyToId: replyingToMessage?.id,
-      });
-    } else {
-      onSend(`📎 ${selectedFiles[0].name}`, {
-        replyToId: replyingToMessage?.id,
-      });
-    }
+    const replyOptions: SendMessageOptions = {
+      replyToId: replyingToMessage?.id,
+      replyToText: replyingToMessage
+        ? getMessageSnippet(replyingToMessage)
+        : undefined,
+      replyToAuthor: replyingToMessage
+        ? getMessageAuthorLabel(replyingToMessage)
+        : undefined,
+      replyToAuthorId: replyingToMessage?.authorId,
+    };
+    const accepted =
+      kind === "gallery"
+        ? onSend(
+            selectedFiles.length === 1
+              ? `🖼️ ${selectedFiles[0].name}`
+              : `🖼️ Медиафайлы · ${selectedFiles.length}`,
+            replyOptions,
+          )
+        : kind === "camera"
+          ? onSend(`📷 ${selectedFiles[0].name}`, replyOptions)
+          : onSend(`📎 ${selectedFiles[0].name}`, replyOptions);
 
-    setReplyingToMessageId(null);
+    if (accepted) setReplyingToMessageId(null);
     event.currentTarget.value = "";
   };
 
@@ -3171,18 +3202,33 @@ function ChatView({
                         Переслано от {message.forwardedFrom}
                       </span>
                     ) : null}
-                    {repliedMessage ? (
+                    {repliedMessage || message.replyPreview ? (
                       <button
                         type="button"
                         className="message-quote"
                         onPointerDown={(event) => event.stopPropagation()}
-                        onClick={() => jumpToMessage(repliedMessage.id)}
-                        aria-label={`Перейти к сообщению: ${getMessageSnippet(repliedMessage)}`}
+                        onClick={() =>
+                          repliedMessage ? jumpToMessage(repliedMessage.id) : undefined
+                        }
+                        disabled={!repliedMessage}
+                        aria-label={
+                          repliedMessage
+                            ? `Перейти к сообщению: ${getMessageSnippet(repliedMessage)}`
+                            : `Ответ на сообщение: ${message.replyPreview?.text ?? "сообщение"}`
+                        }
                       >
                         <i />
                         <span>
-                          <strong>{getMessageAuthorLabel(repliedMessage)}</strong>
-                          <small>{getMessageSnippet(repliedMessage)}</small>
+                          <strong>
+                            {repliedMessage
+                              ? getMessageAuthorLabel(repliedMessage)
+                              : message.replyPreview?.author}
+                          </strong>
+                          <small>
+                            {repliedMessage
+                              ? getMessageSnippet(repliedMessage)
+                              : message.replyPreview?.text}
+                          </small>
                         </span>
                       </button>
                     ) : null}
@@ -4421,11 +4467,10 @@ function TeamsView({
   const normalizedQuery = query.trim().toLocaleLowerCase("ru");
   const visibleUsers = users.filter(
     (user) =>
-      user.id !== "self" &&
-      (!normalizedQuery ||
-        `${user.name} ${user.position}`
-          .toLocaleLowerCase("ru")
-          .includes(normalizedQuery)),
+      !normalizedQuery ||
+      `${user.name} ${user.position}`
+        .toLocaleLowerCase("ru")
+        .includes(normalizedQuery),
   );
 
   return (
@@ -4498,15 +4543,17 @@ function TeamsView({
               type="button"
               className="person-row"
               key={person.id}
-              onClick={() =>
-                role !== "employee"
-                  ? onOpenUser(person.id)
-                  : onMessage(person.id)
-              }
+              onClick={() => {
+                if (person.id === "self") return;
+                if (role !== "employee") onOpenUser(person.id);
+                else onMessage(person.id);
+              }}
               aria-label={
-                role !== "employee"
-                  ? `Открыть профиль: ${person.name}`
-                  : `Написать: ${person.name}`
+                person.id === "self"
+                  ? `${person.name} — это вы`
+                  : role !== "employee"
+                    ? `Открыть профиль: ${person.name}`
+                    : `Написать: ${person.name}`
               }
             >
               <Avatar
@@ -4521,7 +4568,9 @@ function TeamsView({
                   {person.position} · {person.online ? "в сети" : "не в сети"}
                 </small>
               </span>
-              {role !== "employee" ? (
+              {person.id === "self" ? (
+                <UserRound size={19} />
+              ) : role !== "employee" ? (
                 <ChevronRight size={19} />
               ) : (
                 <MessageCircle size={19} />
@@ -4605,10 +4654,12 @@ function TeamsView({
 function CallsView({
   calls,
   users,
+  runtimeMode,
   onCall,
 }: {
   calls: CallRecord[];
   users: MessengerUser[];
+  runtimeMode: RuntimeMode;
   onCall: (participantIds: string[]) => void;
 }) {
   const [groupCallOpen, setGroupCallOpen] = useState(false);
@@ -4617,6 +4668,7 @@ function CallsView({
     string[]
   >([]);
   const normalizedQuery = query.trim().toLocaleLowerCase("ru");
+  const visibleCalls = filterCallsForRuntime(runtimeMode, calls, users);
   const visibleContacts = users.filter(
     (user) =>
       user.id !== "self" &&
@@ -4669,7 +4721,7 @@ function CallsView({
       </div>
 
       <div className="scroll-area call-list">
-        {calls.map((call, index) => (
+        {visibleCalls.map((call, index) => (
           <button
             type="button"
             className="call-row"
@@ -4698,6 +4750,12 @@ function CallsView({
             </span>
           </button>
         ))}
+        {!visibleCalls.length ? (
+          <div className="panel-empty calls-empty-state">
+            <Phone size={23} />
+            <span>История звонков пока пуста</span>
+          </div>
+        ) : null}
       </div>
 
       {groupCallOpen ? (
@@ -4918,56 +4976,58 @@ function ProfileView({
           onChange={handleAvatarChange}
         />
 
-        <div
-          className={`role-preview ${
-            authMode === "backend" ? "role-preview-readonly" : ""
-          }`}
-          aria-label={
-            authMode === "demo"
-              ? "Демо роли пользователя"
-              : "Роль пользователя"
-          }
-        >
-          <span>
-            <strong>
-              {authMode === "demo" ? "Демо доступа" : "Доступ организации"}
-            </strong>
-            <small>
-              {authMode === "demo"
-                ? "Переключатель только для проверки прототипа"
-                : "Роль назначена сервером и не меняется в профиле"}
-            </small>
-          </span>
-          <div role="group" aria-label="Выбрать роль">
-            <button
-              type="button"
-              className={role === "admin" ? "is-active" : ""}
-              aria-pressed={role === "admin"}
-              onClick={() => onRoleChange("admin")}
-              disabled={authMode === "backend"}
-            >
-              Админ
-            </button>
-            <button
-              type="button"
-              className={role === "moderator" ? "is-active" : ""}
-              aria-pressed={role === "moderator"}
-              onClick={() => onRoleChange("moderator")}
-              disabled={authMode === "backend"}
-            >
-              Модератор
-            </button>
-            <button
-              type="button"
-              className={role === "employee" ? "is-active" : ""}
-              aria-pressed={role === "employee"}
-              onClick={() => onRoleChange("employee")}
-              disabled={authMode === "backend"}
-            >
-              Сотрудник
-            </button>
+        {role !== "employee" ? (
+          <div
+            className={`role-preview ${
+              authMode === "backend" ? "role-preview-readonly" : ""
+            }`}
+            aria-label={
+              authMode === "demo"
+                ? "Демо роли пользователя"
+                : "Роль пользователя"
+            }
+          >
+            <span>
+              <strong>
+                {authMode === "demo" ? "Демо доступа" : "Доступ организации"}
+              </strong>
+              <small>
+                {authMode === "demo"
+                  ? "Переключатель только для проверки прототипа"
+                  : "Роль назначена сервером и не меняется в профиле"}
+              </small>
+            </span>
+            <div role="group" aria-label="Выбрать роль">
+              <button
+                type="button"
+                className={role === "admin" ? "is-active" : ""}
+                aria-pressed={role === "admin"}
+                onClick={() => onRoleChange("admin")}
+                disabled={authMode === "backend"}
+              >
+                Админ
+              </button>
+              <button
+                type="button"
+                className={role === "moderator" ? "is-active" : ""}
+                aria-pressed={role === "moderator"}
+                onClick={() => onRoleChange("moderator")}
+                disabled={authMode === "backend"}
+              >
+                Модератор
+              </button>
+              <button
+                type="button"
+                className=""
+                aria-pressed={false}
+                onClick={() => onRoleChange("employee")}
+                disabled={authMode === "backend"}
+              >
+                Сотрудник
+              </button>
+            </div>
           </div>
-        </div>
+        ) : null}
 
         <div className="profile-hero">
           <Avatar
@@ -5745,7 +5805,10 @@ function ComposeSheet({
   users: MessengerUser[];
   onClose: () => void;
   onSelect: (id: string) => void;
-  onCreateGroup: (name: string, memberIds: string[]) => void;
+  onCreateGroup: (
+    name: string,
+    memberIds: string[],
+  ) => Promise<string | null>;
 }) {
   const [step, setStep] = useState<"message" | "members" | "details">(
     "message",
@@ -5753,6 +5816,8 @@ function ComposeSheet({
   const [query, setQuery] = useState("");
   const [selectedMemberIds, setSelectedMemberIds] = useState<string[]>([]);
   const [groupName, setGroupName] = useState("");
+  const [creatingGroup, setCreatingGroup] = useState(false);
+  const [creationError, setCreationError] = useState("");
   const normalizedQuery = query.trim().toLocaleLowerCase("ru");
   const availableUsers = users.filter(
     (user) =>
@@ -5978,16 +6043,31 @@ function ComposeSheet({
                 );
               })}
             </div>
+            {creationError ? (
+              <p className="group-creation-error" role="alert">
+                {creationError}
+              </p>
+            ) : null}
             <button
               type="button"
               className="create-group-button"
-              disabled={!groupName.trim()}
-              onClick={() =>
-                onCreateGroup(groupName.trim(), selectedMemberIds)
-              }
+              disabled={!groupName.trim() || creatingGroup}
+              onClick={async () => {
+                if (creatingGroup) return;
+                setCreatingGroup(true);
+                setCreationError("");
+                const error = await onCreateGroup(
+                  groupName.trim(),
+                  selectedMemberIds,
+                );
+                if (error) {
+                  setCreationError(error);
+                  setCreatingGroup(false);
+                }
+              }}
             >
               <UsersRound size={18} />
-              Создать группу
+              {creatingGroup ? "Создаём группу…" : "Создать группу"}
             </button>
           </div>
         )}
@@ -6565,7 +6645,7 @@ export default function Home() {
         title: metadataProjection.title,
         subtitle: latestMessage
           ? getChatPreview(latestMessage, realtimeKind)
-          : "Реальный чат Tinode",
+          : "Чат",
         time:
           latestMessage?.time ||
           formatRealtimeTimestamp(
@@ -6685,58 +6765,25 @@ export default function Home() {
     sessionActive,
   ]);
   useEffect(() => {
-    const previousParticipantIds = realtimeParticipantIdsRef.current;
-    const participantProfiles = realtimeMetadata.flatMap((metadata) =>
-      buildRealtimeParticipantProfiles(metadata, realtimeUserId),
-    );
-    const uniqueProfiles = Array.from(
+    const participantProfiles = Array.from(
       new Map(
-        participantProfiles.map((participant) => [
-          participant.id,
-          participant,
-        ]),
+        realtimeMetadata
+          .flatMap((metadata) =>
+            buildRealtimeParticipantProfiles(metadata, realtimeUserId),
+          )
+          .map((participant) => [participant.id, participant]),
       ).values(),
-    );
-    const currentParticipantIds = new Set(
-      uniqueProfiles.map((participant) => participant.id),
     );
 
     setUsers((current) => {
-      const retained = current.filter(
-        (user) => !previousParticipantIds.has(user.id),
+      const merged = mergeRealtimeParticipantsIntoDirectory(
+        current,
+        realtimeParticipantIdsRef.current,
+        participantProfiles,
       );
-      const retainedIds = new Set(retained.map((user) => user.id));
-      const generated = uniqueProfiles
-        .filter((participant) => !retainedIds.has(participant.id))
-        .map(
-          (participant): MessengerUser => ({
-            id: participant.id,
-            name: participant.name,
-            email: "",
-            username: participant.id,
-            phone: "",
-            avatar: participant.avatar,
-            ...(participant.avatarUrl
-              ? { avatarUrl: participant.avatarUrl }
-              : {}),
-            gradient: "linear-gradient(145deg, #0f766e, #2563eb)",
-            role: "employee",
-            online: participant.online,
-            position: "Участник Tinode",
-          }),
-        );
-
-      if (
-        generated.length === 0 &&
-        retained.length === current.length
-      ) {
-        return current;
-      }
-
-      return [...retained, ...generated];
+      realtimeParticipantIdsRef.current = new Set(merged.participantIds);
+      return merged.users as MessengerUser[];
     });
-
-    realtimeParticipantIdsRef.current = currentParticipantIds;
   }, [realtimeMetadata, realtimeUserId]);
 
   useEffect(() => {
@@ -6819,7 +6866,8 @@ export default function Home() {
         storedTheme === "black" ||
         storedTheme === "sage" ||
         storedTheme === "gray" ||
-        storedTheme === "sunset"
+        storedTheme === "sunset" ||
+        storedTheme === "mirror"
       ) {
         frameId = window.requestAnimationFrame(() => setTheme(storedTheme));
       }
@@ -7024,6 +7072,7 @@ export default function Home() {
       sage: "#18261d",
       gray: "#1b1b1b",
       sunset: "#1f214d",
+      mirror: "#162235",
     };
     document
       .querySelector('meta[name="theme-color"]')
@@ -7410,31 +7459,60 @@ export default function Home() {
     });
   };
 
-  const createGroup = (name: string, memberIds: string[]) => {
-    if (!canUseLocalChatFallback(authMode)) {
+  const createGroup = async (
+    name: string,
+    memberIds: string[],
+  ): Promise<string | null> => {
+    if (canUseLocalChatFallback(authMode)) {
+      const newChat: Chat = {
+        id: `group-${Date.now()}`,
+        title: name,
+        subtitle: `${memberIds.length + 1} участников · группа создана`,
+        time: "Сейчас",
+        unread: 0,
+        lastActivityOrder: ++activitySequenceRef.current,
+        avatar: name
+          .split(/\s+/)
+          .slice(0, 2)
+          .map((part) => part[0]?.toLocaleUpperCase("ru"))
+          .join(""),
+        gradient: "linear-gradient(145deg, #1d4ed8, #7c3aed)",
+        kind: "group",
+        memberIds,
+      };
+      setChatItems((current) => [newChat, ...current]);
+      setMessagesByChat((current) => ({ ...current, [newChat.id]: [] }));
       setComposeOpen(false);
-      return;
+      setSelectedChatId(newChat.id);
+      return null;
     }
-    const newChat: Chat = {
-      id: `group-${Date.now()}`,
-      title: name,
-      subtitle: `${memberIds.length + 1} участников · группа создана`,
-      time: "Сейчас",
-      unread: 0,
-      lastActivityOrder: ++activitySequenceRef.current,
-      avatar: name
-        .split(/\s+/)
-        .slice(0, 2)
-        .map((part) => part[0]?.toLocaleUpperCase("ru"))
-        .join(""),
-      gradient: "linear-gradient(145deg, #1d4ed8, #7c3aed)",
-      kind: "group",
-      memberIds,
-    };
-    setChatItems((current) => [newChat, ...current]);
-    setMessagesByChat((current) => ({ ...current, [newChat.id]: [] }));
-    setComposeOpen(false);
-    setSelectedChatId(newChat.id);
+
+    const realtimeClient = realtimeClientRef.current;
+    if (!realtimeClient || realtimeStatus !== "connected") {
+      return "Нет соединения с сервером сообщений. Повторите попытку.";
+    }
+
+    const members = resolveRealtimeMemberIds(users, memberIds);
+    if (members.unresolved.length) {
+      return "Не удалось сопоставить всех выбранных сотрудников. Откройте с ними чат и повторите попытку.";
+    }
+
+    try {
+      const result = await realtimeClient.createGroup(name, members.resolved);
+      setComposeOpen(false);
+      setSelectedChatId(result.topic);
+      return null;
+    } catch (error: unknown) {
+      if (error instanceof CifraRealtimeError) {
+        if (error.code === "tinode_group_members_insufficient") {
+          return "Для группы нужно выбрать минимум двух сотрудников.";
+        }
+        if (error.code === "tinode_group_create_rejected") {
+          return "Сервер не разрешил создать группу для этой учётной записи.";
+        }
+      }
+      return "Не удалось создать группу. Повторите попытку позже.";
+    }
   };
 
   const updateOwnAvatar = (avatarUrl: string) => {
@@ -7469,7 +7547,6 @@ export default function Home() {
       if (
         !normalizedText ||
         voice ||
-        options.replyToId !== undefined ||
         options.forwardedFrom
       ) {
         setRealtimePublishStatus("error");
@@ -7480,7 +7557,12 @@ export default function Home() {
       setRealtimePublishedSeq(null);
 
       void realtimeClient
-        .publishText(chatId, normalizedText)
+        .publishText(chatId, normalizedText, {
+          replyToId: options.replyToId,
+          replyToText: options.replyToText,
+          replyToAuthor: options.replyToAuthor,
+          replyToAuthorId: options.replyToAuthorId,
+        })
         .then((result) => {
           setRealtimePublishedSeq(result.seq);
           setRealtimePublishStatus("published");
@@ -7512,6 +7594,14 @@ export default function Home() {
       time: now,
       deliveryStatus: "sent",
       replyToId: options.replyToId,
+      ...(options.replyToText && options.replyToAuthor
+        ? {
+            replyPreview: {
+              author: options.replyToAuthor,
+              text: options.replyToText,
+            },
+          }
+        : {}),
       forwardedFrom: options.forwardedFrom,
     };
     const activityOrder = ++activitySequenceRef.current;
@@ -7874,6 +7964,7 @@ export default function Home() {
                         <CallsView
                           calls={calls}
                           users={users}
+                          runtimeMode={authMode}
                           onCall={startCall}
                         />
                       ) : (

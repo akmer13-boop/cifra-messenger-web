@@ -6523,3 +6523,155 @@ textarea:focus-visible {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Stage 7D: real directory, group creation feedback and mirror glass theme. */
+.message-quote:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.group-creation-error {
+  margin: 2px 0 10px;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--danger) 54%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface));
+  color: color-mix(in srgb, var(--danger) 78%, white);
+  line-height: 1.4;
+}
+
+.calls-empty-state {
+  min-height: 180px;
+  margin: 12px;
+}
+
+.theme-option-mirror::before {
+  background:
+    linear-gradient(120deg, rgba(255, 255, 255, 0.58), rgba(121, 211, 255, 0.22) 26%, rgba(205, 154, 255, 0.24) 52%, rgba(117, 255, 223, 0.18) 76%, rgba(255, 255, 255, 0.48)),
+    linear-gradient(145deg, #15233a, #071321);
+  background-size: 220% 220%, 100% 100%;
+  animation: mirror-shimmer 8s ease-in-out infinite alternate;
+}
+
+.theme-preview-mirror {
+  border-color: rgba(255, 255, 255, 0.42);
+  background:
+    linear-gradient(120deg, rgba(255, 255, 255, 0.68), rgba(111, 210, 255, 0.3) 30%, rgba(213, 151, 255, 0.34) 58%, rgba(121, 255, 221, 0.24) 82%, rgba(255, 255, 255, 0.58)),
+    #102138;
+  background-size: 220% 220%;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.7),
+    0 8px 22px rgba(93, 179, 227, 0.24);
+  color: #ffffff;
+  animation: mirror-shimmer 7s ease-in-out infinite alternate;
+}
+
+.theme-mirror {
+  --page: #091321;
+  --page-soft: #182941;
+  --app-bg: rgba(11, 24, 42, 0.62);
+  --surface: rgba(36, 56, 82, 0.52);
+  --surface-glass: rgba(28, 48, 72, 0.5);
+  --surface-muted: rgba(73, 94, 122, 0.42);
+  --text: #f8fbff;
+  --muted: #a7b7ca;
+  --muted-strong: #d6e1ed;
+  --line: rgba(216, 238, 255, 0.24);
+  --accent: #6ab9dc;
+  --accent-deep: #d9f5ff;
+  --accent-soft: rgba(125, 202, 235, 0.22);
+  --notification: #1687df;
+  --incoming: linear-gradient(145deg, rgba(89, 113, 144, 0.48), rgba(27, 50, 79, 0.56));
+  --outgoing: linear-gradient(145deg, rgba(72, 178, 218, 0.78), rgba(125, 95, 203, 0.7));
+  --shadow: 0 34px 100px rgba(0, 5, 14, 0.48);
+}
+
+.prototype-shell.theme-mirror {
+  background:
+    radial-gradient(circle at 14% 18%, rgba(138, 224, 255, 0.34), transparent 34%),
+    radial-gradient(circle at 82% 22%, rgba(218, 161, 255, 0.28), transparent 30%),
+    radial-gradient(circle at 72% 82%, rgba(115, 255, 224, 0.2), transparent 32%),
+    linear-gradient(145deg, #07101d 0%, #142840 48%, #071321 100%);
+  background-size: 140% 140%;
+  animation: mirror-ambient 16s ease-in-out infinite alternate;
+}
+
+.theme-mirror .device-glow {
+  background: linear-gradient(135deg, rgba(119, 221, 255, 0.3), rgba(216, 139, 255, 0.24));
+  filter: blur(92px);
+}
+
+.theme-mirror .iphone {
+  border-color: rgba(235, 248, 255, 0.48);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.34), rgba(81, 119, 153, 0.18) 35%, rgba(9, 22, 39, 0.72) 70%),
+    #101d2d;
+  box-shadow:
+    0 40px 110px rgba(0, 7, 18, 0.58),
+    inset 0 1px 1px rgba(255, 255, 255, 0.72),
+    inset 0 0 0 1px rgba(143, 218, 255, 0.16);
+}
+
+.theme-mirror .app-screen,
+.theme-mirror .bottom-sheet,
+.theme-mirror .tab-bar,
+.theme-mirror .status-bar,
+.theme-mirror .compact-header,
+.theme-mirror .large-header,
+.theme-mirror .profile-nav {
+  -webkit-backdrop-filter: blur(28px) saturate(1.35);
+  backdrop-filter: blur(28px) saturate(1.35);
+}
+
+.theme-mirror .app-screen {
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.1), transparent 38%),
+    var(--app-bg);
+}
+
+.theme-mirror .message-bubble,
+.theme-mirror .workspace-card,
+.theme-mirror .person-row,
+.theme-mirror .call-row,
+.theme-mirror .profile-card,
+.theme-mirror .role-preview,
+.theme-mirror .call-link-card {
+  border-color: rgba(230, 247, 255, 0.22);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    0 12px 30px rgba(0, 8, 22, 0.2);
+  -webkit-backdrop-filter: blur(18px) saturate(1.25);
+  backdrop-filter: blur(18px) saturate(1.25);
+}
+
+.theme-mirror .brand-mark,
+.theme-mirror .workspace-mark {
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.68), rgba(82, 191, 229, 0.5), rgba(171, 117, 223, 0.5));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.7),
+    0 16px 38px rgba(86, 179, 223, 0.34);
+}
+
+.theme-mirror .prototype-kicker {
+  color: #d9f5ff;
+}
+
+@keyframes mirror-shimmer {
+  from { background-position: 0% 50%, 0 0; }
+  to { background-position: 100% 50%, 0 0; }
+}
+
+@keyframes mirror-ambient {
+  from { background-position: 0% 40%; }
+  to { background-position: 100% 60%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .theme-option-mirror::before,
+  .theme-preview-mirror,
+  .prototype-shell.theme-mirror {
+    animation: none;
+  }
+}
