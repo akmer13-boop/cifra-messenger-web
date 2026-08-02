@@ -10,7 +10,10 @@ test("keeps real chat UI state while the client reconnects with refreshed API au
   ]);
 
   assert.match(api, /async issueRealtimeTicket\(\): Promise<unknown>/);
-  assert.match(api, /this\.request<unknown>\("\/api\/v1\/realtime\/tickets"/);
+  assert.match(
+    api,
+    /this\.request<Record<string, unknown>>\([\s\S]*?"\/api\/v1\/realtime\/tickets"[\s\S]*?parseJsonRecord/,
+  );
   assert.match(page, /ticketProvider: \(\) => apiClient\.issueRealtimeTicket\(\)/);
   assert.match(page, /if \(status === "disconnected"\) \{[\s\S]*?setRealtimeUserId\(null\)/);
   assert.doesNotMatch(page, /if \(status !== "connected"\) \{[\s\S]{0,100}?setRealtimeUserId\(null\)/);
