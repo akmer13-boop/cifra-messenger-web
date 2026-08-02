@@ -203,7 +203,7 @@ export function loadRuntimeConfig(): Promise<RuntimeConfig> {
           "RUNTIME_CONFIG_INVALID",
         );
       }
-      const mode = raw.mode;
+      const mode: RuntimeMode = raw.mode;
       return {
         mode,
         apiBaseUrl: normalizeApiBase(
