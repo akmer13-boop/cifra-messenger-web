@@ -9,8 +9,10 @@ import {
   getRealtimeTopicType,
   projectRealtimeChatMetadata,
 } from "../app/realtime-chat-metadata-policy.mjs";
+import { configureAvatarAllowedOrigins } from "../app/avatar-policy.mjs";
 
 test("projects direct, group, and channel metadata into safe chat UI fields", () => {
+  configureAvatarAllowedOrigins(["https://media.example.test"]);
   assert.equal(getRealtimeTopicType("usrZyXwVuTsR10"), "direct");
   assert.equal(getRealtimeTopicType("grpAbCdEfGhI12"), "group");
   assert.equal(getRealtimeTopicType("chnAbCdEfGhI12"), "channel");
@@ -95,6 +97,7 @@ test("projects direct, group, and channel metadata into safe chat UI fields", ()
 });
 
 test("normalizes supported avatars and rejects unsafe image sources", () => {
+  configureAvatarAllowedOrigins([]);
   assert.equal(
     getRealtimeAvatarUrl({ photo: "/api/v1/media/avatar.png" }),
     "/api/v1/media/avatar.png",
@@ -113,6 +116,10 @@ test("normalizes supported avatars and rejects unsafe image sources", () => {
   );
   assert.equal(
     getRealtimeAvatarUrl({ photo: "//outside.example.test/avatar.png" }),
+    undefined,
+  );
+  assert.equal(
+    getRealtimeAvatarUrl({ photo: "https://outside.example.test/avatar.png" }),
     undefined,
   );
   assert.equal(
