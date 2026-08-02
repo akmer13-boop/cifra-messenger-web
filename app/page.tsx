@@ -141,6 +141,11 @@ import {
   filterMessagesForRuntimeMode,
   keepSelectedChatForRuntimeMode,
 } from "./chat-source-policy.mjs";
+import {
+  configureAvatarAllowedOrigins,
+  normalizeSafeAvatarUrl,
+  validateAvatarFile,
+} from "./avatar-policy.mjs";
 
 import {
   clampSwipeOffset,
@@ -160,6 +165,14 @@ type RealtimePublishStatus =
   | "idle"
   | "publishing"
   | "published"
+  | "error";
+type DirectoryStatus = "idle" | "loading" | "ready" | "empty" | "error";
+type RealtimeListStatus =
+  | "ready"
+  | "connecting"
+  | "reconnecting"
+  | "loading"
+  | "empty"
   | "error";
 
 const EMPTY_REALTIME_DIAGNOSTICS: RealtimeDiagnostics = {
@@ -810,11 +823,40 @@ function backendUserToMessenger(
     avatar: avatar || "CF",
     gradient: gradients[colorIndex] ?? gradients[0],
     role: primaryRole(user.roles) as UserRole,
-    online: user.status === "active",
+    // Account lifecycle status is not presence. Realtime metadata is the only
+    // authority that may later project this user as online.
+    online: false,
     position:
       user.job_title ??
       user.department ??
       roleDisplayName(primaryRole(user.roles)),
+  };
+}
+
+function authSessionToMessenger(session: AuthSession): MessengerUser {
+  const name = session.login.trim() || "Текущий пользователь";
+  const avatar = name
+    .split(/[\s._-]+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toLocaleUpperCase("ru"))
+    .join("");
+  return {
+    id: "self",
+    backendId:
+      session.context.user_id === "00000000-0000-4000-8000-000000000001"
+        ? undefined
+        : session.context.user_id,
+    backendRoles: session.context.roles,
+    name,
+    email: "",
+    username: session.login,
+    phone: "",
+    avatar: avatar || "CF",
+    gradient: "linear-gradient(145deg, #102c52, #2d659d)",
+    role: session.role,
+    online: false,
+    position: roleDisplayName(session.role),
   };
 }
 
@@ -1119,16 +1161,17 @@ function Avatar({
   size?: "small" | "medium" | "large" | "hero";
   online?: boolean;
 }) {
+  const safeImageUrl = normalizeSafeAvatarUrl(imageUrl);
   return (
     <span
       className={`avatar avatar-${size}`}
       style={{ background: gradient } as CSSProperties}
       aria-hidden="true"
     >
-      {imageUrl ? (
+      {safeImageUrl ? (
         <span
           className="avatar-photo"
-          style={{ backgroundImage: `url("${imageUrl}")` }}
+          style={{ backgroundImage: `url("${safeImageUrl}")` }}
         />
       ) : (
         label
@@ -1982,6 +2025,35 @@ function TabBar({
   );
 }
 
+function BackendStateCard({
+  title,
+  detail,
+  busy = false,
+  onRetry,
+}: {
+  title: string;
+  detail: string;
+  busy?: boolean;
+  onRetry?: () => void;
+}) {
+  return (
+    <div
+      className="empty-state backend-state-card"
+      role={busy ? "status" : "alert"}
+      aria-live="polite"
+    >
+      {busy ? <Wifi size={28} /> : <MessageCircle size={28} />}
+      <strong>{title}</strong>
+      <span>{detail}</span>
+      {onRetry ? (
+        <button type="button" onClick={onRetry}>
+          Повторить
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
 function ChatsView({
   chats,
   users,
@@ -1996,6 +2068,9 @@ function ChatsView({
   onUnarchiveChat,
   onTogglePin,
   onDeleteChat,
+  runtimeMode,
+  realtimeListStatus,
+  onRetryRealtime,
 }: {
   chats: Chat[];
   users: MessengerUser[];
@@ -2010,6 +2085,9 @@ function ChatsView({
   onUnarchiveChat: (id: string) => void;
   onTogglePin: (id: string) => void;
   onDeleteChat: (id: string) => void;
+  runtimeMode: RuntimeMode;
+  realtimeListStatus: RealtimeListStatus;
+  onRetryRealtime: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("Все");
@@ -2086,6 +2164,16 @@ function ChatsView({
       }),
     );
   }, [activeFilter, chats, customCategoryChats, normalizedQuery, role]);
+  const realtimeStateCopy =
+    realtimeListStatus === "connecting"
+      ? ["Подключаем чаты", "Устанавливаем защищённое соединение с сервером сообщений."]
+      : realtimeListStatus === "reconnecting"
+        ? ["Восстанавливаем соединение", "Список чатов сохранён и обновится после подключения."]
+        : realtimeListStatus === "loading"
+          ? ["Загружаем чаты", "Получаем доступные переписки и историю сообщений."]
+          : realtimeListStatus === "empty"
+            ? ["Чатов пока нет", "Сервер не вернул доступных переписок для этой учётной записи."]
+            : ["Не удалось загрузить чаты", "Проверьте соединение и повторите попытку."];
 
   const addCategory = () => {
     const value = newCategory.trim().replace(/\s+/g, " ");
@@ -2258,6 +2346,17 @@ function ChatsView({
               ) : null}
             </div>
           </div>
+        ) : runtimeMode === "backend" && realtimeListStatus !== "ready" ? (
+          <BackendStateCard
+            title={realtimeStateCopy[0]}
+            detail={realtimeStateCopy[1]}
+            busy={
+              realtimeListStatus === "connecting" ||
+              realtimeListStatus === "reconnecting" ||
+              realtimeListStatus === "loading"
+            }
+            onRetry={onRetryRealtime}
+          />
         ) : (
           <>
             {activeFilter === "Все" && !query ? (
@@ -4494,11 +4593,19 @@ function TeamsView({
   role,
   onMessage,
   onOpenUser,
+  runtimeMode,
+  directoryStatus,
+  directoryError,
+  onRetryDirectory,
 }: {
   users: MessengerUser[];
   role: UserRole;
   onMessage: (id: string) => void;
   onOpenUser: (id: string) => void;
+  runtimeMode: RuntimeMode;
+  directoryStatus: DirectoryStatus;
+  directoryError: string;
+  onRetryDirectory: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [organizationOpen, setOrganizationOpen] = useState(false);
@@ -4528,6 +4635,29 @@ function TeamsView({
       </header>
 
       <div className="scroll-area team-scroll">
+        {runtimeMode === "backend" && directoryStatus !== "ready" ? (
+          <BackendStateCard
+            title={
+              directoryStatus === "error"
+                ? "Не удалось загрузить сотрудников"
+                : directoryStatus === "empty"
+                  ? "Каталог сотрудников пуст"
+                  : "Загружаем сотрудников"
+            }
+            detail={
+              directoryStatus === "error"
+                ? directoryError || "Проверьте соединение и повторите попытку."
+                : directoryStatus === "empty"
+                  ? "Сервер не вернул доступных сотрудников для этой организации."
+                  : "Получаем актуальный каталог организации с сервера."
+            }
+            busy={
+              directoryStatus === "idle" || directoryStatus === "loading"
+            }
+            onRetry={onRetryDirectory}
+          />
+        ) : (
+          <>
         <button
           type="button"
           className="workspace-card"
@@ -4622,9 +4752,13 @@ function TeamsView({
             </div>
           ) : null}
         </div>
+          </>
+        )}
       </div>
 
-      {organizationOpen && role !== "employee" ? (
+      {organizationOpen &&
+      role !== "employee" &&
+      (runtimeMode !== "backend" || directoryStatus === "ready") ? (
         <div
           className="sheet-backdrop"
           role="presentation"
@@ -4967,6 +5101,7 @@ function ProfileView({
   onLogout: () => void;
 }) {
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
+  const [avatarError, setAvatarError] = useState("");
   const [activePanel, setActivePanel] = useState<ProfilePanel>(null);
   const [storageTab, setStorageTab] = useState<"media" | "files">("media");
   const [previewContent, setPreviewContent] =
@@ -4984,6 +5119,13 @@ function ProfileView({
   const handleAvatarChange = (event: ChangeEvent<HTMLInputElement>) => {
     const [file] = Array.from(event.currentTarget.files ?? []);
     if (!file) return;
+    const validationError = validateAvatarFile(file);
+    if (validationError) {
+      setAvatarError(validationError);
+      event.currentTarget.value = "";
+      return;
+    }
+    setAvatarError("");
     onAvatarChange(URL.createObjectURL(file));
     event.currentTarget.value = "";
   };
@@ -5012,9 +5154,14 @@ function ProfileView({
           ref={avatarInputRef}
           hidden
           type="file"
-          accept="image/*"
+          accept="image/png,image/jpeg,image/webp,image/avif"
           onChange={handleAvatarChange}
         />
+        {avatarError ? (
+          <p className="avatar-upload-error" role="alert">
+            {avatarError}
+          </p>
+        ) : null}
 
         {role !== "employee" ? (
           <div
@@ -5075,7 +5222,7 @@ function ProfileView({
             gradient={user.gradient}
             imageUrl={user.avatarUrl}
             size="hero"
-            online
+            online={user.online}
           />
           <h1>{user.name}</h1>
           <span className={`role-badge role-badge-${role}`}>
@@ -5086,7 +5233,7 @@ function ProfileView({
             )}
             {roleDisplayName(role)}
           </span>
-          <small>в сети</small>
+          <small>{user.online ? "в сети" : "не в сети"}</small>
         </div>
 
         <div className="profile-card identity-card">
@@ -5427,6 +5574,7 @@ function AdminUserSheet({
   const [saveError, setSaveError] = useState("");
   const [saving, setSaving] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
+  const avatarPreviewUrlRef = useRef<string | null>(null);
   const normalizedDraft: MessengerUser = {
     ...draft,
     name: draft.name.trim(),
@@ -5451,12 +5599,33 @@ function AdminUserSheet({
   const handleAvatarChange = (event: ChangeEvent<HTMLInputElement>) => {
     const [file] = Array.from(event.currentTarget.files ?? []);
     if (!file) return;
+    const validationError = validateAvatarFile(file);
+    if (validationError) {
+      setSaveError(validationError);
+      event.currentTarget.value = "";
+      return;
+    }
+    if (avatarPreviewUrlRef.current) {
+      URL.revokeObjectURL(avatarPreviewUrlRef.current);
+    }
+    const previewUrl = URL.createObjectURL(file);
+    avatarPreviewUrlRef.current = previewUrl;
+    setSaveError("");
     setDraft((current) => ({
       ...current,
-      avatarUrl: URL.createObjectURL(file),
+      avatarUrl: previewUrl,
     }));
     event.currentTarget.value = "";
   };
+
+  useEffect(
+    () => () => {
+      if (avatarPreviewUrlRef.current) {
+        URL.revokeObjectURL(avatarPreviewUrlRef.current);
+      }
+    },
+    [],
+  );
 
   return (
     <div
@@ -5511,7 +5680,7 @@ function AdminUserSheet({
                 ref={avatarInputRef}
                 hidden
                 type="file"
-                accept="image/*"
+                accept="image/png,image/jpeg,image/webp,image/avif"
                 onChange={handleAvatarChange}
               />
             </>
@@ -5629,9 +5798,12 @@ function AdminUserSheet({
               onClick={async () => {
                 setSaving(true);
                 setSaveError("");
+                const transferredPreviewUrl = avatarPreviewUrlRef.current;
+                avatarPreviewUrlRef.current = null;
                 try {
                   await onSave(normalizedDraft);
                 } catch (error) {
+                  avatarPreviewUrlRef.current = transferredPreviewUrl;
                   setSaveError(authErrorMessage(error));
                 } finally {
                   setSaving(false);
@@ -5925,6 +6097,10 @@ function ComposeSheet({
   onClose,
   onSelect,
   onCreateGroup,
+  runtimeMode,
+  directoryStatus,
+  directoryError,
+  onRetryDirectory,
 }: {
   users: MessengerUser[];
   onClose: () => void;
@@ -5933,6 +6109,10 @@ function ComposeSheet({
     name: string,
     memberIds: string[],
   ) => Promise<string | null>;
+  runtimeMode: RuntimeMode;
+  directoryStatus: DirectoryStatus;
+  directoryError: string;
+  onRetryDirectory: () => void;
 }) {
   const [step, setStep] = useState<"message" | "members" | "details">(
     "message",
@@ -5942,6 +6122,8 @@ function ComposeSheet({
   const [groupName, setGroupName] = useState("");
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [creationError, setCreationError] = useState("");
+  const backdropRef = useRef<HTMLDivElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
   const normalizedQuery = query.trim().toLocaleLowerCase("ru");
   const availableUsers = users.filter(
     (user) =>
@@ -5960,26 +6142,92 @@ function ComposeSheet({
     );
   };
 
+  useEffect(() => {
+    const backdrop = backdropRef.current;
+    const dialog = dialogRef.current;
+    if (!backdrop || !dialog) return;
+
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const appScreen = backdrop.parentElement;
+    const background = appScreen
+      ? Array.from(appScreen.children).filter(
+          (element): element is HTMLElement =>
+            element instanceof HTMLElement && element !== backdrop,
+        )
+      : [];
+    const previousStates = background.map((element) => ({
+      element,
+      inert: element.inert,
+      ariaHidden: element.getAttribute("aria-hidden"),
+    }));
+
+    for (const element of background) {
+      element.inert = true;
+      element.setAttribute("aria-hidden", "true");
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      dialog
+        .querySelector<HTMLElement>(
+          'input:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        )
+        ?.focus();
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      for (const state of previousStates) {
+        state.element.inert = state.inert;
+        if (state.ariaHidden === null) {
+          state.element.removeAttribute("aria-hidden");
+        } else {
+          state.element.setAttribute("aria-hidden", state.ariaHidden);
+        }
+      }
+      previouslyFocused?.focus();
+    };
+  }, []);
+
   return (
     <div
+      ref={backdropRef}
       className="sheet-backdrop"
       role="presentation"
       onClick={onClose}
       onKeyDown={(event) => {
-        if (event.key === "Escape") onClose();
+        if (event.key === "Escape") {
+          event.preventDefault();
+          onClose();
+          return;
+        }
+        if (event.key !== "Tab" || !dialogRef.current) return;
+        const focusable = Array.from(
+          dialogRef.current.querySelectorAll<HTMLElement>(
+            'input:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+          ),
+        ).filter((element) => !element.hidden);
+        const first = focusable[0];
+        const last = focusable.at(-1);
+        if (!first || !last) {
+          event.preventDefault();
+        } else if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
       }}
     >
       <div
+        ref={dialogRef}
         className={`bottom-sheet compose-sheet compose-step-${step}`}
         role="dialog"
         aria-modal="true"
-        aria-label={
-          step === "message"
-            ? "Новое сообщение"
-            : step === "members"
-              ? "Выбор участников группы"
-              : "Создание группы"
-        }
+        aria-labelledby="compose-sheet-title"
         onClick={(event) => event.stopPropagation()}
       >
         <span className="sheet-handle" />
@@ -5998,7 +6246,7 @@ function ComposeSheet({
                 <ChevronLeft size={18} />
               </button>
             ) : null}
-            <strong>
+            <strong id="compose-sheet-title">
               {step === "message"
                 ? "Новое сообщение"
                 : step === "members"
@@ -6057,7 +6305,29 @@ function ComposeSheet({
             </button>
             <span className="contact-letter">КОНТАКТЫ</span>
             <div className="compose-contact-list">
-              {availableUsers.length ? (
+              {runtimeMode === "backend" && directoryStatus !== "ready" ? (
+                <BackendStateCard
+                  title={
+                    directoryStatus === "error"
+                      ? "Контакты недоступны"
+                      : directoryStatus === "empty"
+                        ? "Контактов пока нет"
+                        : "Загружаем контакты"
+                  }
+                  detail={
+                    directoryStatus === "error"
+                      ? directoryError || "Повторите загрузку каталога."
+                      : directoryStatus === "empty"
+                        ? "Сервер вернул пустой каталог сотрудников."
+                        : "Получаем сотрудников организации."
+                  }
+                  busy={
+                    directoryStatus === "idle" ||
+                    directoryStatus === "loading"
+                  }
+                  onRetry={onRetryDirectory}
+                />
+              ) : availableUsers.length ? (
                 availableUsers.map((person) => (
                   <button
                     type="button"
@@ -6090,7 +6360,23 @@ function ComposeSheet({
         ) : step === "members" ? (
           <>
             <div className="group-member-list">
-              {availableUsers.length ? (
+              {runtimeMode === "backend" && directoryStatus !== "ready" ? (
+                <BackendStateCard
+                  title="Участники недоступны"
+                  detail={
+                    directoryStatus === "error"
+                      ? directoryError || "Повторите загрузку каталога."
+                      : directoryStatus === "empty"
+                        ? "Сервер вернул пустой каталог сотрудников."
+                        : "Получаем сотрудников организации."
+                  }
+                  busy={
+                    directoryStatus === "idle" ||
+                    directoryStatus === "loading"
+                  }
+                  onRetry={onRetryDirectory}
+                />
+              ) : availableUsers.length ? (
                 availableUsers.map((person) => {
                   const selected = selectedMemberIds.includes(person.id);
                   return (
@@ -6268,7 +6554,7 @@ function CallOverlay({
         <h2>
           {isGroupCall
             ? "Групповой звонок"
-            : callParticipants[0]?.name ?? "Анна Смирнова"}
+            : callParticipants[0]?.name ?? "Собеседник"}
         </h2>
         <p>
           {isGroupCall
@@ -6318,15 +6604,15 @@ function CallOverlay({
 export default function Home() {
   const [activeTab, setActiveTab] = useState<Tab>("chats");
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
-  const [chatItems, setChatItems] = useState<Chat[]>(initialChats);
+  const [chatItems, setChatItems] = useState<Chat[]>([]);
   const [messagesByChat, setMessagesByChat] =
-    useState<Record<string, Message[]>>(initialMessagesByChat);
+    useState<Record<string, Message[]>>({});
   const deliveryTimersRef = useRef<number[]>([]);
   const activitySequenceRef = useRef(initialChats.length);
   const [composeOpen, setComposeOpen] = useState(false);
   const [callOpen, setCallOpen] = useState(false);
   const [callParticipantIds, setCallParticipantIds] = useState<string[]>([]);
-  const [calls, setCalls] = useState<CallRecord[]>(initialCallHistory);
+  const [calls, setCalls] = useState<CallRecord[]>([]);
   const [callHistoryReady, setCallHistoryReady] = useState(false);
   const [theme, setTheme] = useState<Theme>("navy");
   const [notificationMode, setNotificationMode] =
@@ -6375,11 +6661,15 @@ export default function Home() {
   >(null);
   const [realtimeDiagnostics, setRealtimeDiagnostics] =
     useState<RealtimeDiagnostics>(EMPTY_REALTIME_DIAGNOSTICS);
-  const [authMode, setAuthMode] = useState<RuntimeMode>("demo");
+  const [realtimeRetryNonce, setRealtimeRetryNonce] = useState(0);
+  const [authMode, setAuthMode] = useState<RuntimeMode>("backend");
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
   const [role, setRole] = useState<UserRole>("admin");
-  const [users, setUsers] = useState<MessengerUser[]>(initialUsers);
+  const [users, setUsers] = useState<MessengerUser[]>([]);
+  const [directoryStatus, setDirectoryStatus] =
+    useState<DirectoryStatus>("idle");
+  const [directoryError, setDirectoryError] = useState("");
   const [selectedProfileUserId, setSelectedProfileUserId] = useState<
     string | null
   >(null);
@@ -6387,13 +6677,50 @@ export default function Home() {
   const [chatOpenError, setChatOpenError] = useState("");
   const [callOpenError, setCallOpenError] = useState("");
   const openingDirectUsersRef = useRef<Set<string>>(new Set());
+  const ownedAvatarUrlsRef = useRef<Map<string, string>>(new Map());
+
+  const ownAvatarUrl = useCallback((userId: string, avatarUrl: string) => {
+    if (!avatarUrl.startsWith("blob:")) return;
+    const previousUrl = ownedAvatarUrlsRef.current.get(userId);
+    if (previousUrl && previousUrl !== avatarUrl) {
+      URL.revokeObjectURL(previousUrl);
+    }
+    ownedAvatarUrlsRef.current.set(userId, avatarUrl);
+  }, []);
+
+  const releaseOwnedAvatarUrls = useCallback(() => {
+    for (const avatarUrl of ownedAvatarUrlsRef.current.values()) {
+      URL.revokeObjectURL(avatarUrl);
+    }
+    ownedAvatarUrlsRef.current.clear();
+  }, []);
+
+  const applyRuntimeMode = useCallback((mode: RuntimeMode) => {
+    setAuthMode(mode);
+    if (mode === "demo") {
+      setChatItems(initialChats);
+      setMessagesByChat(initialMessagesByChat);
+      setCalls(initialCallHistory);
+      setUsers(initialUsers);
+      setDirectoryStatus("ready");
+      setDirectoryError("");
+      return;
+    }
+
+    setChatItems([]);
+    setMessagesByChat({});
+    setCalls([]);
+    setUsers([]);
+    setDirectoryStatus("idle");
+    setDirectoryError("");
+  }, []);
 
   const activateSession = useCallback((session: AuthSession) => {
     setAuthSession(session);
     setRole(session.role);
     setSessionActive(true);
-    setUsers((current) =>
-      current.map((user) =>
+    setUsers((current) => {
+      const next = current.map((user) =>
         user.id === "self"
           ? {
               ...user,
@@ -6407,23 +6734,46 @@ export default function Home() {
               backendRoles: session.context.roles,
             }
           : user,
-      ),
-    );
+      );
+      return next.some((user) => user.id === "self")
+        ? next
+        : [authSessionToMessenger(session)];
+    });
   }, []);
 
   const syncBackendDirectory = useCallback(
     async (client: CifraApiClient, session: AuthSession) => {
       if (client.mode !== "backend") return;
-      const page = await client.listUsers();
-      if (page.items.length === 0) return;
-      setUsers(
-        page.items.map((user) =>
-          backendUserToMessenger(user, session.context.user_id),
-        ),
-      );
+      setDirectoryStatus("loading");
+      setDirectoryError("");
+      try {
+        const page = await client.listUsers();
+        if (page.items.length === 0) {
+          setUsers([authSessionToMessenger(session)]);
+          setDirectoryStatus("empty");
+          return;
+        }
+        setUsers(
+          page.items.map((user) =>
+            backendUserToMessenger(user, session.context.user_id),
+          ),
+        );
+        setDirectoryStatus("ready");
+      } catch (error) {
+        setUsers([authSessionToMessenger(session)]);
+        setDirectoryStatus("error");
+        setDirectoryError(authErrorMessage(error));
+        throw error;
+      }
     },
     [],
   );
+
+  const retryBackendDirectory = useCallback(() => {
+    const client = apiClientRef.current;
+    if (!client || !authSession || client.mode !== "backend") return;
+    void syncBackendDirectory(client, authSession).catch(() => undefined);
+  }, [authSession, syncBackendDirectory]);
 
   useEffect(() => {
     let cancelled = false;
@@ -6432,7 +6782,8 @@ export default function Home() {
         if (cancelled) return;
         const client = new CifraApiClient(config);
         apiClientRef.current = client;
-        setAuthMode(config.mode);
+        configureAvatarAllowedOrigins(config.avatarAllowedOrigins);
+        applyRuntimeMode(config.mode);
         const restored = await client.restoreSession();
         if (cancelled || !restored) return;
         activateSession(restored);
@@ -6444,7 +6795,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [activateSession, syncBackendDirectory]);
+  }, [activateSession, applyRuntimeMode, syncBackendDirectory]);
   useEffect(() => {
     const apiClient = apiClientRef.current;
 
@@ -6546,7 +6897,7 @@ export default function Home() {
         realtimeClientRef.current = null;
       }
     };
-  }, [authSession, sessionActive]);
+  }, [authSession, realtimeRetryNonce, sessionActive]);
   useEffect(() => {
     const realtimeClient = realtimeClientRef.current;
     let cancelled = false;
@@ -7051,6 +7402,13 @@ export default function Home() {
     }
   }, [callHistoryReady, calls]);
 
+  useEffect(
+    () => () => {
+      releaseOwnedAvatarUrls();
+    },
+    [releaseOwnedAvatarUrls],
+  );
+
   useEffect(() => {
     const deliveryTimers = deliveryTimersRef.current;
     return () => {
@@ -7262,6 +7620,26 @@ export default function Home() {
     (total, chat) => total + (chat.deleted ? 0 : chat.unread),
     0,
   );
+  const realtimeListStatus: RealtimeListStatus =
+    authMode !== "backend"
+      ? "ready"
+      : realtimeStatus === "error" || realtimeChatStatus === "error"
+        ? "error"
+        : realtimeStatus === "reconnecting"
+          ? "reconnecting"
+          : realtimeStatus === "disconnected" || realtimeStatus === "connecting"
+            ? "connecting"
+            : !realtimeUserId || realtimeChatStatus === "subscribing"
+              ? "loading"
+              : realtimeSubscriptions.length === 0
+                ? "empty"
+                : realtimeAttachedTopics.length === 0
+                  ? "loading"
+                  : "ready";
+
+  const retryRealtime = () => {
+    setRealtimeRetryNonce((current) => current + 1);
+  };
 
   const acknowledgeRealtimeChatOpen = (id: string) => {
     if (!realtimeUserId || !realtimeAttachedTopics.includes(id)) {
@@ -7504,7 +7882,8 @@ export default function Home() {
     const config = await loadRuntimeConfig();
     const client = new CifraApiClient(config);
     apiClientRef.current = client;
-    setAuthMode(config.mode);
+    configureAvatarAllowedOrigins(config.avatarAllowedOrigins);
+    applyRuntimeMode(config.mode);
     return client;
   };
 
@@ -7610,6 +7989,7 @@ export default function Home() {
   try {
     await apiClientRef.current?.logout();
   } finally {
+    releaseOwnedAvatarUrls();
     setAuthSession(null);
     setSessionActive(false);
     setSelectedChatId(null);
@@ -7688,11 +8068,16 @@ export default function Home() {
         );
       }
       if (backendUser) {
-        persistedUser = backendUserToMessenger(
-          backendUser,
-          authSession.context.user_id,
-        );
+        persistedUser = {
+          ...backendUserToMessenger(backendUser, authSession.context.user_id),
+          ...(updatedUser.avatarUrl
+            ? { avatarUrl: updatedUser.avatarUrl }
+            : {}),
+        };
       }
+    }
+    if (persistedUser.avatarUrl) {
+      ownAvatarUrl(persistedUser.id, persistedUser.avatarUrl);
     }
     setUsers((current) =>
       current.map((user) =>
@@ -7706,6 +8091,9 @@ export default function Home() {
               ...chat,
               title: persistedUser.name,
               avatar: persistedUser.avatar,
+              ...(persistedUser.avatarUrl
+                ? { avatarUrl: persistedUser.avatarUrl }
+                : {}),
               gradient: persistedUser.gradient,
               online: persistedUser.online,
             }
@@ -7726,6 +8114,11 @@ export default function Home() {
         target.backendId,
         "Отключение сотрудника через CIFRA Web",
       );
+    }
+    const ownedAvatarUrl = ownedAvatarUrlsRef.current.get(id);
+    if (ownedAvatarUrl) {
+      URL.revokeObjectURL(ownedAvatarUrl);
+      ownedAvatarUrlsRef.current.delete(id);
     }
     setUsers((current) => current.filter((user) => user.id !== id));
     setChatItems((current) =>
@@ -7879,6 +8272,7 @@ export default function Home() {
   };
 
   const updateOwnAvatar = (avatarUrl: string) => {
+    ownAvatarUrl("self", avatarUrl);
     setUsers((current) =>
       current.map((user) =>
         user.id === "self" ? { ...user, avatarUrl } : user,
@@ -8282,6 +8676,9 @@ export default function Home() {
                           onUnarchiveChat={unarchiveChat}
                           onTogglePin={toggleChatPin}
                           onDeleteChat={deleteChat}
+                          runtimeMode={authMode}
+                          realtimeListStatus={realtimeListStatus}
+                          onRetryRealtime={retryRealtime}
                         />
                       </section>
 
@@ -8373,6 +8770,10 @@ export default function Home() {
                         <TeamsView
                           users={users}
                           role={role}
+                          runtimeMode={authMode}
+                          directoryStatus={directoryStatus}
+                          directoryError={directoryError}
+                          onRetryDirectory={retryBackendDirectory}
                           onMessage={openUserChat}
                           onOpenUser={(id) => {
                             if (role !== "employee") {
@@ -8433,6 +8834,10 @@ export default function Home() {
             composeOpen ? (
               <ComposeSheet
                 users={users}
+                runtimeMode={authMode}
+                directoryStatus={directoryStatus}
+                directoryError={directoryError}
+                onRetryDirectory={retryBackendDirectory}
                 onClose={() => setComposeOpen(false)}
                 onSelect={openUserChat}
                 onCreateGroup={createGroup}
