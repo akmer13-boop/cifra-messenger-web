@@ -22,7 +22,8 @@ test("bridges Tinode me-topic subscriptions without mutating chat rows directly"
   );
   assert.match(page, /setRealtimeSubscriptions\(\[\]\)/);
 
-  assert.match(page, /useState<Chat\[]>\(initialChats\)/);
+  assert.match(page, /useState<Chat\[]>\(\[\]\)/);
+  assert.match(page, /setChatItems\(initialChats\)/);
   assert.doesNotMatch(
     page,
     /setChatItems\([\s\S]{0,240}realtimeSubscriptions/,

@@ -1,3 +1,5 @@
+import { normalizeSafeAvatarUrl } from "./avatar-policy.mjs";
+
 const isRecord = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
@@ -30,25 +32,6 @@ export const getRealtimeDisplayName = (
   readString(privateValue, ["title", "name", "comment"]) ||
   fallback;
 
-const normalizeSafeImageUrl = (value) => {
-  if (typeof value !== "string") return undefined;
-
-  const normalized = value.trim();
-  if (!normalized) return undefined;
-  if (/^https?:\/\//i.test(normalized)) return normalized;
-  if (normalized.startsWith("/") && !normalized.startsWith("//")) {
-    return normalized;
-  }
-  if (normalized.startsWith("./") || normalized.startsWith("../")) {
-    return normalized;
-  }
-  if (/^data:image\/(?:png|jpe?g|gif|webp|avif);base64,/i.test(normalized)) {
-    return normalized;
-  }
-
-  return undefined;
-};
-
 const readRawString = (source, keys) => {
   if (!isRecord(source)) return undefined;
 
@@ -64,24 +47,24 @@ const readRawString = (source, keys) => {
 
 const normalizeImageSource = (value) => {
   if (typeof value === "string") {
-    return normalizeSafeImageUrl(value);
+    return normalizeSafeAvatarUrl(value);
   }
 
   if (!isRecord(value)) return undefined;
 
   const directUrl = readRawString(value, ["ref", "url", "src"]);
-  const normalizedUrl = normalizeSafeImageUrl(directUrl);
+  const normalizedUrl = normalizeSafeAvatarUrl(directUrl);
   if (normalizedUrl) return normalizedUrl;
 
   const data = readRawString(value, ["data"]);
   const type = readRawString(value, ["type", "mime"]);
   if (!data) return undefined;
 
-  const normalizedData = normalizeSafeImageUrl(data);
+  const normalizedData = normalizeSafeAvatarUrl(data);
   if (normalizedData) return normalizedData;
 
-  if (/^image\/(?:png|jpe?g|gif|webp|avif)$/i.test(type ?? "")) {
-    return `data:${type};base64,${data}`;
+  if (/^image\/(?:png|jpe?g|webp|avif)$/i.test(type ?? "")) {
+    return normalizeSafeAvatarUrl(`data:${type};base64,${data}`);
   }
 
   return undefined;

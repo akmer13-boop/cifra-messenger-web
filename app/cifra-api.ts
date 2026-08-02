@@ -9,6 +9,7 @@ export interface RuntimeConfig {
   apiBaseUrl: string;
   requestTimeoutMs: number;
   demoMfaCode: string;
+  avatarAllowedOrigins: string[];
 }
 
 export interface AuthTokens {
@@ -46,6 +47,16 @@ export interface AuthenticatedLogin {
 }
 
 export type LoginOutcome = MfaChallenge | AuthenticatedLogin;
+
+type LoginResponse =
+  | AuthTokens
+  | {
+      mfa_required: true;
+      challenge_token: string;
+      expires_in: number;
+    };
+
+type JsonParser<T> = (value: unknown) => T;
 
 export interface BackendUser {
   id: string;
@@ -138,24 +149,14 @@ interface ApiErrorBody {
   };
 }
 
-interface StoredSession {
-  login: string;
-  tokens: AuthTokens;
-  context: AuthContext;
-}
-
-const SESSION_KEY = "cifra-auth-session-v1";
+const LEGACY_SESSION_KEY = "cifra-auth-session-v1";
 const DEVICE_KEY = "cifra-browser-device-id-v1";
 const REFRESHABLE_ACCESS_ERRORS = new Set([
   "AUTH_REQUIRED",
   "ACCESS_TOKEN_INVALID",
 ]);
-const DEFAULT_CONFIG: RuntimeConfig = {
-  mode: "demo",
-  apiBaseUrl: "",
-  requestTimeoutMs: 15_000,
-  demoMfaCode: "111111",
-};
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_DEMO_MFA_CODE = "111111";
 
 let runtimeConfigPromise: Promise<RuntimeConfig> | null = null;
 
@@ -178,26 +179,64 @@ export function loadRuntimeConfig(): Promise<RuntimeConfig> {
     cache: "no-store",
   })
     .then(async (response) => {
-      if (!response.ok) return DEFAULT_CONFIG;
-      const raw = (await response.json()) as Partial<RuntimeConfig>;
-      if (raw.mode !== "demo" && raw.mode !== "backend") {
-        throw new Error("Некорректный mode в cifra-runtime-config.json");
+      if (!response.ok) {
+        throw new CifraApiError(
+          "Не удалось загрузить конфигурацию CIFRA",
+          response.status,
+          "RUNTIME_CONFIG_UNAVAILABLE",
+          undefined,
+          response.status >= 500,
+        );
       }
+      const raw = await response.json();
+      if (!isRecord(raw)) {
+        throw new CifraApiError(
+          "Некорректный формат конфигурации CIFRA",
+          0,
+          "RUNTIME_CONFIG_INVALID",
+        );
+      }
+      if (raw.mode !== "demo" && raw.mode !== "backend") {
+        throw new CifraApiError(
+          "Некорректный mode в cifra-runtime-config.json",
+          0,
+          "RUNTIME_CONFIG_INVALID",
+        );
+      }
+      const mode = raw.mode;
       return {
-        mode: raw.mode,
-        apiBaseUrl: normalizeApiBase(raw.apiBaseUrl ?? ""),
-        requestTimeoutMs: clampTimeout(raw.requestTimeoutMs),
+        mode,
+        apiBaseUrl: normalizeApiBase(
+          typeof raw.apiBaseUrl === "string" ? raw.apiBaseUrl : "",
+        ),
+        requestTimeoutMs: clampTimeout(
+          typeof raw.requestTimeoutMs === "number"
+            ? raw.requestTimeoutMs
+            : undefined,
+        ),
         demoMfaCode:
-          typeof raw.demoMfaCode === "string" && raw.demoMfaCode
-            ? raw.demoMfaCode
-            : DEFAULT_CONFIG.demoMfaCode,
+          mode === "demo"
+            ? typeof raw.demoMfaCode === "string" && raw.demoMfaCode
+              ? raw.demoMfaCode
+              : DEFAULT_DEMO_MFA_CODE
+            : "",
+        avatarAllowedOrigins: parseAvatarAllowedOrigins(
+          raw.avatarAllowedOrigins,
+        ),
       };
     })
     .catch((error: unknown) => {
-      if (error instanceof Error && error.message.includes("mode")) {
+      runtimeConfigPromise = null;
+      if (error instanceof CifraApiError) {
         throw error;
       }
-      return DEFAULT_CONFIG;
+      throw new CifraApiError(
+        "Не удалось загрузить конфигурацию CIFRA",
+        0,
+        "RUNTIME_CONFIG_UNAVAILABLE",
+        undefined,
+        true,
+      );
     });
   return runtimeConfigPromise;
 }
@@ -206,11 +245,14 @@ export class CifraApiClient {
   private session: AuthSession | null = null;
   private refreshInFlight: Promise<AuthSession> | null = null;
 
-  constructor(readonly config: RuntimeConfig) {}
-  
-get currentDeviceId(): string {
-  return browserDevice().id;
-}
+  constructor(readonly config: RuntimeConfig) {
+    purgeLegacyStoredSession();
+  }
+
+  get currentDeviceId(): string {
+    return browserDevice().id;
+  }
+
   get mode(): RuntimeMode {
     return this.config.mode;
   }
@@ -236,21 +278,18 @@ get currentDeviceId(): string {
       };
     }
 
-    const response = await this.fetchJson<
-      | AuthTokens
-      | {
-          mfa_required: true;
-          challenge_token: string;
-          expires_in: number;
-        }
-    >("/api/v1/auth/login", {
-      method: "POST",
-      body: JSON.stringify({
-        login: normalizedLogin,
-        password,
-        device: browserDevice(),
-      }),
-    });
+    const response = await this.fetchJson<LoginResponse>(
+      "/api/v1/auth/login",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          login: normalizedLogin,
+          password,
+          device: browserDevice(),
+        }),
+      },
+      parseLoginResponse,
+    );
     if ("mfa_required" in response) {
       return {
         kind: "mfa_required",
@@ -285,8 +324,8 @@ get currentDeviceId(): string {
         login,
         role,
         tokens: {
-          access_token: "demo-access-token",
-          refresh_token: "demo-refresh-token",
+          access_token: `demo:${crypto.randomUUID()}`,
+          refresh_token: `demo:${crypto.randomUUID()}`,
           token_type: "Bearer",
           expires_in: 86_400,
           session_id: "00000000-0000-4000-8000-000000000001",
@@ -312,56 +351,26 @@ get currentDeviceId(): string {
           code,
         }),
       },
+      parseAuthTokens,
     );
     return this.acceptTokens(login, tokens);
   }
 
   async restoreSession(): Promise<AuthSession | null> {
-    const stored = readStoredSession();
-    if (!stored) return null;
-    if (this.mode === "demo") {
-      const restored: AuthSession = {
-        ...stored,
-        role: primaryRole(stored.context.roles) as UserRole,
-      };
-      this.session = restored;
-      return restored;
-    }
-    this.session = {
-      ...stored,
-      role: primaryRole(stored.context.roles) as UserRole,
-    };
-    try {
-      const context = await this.authorizedFetch<AuthContext>(
-        "/api/v1/auth/context",
-      );
-      const restored = {
-        ...this.session,
-        context,
-        role: primaryRole(context.roles) as UserRole,
-      };
-      this.setSession(restored);
-      return restored;
-    } catch (error) {
-      if (error instanceof CifraApiError && error.status === 401) {
-        try {
-          return await this.refresh();
-        } catch {
-          this.clearSession();
-          return null;
-        }
-      }
-      throw error;
-    }
+    // Tokens intentionally live in memory only. A page reload requires a new
+    // sign-in until the Gateway exposes an HttpOnly cookie/BFF session.
+    return this.session;
   }
 
   async logout(): Promise<void> {
     const active = this.session;
     try {
       if (this.mode === "backend" && active) {
-        await this.authorizedFetch<void>("/api/v1/auth/logout", {
-          method: "POST",
-        });
+        await this.authorizedFetch<void>(
+          "/api/v1/auth/logout",
+          { method: "POST" },
+          parseVoid,
+        );
       }
     } finally {
       this.clearSession();
@@ -371,15 +380,23 @@ get currentDeviceId(): string {
   async listUsers(query = ""): Promise<UserPage> {
     const params = new URLSearchParams({ limit: "100" });
     if (query.trim()) params.set("query", query.trim());
-    return this.request<UserPage>(`/api/v1/users?${params.toString()}`);
+    return this.request<UserPage>(
+      `/api/v1/users?${params.toString()}`,
+      {},
+      parseUserPage,
+    );
   }
 
   async createUser(input: CreateUserInput): Promise<BackendUser> {
-    return this.request<BackendUser>("/api/v1/admin/users", {
-      method: "POST",
-      headers: { "Idempotency-Key": crypto.randomUUID() },
-      body: JSON.stringify(input),
-    });
+    return this.request<BackendUser>(
+      "/api/v1/admin/users",
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": crypto.randomUUID() },
+        body: JSON.stringify(input),
+      },
+      parseBackendUser,
+    );
   }
 
   async updateUser(
@@ -394,6 +411,7 @@ get currentDeviceId(): string {
         headers: { "If-Match": String(version) },
         body: JSON.stringify(input),
       },
+      parseBackendUser,
     );
   }
 
@@ -408,6 +426,7 @@ get currentDeviceId(): string {
         method: "PUT",
         body: JSON.stringify({ roles, reason }),
       },
+      parseBackendUser,
     );
   }
 
@@ -419,6 +438,7 @@ get currentDeviceId(): string {
         headers: { "Idempotency-Key": crypto.randomUUID() },
         body: JSON.stringify({ reason }),
       },
+      parseBackendUser,
     );
   }
 
@@ -426,21 +446,29 @@ get currentDeviceId(): string {
     currentPassword: string,
     newPassword: string,
   ): Promise<void> {
-    await this.request<void>("/api/v1/auth/password/change", {
-      method: "POST",
-      body: JSON.stringify({
-        current_password: currentPassword,
-        new_password: newPassword,
-      }),
-    });
+    await this.request<void>(
+      "/api/v1/auth/password/change",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          current_password: currentPassword,
+          new_password: newPassword,
+        }),
+      },
+      parseVoid,
+    );
     this.clearSession();
   }
 
   async issueRealtimeTicket(): Promise<unknown> {
-    return this.request<unknown>("/api/v1/realtime/tickets", {
-      method: "POST",
-      body: JSON.stringify({ channel: "tinode" }),
-    });
+    return this.request<Record<string, unknown>>(
+      "/api/v1/realtime/tickets",
+      {
+        method: "POST",
+        body: JSON.stringify({ channel: "tinode" }),
+      },
+      parseJsonRecord,
+    );
   }
 
   async searchComplianceMetadata(
@@ -456,15 +484,17 @@ get currentDeviceId(): string {
           limit: Math.min(200, Math.max(1, input.limit ?? 200)),
         }),
       },
+      parseComplianceSearchResponse,
     );
   }
 
   async request<T>(
     path: string,
-    init: RequestInit = {},
+    init: RequestInit,
+    parseJson: JsonParser<T>,
   ): Promise<T> {
     try {
-      return await this.authorizedFetch<T>(path, init);
+      return await this.authorizedFetch<T>(path, init, parseJson);
     } catch (error) {
       if (
         error instanceof CifraApiError &&
@@ -473,7 +503,7 @@ get currentDeviceId(): string {
         this.session?.tokens.refresh_token
       ) {
         await this.refresh();
-        return this.authorizedFetch<T>(path, init);
+        return this.authorizedFetch<T>(path, init, parseJson);
       }
       throw error;
     }
@@ -488,6 +518,7 @@ get currentDeviceId(): string {
       {
         headers: { Authorization: `Bearer ${tokens.access_token}` },
       },
+      parseAuthContext,
     );
     const session: AuthSession = {
       login,
@@ -509,12 +540,16 @@ get currentDeviceId(): string {
         "AUTH_REQUIRED",
       );
     }
-    this.refreshInFlight = this.fetchJson<AuthTokens>("/api/v1/auth/refresh", {
-      method: "POST",
-      body: JSON.stringify({
-        refresh_token: current.tokens.refresh_token,
-      }),
-    })
+    this.refreshInFlight = this.fetchJson<AuthTokens>(
+      "/api/v1/auth/refresh",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          refresh_token: current.tokens.refresh_token,
+        }),
+      },
+      parseAuthTokens,
+    )
       .then((tokens) => this.acceptTokens(current.login, tokens))
       .catch((error: unknown) => {
         this.clearSession();
@@ -528,7 +563,8 @@ get currentDeviceId(): string {
 
   private authorizedFetch<T>(
     path: string,
-    init: RequestInit = {},
+    init: RequestInit,
+    parseJson: JsonParser<T>,
   ): Promise<T> {
     if (!this.session) {
       return Promise.reject(
@@ -539,18 +575,23 @@ get currentDeviceId(): string {
         ),
       );
     }
-    return this.fetchJson<T>(path, {
-      ...init,
-      headers: {
-        ...headersToObject(init.headers),
-        Authorization: `Bearer ${this.session.tokens.access_token}`,
+    return this.fetchJson<T>(
+      path,
+      {
+        ...init,
+        headers: {
+          ...headersToObject(init.headers),
+          Authorization: `Bearer ${this.session.tokens.access_token}`,
+        },
       },
-    });
+      parseJson,
+    );
   }
 
   private async fetchJson<T>(
     path: string,
-    init: RequestInit = {},
+    init: RequestInit,
+    parseJson: JsonParser<T>,
   ): Promise<T> {
     const controller = new AbortController();
     const timeout = window.setTimeout(
@@ -580,8 +621,8 @@ get currentDeviceId(): string {
           body.error?.details ?? {},
         );
       }
-      if (response.status === 204) return undefined as T;
-      return (await response.json()) as T;
+      if (response.status === 204) return parseJson(undefined);
+      return parseJson(await response.json());
     } catch (error) {
       if (error instanceof CifraApiError) throw error;
       if (error instanceof DOMException && error.name === "AbortError") {
@@ -607,27 +648,10 @@ get currentDeviceId(): string {
 
   private setSession(session: AuthSession): void {
     this.session = session;
-    try {
-      window.sessionStorage.setItem(
-        SESSION_KEY,
-        JSON.stringify({
-          login: session.login,
-          tokens: session.tokens,
-          context: session.context,
-        } satisfies StoredSession),
-      );
-    } catch {
-      // The in-memory session remains active until this tab is closed.
-    }
   }
 
   private clearSession(): void {
     this.session = null;
-    try {
-      window.sessionStorage.removeItem(SESSION_KEY);
-    } catch {
-      // The in-memory session has already been cleared.
-    }
   }
 }
 
@@ -638,8 +662,22 @@ function normalizeApiBase(value: string): string {
 }
 
 function clampTimeout(value: number | undefined): number {
-  if (!Number.isFinite(value)) return DEFAULT_CONFIG.requestTimeoutMs;
+  if (!Number.isFinite(value)) return DEFAULT_REQUEST_TIMEOUT_MS;
   return Math.min(60_000, Math.max(3_000, Math.round(value as number)));
+}
+
+function parseAvatarAllowedOrigins(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const origins = value.flatMap((item) => {
+    if (typeof item !== "string") return [];
+    try {
+      const url = new URL(item.trim());
+      return url.protocol === "https:" ? [url.origin] : [];
+    } catch {
+      return [];
+    }
+  });
+  return Array.from(new Set(origins));
 }
 
 function headersToObject(headers?: HeadersInit): Record<string, string> {
@@ -649,10 +687,286 @@ function headersToObject(headers?: HeadersInit): Record<string, string> {
 
 async function parseErrorBody(response: Response): Promise<ApiErrorBody> {
   try {
-    return (await response.json()) as ApiErrorBody;
+    const value = await response.json();
+    if (!isRecord(value) || !isRecord(value.error)) return {};
+    const error = value.error;
+    return {
+      error: {
+        ...(typeof error.code === "string" ? { code: error.code } : {}),
+        ...(typeof error.message === "string" ? { message: error.message } : {}),
+        ...(isRecord(error.details) ? { details: error.details } : {}),
+        ...(typeof error.request_id === "string"
+          ? { request_id: error.request_id }
+          : {}),
+        ...(typeof error.retryable === "boolean"
+          ? { retryable: error.retryable }
+          : {}),
+      },
+    };
   } catch {
     return {};
   }
+}
+
+function parseLoginResponse(value: unknown): LoginResponse {
+  const record = requireRecord(value, "ответ входа");
+  if (record.mfa_required === true) {
+    return {
+      mfa_required: true,
+      challenge_token: requireString(record, "challenge_token", "ответ входа"),
+      expires_in: requireNumber(record, "expires_in", "ответ входа"),
+    };
+  }
+  return parseAuthTokens(record);
+}
+
+function parseAuthTokens(value: unknown): AuthTokens {
+  const record = requireRecord(value, "токены авторизации");
+  const tokenType = requireString(record, "token_type", "токены авторизации");
+  if (tokenType !== "Bearer") {
+    throw contractError("токены авторизации", "token_type");
+  }
+  return {
+    access_token: requireString(record, "access_token", "токены авторизации"),
+    refresh_token: requireString(record, "refresh_token", "токены авторизации"),
+    token_type: tokenType,
+    expires_in: requireNumber(record, "expires_in", "токены авторизации"),
+    session_id: requireString(record, "session_id", "токены авторизации"),
+    must_change_password: requireBoolean(
+      record,
+      "must_change_password",
+      "токены авторизации",
+    ),
+  };
+}
+
+function parseAuthContext(value: unknown): AuthContext {
+  const record = requireRecord(value, "контекст авторизации");
+  return {
+    user_id: requireString(record, "user_id", "контекст авторизации"),
+    session_id: requireString(record, "session_id", "контекст авторизации"),
+    roles: parseCorporateRoles(record.roles, "контекст авторизации"),
+    must_change_password: requireBoolean(
+      record,
+      "must_change_password",
+      "контекст авторизации",
+    ),
+  };
+}
+
+function parseUserPage(value: unknown): UserPage {
+  const record = requireRecord(value, "каталог пользователей");
+  if (!Array.isArray(record.items)) {
+    throw contractError("каталог пользователей", "items");
+  }
+  return {
+    items: record.items.map(parseBackendUser),
+    next_cursor: readNullableString(
+      record,
+      "next_cursor",
+      "каталог пользователей",
+    ),
+  };
+}
+
+function parseBackendUser(value: unknown): BackendUser {
+  const record = requireRecord(value, "пользователь");
+  const status = requireString(record, "status", "пользователь");
+  if (!isBackendUserStatus(status)) {
+    throw contractError("пользователь", "status");
+  }
+  return {
+    id: requireString(record, "id", "пользователь"),
+    realtime_user_id: readOptionalNullableString(
+      record,
+      "realtime_user_id",
+      "пользователь",
+    ),
+    tinode_uid: readOptionalNullableString(record, "tinode_uid", "пользователь"),
+    login: requireString(record, "login", "пользователь"),
+    first_name: requireString(record, "first_name", "пользователь"),
+    last_name: requireString(record, "last_name", "пользователь"),
+    middle_name: readNullableString(record, "middle_name", "пользователь"),
+    email: readNullableString(record, "email", "пользователь"),
+    phone: readNullableString(record, "phone", "пользователь"),
+    department: readNullableString(record, "department", "пользователь"),
+    job_title: readNullableString(record, "job_title", "пользователь"),
+    status,
+    roles: parseCorporateRoles(record.roles, "пользователь"),
+    version: requireNumber(record, "version", "пользователь"),
+    created_at: requireString(record, "created_at", "пользователь"),
+    updated_at: requireString(record, "updated_at", "пользователь"),
+  };
+}
+
+function parseComplianceSearchResponse(
+  value: unknown,
+): ComplianceSearchResponse {
+  const record = requireRecord(value, "результаты аудита");
+  if (!Array.isArray(record.items)) {
+    throw contractError("результаты аудита", "items");
+  }
+  return {
+    items: record.items.map((item) => {
+      const message = requireRecord(item, "метаданные сообщения");
+      return {
+        topic_id: requireString(message, "topic_id", "метаданные сообщения"),
+        seq: requireNumber(message, "seq", "метаданные сообщения"),
+        sender_id: readNullableString(
+          message,
+          "sender_id",
+          "метаданные сообщения",
+        ),
+        client_msg_id: readNullableString(
+          message,
+          "client_msg_id",
+          "метаданные сообщения",
+        ),
+        kind: requireString(message, "kind", "метаданные сообщения"),
+        created_at: requireString(
+          message,
+          "created_at",
+          "метаданные сообщения",
+        ),
+        deleted_at: readNullableString(
+          message,
+          "deleted_at",
+          "метаданные сообщения",
+        ),
+      };
+    }),
+    ...(record.next_cursor === undefined
+      ? {}
+      : {
+          next_cursor: readNullableString(
+            record,
+            "next_cursor",
+            "результаты аудита",
+          ),
+        }),
+    ...(record.protected_text_search_available === false
+      ? { protected_text_search_available: false as const }
+      : {}),
+  };
+}
+
+function parseJsonRecord(value: unknown): Record<string, unknown> {
+  return requireRecord(value, "ответ сервера");
+}
+
+function parseVoid(value: unknown): void {
+  if (value !== undefined && value !== null && !isRecord(value)) {
+    throw contractError("пустой ответ", "body");
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function requireRecord(
+  value: unknown,
+  resource: string,
+): Record<string, unknown> {
+  if (!isRecord(value)) throw contractError(resource, "body");
+  return value;
+}
+
+function requireString(
+  record: Record<string, unknown>,
+  key: string,
+  resource: string,
+): string {
+  const value = record[key];
+  if (typeof value !== "string" || !value.trim()) {
+    throw contractError(resource, key);
+  }
+  return value;
+}
+
+function requireNumber(
+  record: Record<string, unknown>,
+  key: string,
+  resource: string,
+): number {
+  const value = record[key];
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw contractError(resource, key);
+  }
+  return value;
+}
+
+function requireBoolean(
+  record: Record<string, unknown>,
+  key: string,
+  resource: string,
+): boolean {
+  const value = record[key];
+  if (typeof value !== "boolean") throw contractError(resource, key);
+  return value;
+}
+
+function readNullableString(
+  record: Record<string, unknown>,
+  key: string,
+  resource: string,
+): string | null {
+  const value = record[key];
+  if (value === null) return null;
+  if (typeof value !== "string") throw contractError(resource, key);
+  return value;
+}
+
+function readOptionalNullableString(
+  record: Record<string, unknown>,
+  key: string,
+  resource: string,
+): string | null | undefined {
+  if (!(key in record)) return undefined;
+  return readNullableString(record, key, resource);
+}
+
+function parseCorporateRoles(
+  value: unknown,
+  resource: string,
+): CorporateRole[] {
+  if (!Array.isArray(value) || !value.every(isCorporateRole)) {
+    throw contractError(resource, "roles");
+  }
+  return [...value];
+}
+
+function isCorporateRole(value: unknown): value is CorporateRole {
+  return (
+    value === "employee" ||
+    value === "admin" ||
+    value === "security_moderator"
+  );
+}
+
+function isBackendUserStatus(
+  value: string,
+): value is BackendUser["status"] {
+  return [
+    "active",
+    "inactive",
+    "blocked",
+    "deleted",
+    "invited",
+    "disabled",
+    "archived",
+  ].includes(value);
+}
+
+function contractError(resource: string, field: string): CifraApiError {
+  return new CifraApiError(
+    `Сервер вернул некорректные данные: ${resource}`,
+    502,
+    "API_CONTRACT_MISMATCH",
+    undefined,
+    false,
+    { field },
+  );
 }
 
 function browserDevice(): {
@@ -682,23 +996,11 @@ function browserDevice(): {
   return { id, name: `${browser} · CIFRA Web`, platform: "web" };
 }
 
-function readStoredSession(): StoredSession | null {
+function purgeLegacyStoredSession(): void {
   try {
-    const raw = window.sessionStorage.getItem(SESSION_KEY);
-    if (!raw) return null;
-    const stored = JSON.parse(raw) as Partial<StoredSession>;
-    if (
-      !stored.login ||
-      !stored.tokens?.access_token ||
-      !stored.tokens.refresh_token ||
-      !Array.isArray(stored.context?.roles)
-    ) {
-      window.sessionStorage.removeItem(SESSION_KEY);
-      return null;
-    }
-    return stored as StoredSession;
+    window.sessionStorage.removeItem(LEGACY_SESSION_KEY);
   } catch {
-    return null;
+    // Storage may be unavailable; no new secrets are written there.
   }
 }
 

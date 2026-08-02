@@ -31,7 +31,8 @@ test("observes every readable Tinode chat while retaining mock UI only in demo m
   assert.match(page, /data-realtime-message-count=/);
   assert.match(page, /setRealtimeMessages\(\[\]\)/);
 
-  assert.match(page, /useState<Chat\[]>\(initialChats\)/);
+  assert.match(page, /useState<Chat\[]>\(\[\]\)/);
+  assert.match(page, /setChatItems\(initialChats\)/);
   assert.match(page, /const withoutRealtimeTopics = canUseLocalChatFallback\(authMode\)/);
   assert.match(page, /filterChatsForRuntimeMode/);
   assert.match(page, /const sendMessage = \(/);
