@@ -119,7 +119,7 @@ test("messages are scoped to the selected chat", async () => {
   );
   assert.match(
     source,
-    /const sendMessage = \(\s*chatId: string,\s*text: string,\s*options: SendMessageOptions/,
+    /const sendMessage = async \(\s*chatId: string,\s*text: string,\s*options: SendMessageOptions/,
   );
   assert.match(source, /\[chatId\]: \[[\s\S]*current\[chatId\]/);
   assert.match(source, /const clearMessages = \(chatId: string\)/);
