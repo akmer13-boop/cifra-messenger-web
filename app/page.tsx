@@ -130,6 +130,7 @@ import {
   projectRealtimeChatMetadata,
 } from "./realtime-chat-metadata-policy.mjs";
 import { parseRealtimeMessageContent } from "./realtime-message-policy.mjs";
+import { classifyRealtimePublishError } from "./message-send-policy.mjs";
 import {
   filterCallsForRuntime,
   mergeRealtimeParticipantsIntoDirectory,
@@ -196,6 +197,7 @@ type MediaCategory = "Фото и видео" | "Файлы";
 type ProfilePanel = "notifications" | "storage" | "theme" | null;
 type NotificationMode = "on" | "off" | "hour";
 type MessageDeliveryStatus = "sent" | "delivered" | "read";
+type SendMessageResult = "sent" | "failed" | "unknown";
 type IncomingMessageDetail = {
   chatId: string;
   id?: number;
@@ -2704,6 +2706,7 @@ function ChatView({
   chats,
   users,
   role,
+  runtimeMode,
   messages,
   onBack,
   onSend,
@@ -2722,9 +2725,13 @@ function ChatView({
   chats: Chat[];
   users: MessengerUser[];
   role: UserRole;
+  runtimeMode: RuntimeMode;
   messages: Message[];
   onBack: () => void;
-  onSend: (text: string, options?: SendMessageOptions) => boolean;
+  onSend: (
+    text: string,
+    options?: SendMessageOptions,
+  ) => Promise<SendMessageResult>;
   onClear: () => void;
   onCall: () => void;
   callUnavailableReason?: string;
@@ -2753,6 +2760,11 @@ function ChatView({
     offset: number;
   }>({ id: null, offset: 0 });
   const [actionNotice, setActionNotice] = useState("");
+  const [sendPending, setSendPending] = useState(false);
+  const [sendError, setSendError] = useState<{
+    message: string;
+    retryable: boolean;
+  } | null>(null);
   const [activePanel, setActivePanel] = useState<ChatPanel>(null);
   const [recording, setRecording] = useState(false);
   const [joinApproval, setJoinApproval] = useState(false);
@@ -3090,28 +3102,62 @@ function ChatView({
     setAddingParticipants(false);
   };
 
-  const submitMessage = () => {
+  const submitMessage = async () => {
     const value = draft.trim();
-    if (!value) return;
-    const accepted = onSend(value, {
-      replyToId: replyingToMessage?.id,
-      replyToText: replyingToMessage
-        ? getMessageSnippet(replyingToMessage)
-        : undefined,
-      replyToAuthor: replyingToMessage
-        ? getMessageAuthorLabel(replyingToMessage)
-        : undefined,
-      replyToAuthorId: replyingToMessage?.authorId,
-    });
-    if (!accepted) return;
-    setDraft("");
-    setReplyingToMessageId(null);
-    window.requestAnimationFrame(() => composerInputRef.current?.focus());
+    if (!value || sendPending) return;
+    setSendPending(true);
+    setSendError(null);
+    try {
+      const result = await onSend(value, {
+        replyToId: replyingToMessage?.id,
+        replyToText: replyingToMessage
+          ? getMessageSnippet(replyingToMessage)
+          : undefined,
+        replyToAuthor: replyingToMessage
+          ? getMessageAuthorLabel(replyingToMessage)
+          : undefined,
+        replyToAuthorId: replyingToMessage?.authorId,
+      });
+      if (result !== "sent") {
+        setSendError(
+          result === "unknown"
+            ? {
+                message:
+                  "Сервер не подтвердил результат. Не повторяйте отправку, пока не проверите чат: сообщение могло быть доставлено.",
+                retryable: false,
+              }
+            : {
+                message:
+                  "Сообщение не отправлено. Проверьте соединение и повторите попытку.",
+                retryable: true,
+              },
+        );
+        return;
+      }
+      setDraft((current) => (current.trim() === value ? "" : current));
+      setReplyingToMessageId(null);
+      window.requestAnimationFrame(() => composerInputRef.current?.focus());
+    } catch {
+      setSendError({
+        message:
+          "Сообщение не отправлено. Проверьте соединение и повторите попытку.",
+        retryable: true,
+      });
+    } finally {
+      setSendPending(false);
+    }
   };
 
-  const handleVoice = () => {
+  const handleVoice = async () => {
+    if (runtimeMode === "backend") {
+      setRecording(false);
+      showActionNotice(
+        "Голосовые будут доступны после подключения защищённого media pipeline.",
+      );
+      return;
+    }
     if (recording) {
-      const accepted = onSend("", {
+      const result = await onSend("", {
         voice: "0:07",
         replyToId: replyingToMessage?.id,
         replyToText: replyingToMessage
@@ -3122,7 +3168,7 @@ function ChatView({
           : undefined,
         replyToAuthorId: replyingToMessage?.authorId,
       });
-      if (accepted) {
+      if (result === "sent") {
         setRecording(false);
         setReplyingToMessageId(null);
       }
@@ -3131,12 +3177,19 @@ function ChatView({
     setRecording(true);
   };
 
-  const handleAttachment = (
+  const handleAttachment = async (
     event: ChangeEvent<HTMLInputElement>,
     kind: "gallery" | "camera" | "file",
   ) => {
     const selectedFiles = Array.from(event.currentTarget.files ?? []);
     if (!selectedFiles.length) return;
+    if (runtimeMode === "backend") {
+      event.currentTarget.value = "";
+      showActionNotice(
+        "Вложения будут доступны после подключения защищённого media pipeline.",
+      );
+      return;
+    }
 
     const replyOptions: SendMessageOptions = {
       replyToId: replyingToMessage?.id,
@@ -3148,7 +3201,7 @@ function ChatView({
         : undefined,
       replyToAuthorId: replyingToMessage?.authorId,
     };
-    const accepted =
+    const result = await (
       kind === "gallery"
         ? onSend(
             selectedFiles.length === 1
@@ -3158,9 +3211,10 @@ function ChatView({
           )
         : kind === "camera"
           ? onSend(`📷 ${selectedFiles[0].name}`, replyOptions)
-          : onSend(`📎 ${selectedFiles[0].name}`, replyOptions);
+          : onSend(`📎 ${selectedFiles[0].name}`, replyOptions)
+    );
 
-    if (accepted) setReplyingToMessageId(null);
+    if (result === "sent") setReplyingToMessageId(null);
     event.currentTarget.value = "";
   };
 
@@ -3508,7 +3562,7 @@ function ChatView({
           type="file"
           accept="image/*,video/*"
           multiple
-          onChange={(event) => handleAttachment(event, "gallery")}
+          onChange={(event) => void handleAttachment(event, "gallery")}
         />
         <input
           ref={cameraInputRef}
@@ -3516,13 +3570,13 @@ function ChatView({
           type="file"
           accept="image/*,video/*"
           capture="environment"
-          onChange={(event) => handleAttachment(event, "camera")}
+          onChange={(event) => void handleAttachment(event, "camera")}
         />
         <input
           ref={fileInputRef}
           hidden
           type="file"
-          onChange={(event) => handleAttachment(event, "file")}
+          onChange={(event) => void handleAttachment(event, "file")}
         />
         {recording ? (
           <div className="recording-panel">
@@ -3547,14 +3601,17 @@ function ChatView({
               <textarea
                 ref={composerInputRef}
                 value={draft}
-                onChange={(event) => setDraft(event.target.value)}
+                onChange={(event) => {
+                  setDraft(event.target.value);
+                  setSendError(null);
+                }}
                 placeholder="Сообщение"
                 rows={1}
                 aria-label="Текст сообщения"
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
-                    submitMessage();
+                    void submitMessage();
                   }
                 }}
               />
@@ -3572,12 +3629,23 @@ function ChatView({
         <button
           type="button"
           className="send-button"
+          disabled={sendPending}
           aria-label={draft ? "Отправить" : recording ? "Завершить запись" : "Записать голосовое"}
-          onClick={draft ? submitMessage : handleVoice}
+          onClick={() => void (draft ? submitMessage() : handleVoice())}
         >
           {draft ? <Send size={19} /> : <Mic size={20} />}
         </button>
         </div>
+        {sendError ? (
+          <div className="composer-send-error" role="alert">
+            <span>{sendError.message}</span>
+            {sendError.retryable ? (
+              <button type="button" onClick={() => void submitMessage()}>
+                Повторить
+              </button>
+            ) : null}
+          </div>
+        ) : null}
       </>
       )}
 
@@ -6747,16 +6815,19 @@ export default function Home() {
       setDirectoryStatus("loading");
       setDirectoryError("");
       try {
-        const page = await client.listUsers();
+        const page = await client.listAllUsers();
         if (page.items.length === 0) {
           setUsers([authSessionToMessenger(session)]);
           setDirectoryStatus("empty");
           return;
         }
+        const directoryUsers = page.items.map((user) =>
+          backendUserToMessenger(user, session.context.user_id),
+        );
         setUsers(
-          page.items.map((user) =>
-            backendUserToMessenger(user, session.context.user_id),
-          ),
+          directoryUsers.some((user) => user.id === "self")
+            ? directoryUsers
+            : [authSessionToMessenger(session), ...directoryUsers],
         );
         setDirectoryStatus("ready");
       } catch (error) {
@@ -7418,6 +7489,7 @@ export default function Home() {
 
   useEffect(() => {
     const handleIncomingMessage = (event: Event) => {
+      if (authMode === "backend") return;
       const detail = (event as CustomEvent<IncomingMessageDetail>).detail;
       if (!detail || typeof detail.chatId !== "string") return;
 
@@ -7484,10 +7556,11 @@ export default function Home() {
         "cifra:incoming-message",
         handleIncomingMessage,
       );
-  }, [chatItems, selectedChatId]);
+  }, [authMode, chatItems, selectedChatId]);
 
   useEffect(() => {
     const handleIncomingCall = (event: Event) => {
+      if (authMode === "backend") return;
       const detail = (event as CustomEvent<IncomingCallDetail>).detail;
       if (
         !detail ||
@@ -7515,7 +7588,7 @@ export default function Home() {
     window.addEventListener("cifra:incoming-call", handleIncomingCall);
     return () =>
       window.removeEventListener("cifra:incoming-call", handleIncomingCall);
-  }, [chatItems, users]);
+  }, [authMode, chatItems, users]);
 
   useEffect(() => {
     let frameId: number | undefined;
@@ -7611,7 +7684,11 @@ export default function Home() {
   const selectedMessages = selectedChat
     ? (messagesByChat[selectedChat.id] ?? [])
     : [];
-  const currentUser = users.find((user) => user.id === "self") ?? users[0];
+  const currentUser =
+    users.find((user) => user.id === "self") ??
+    (authSession
+      ? authSessionToMessenger(authSession)
+      : initialUsers.find((user) => user.id === "self")!);
   const selectedProfileUser = users.find(
     (user) => user.id === selectedProfileUserId,
   );
@@ -8280,14 +8357,14 @@ export default function Home() {
     );
   };
 
-  const sendMessage = (
+  const sendMessage = async (
     chatId: string,
     text: string,
     options: SendMessageOptions = {},
-  ) => {
+  ): Promise<SendMessageResult> => {
     const normalizedText = text.trim();
     const voice = options.voice?.trim();
-    if (!normalizedText && !voice) return false;
+    if (!normalizedText && !voice) return "failed";
 
     const realtimeClient = realtimeClientRef.current;
 
@@ -8307,42 +8384,41 @@ export default function Home() {
         options.forwardedFrom
       ) {
         setRealtimePublishStatus("error");
-        return false;
+        return "failed";
       }
 
       setRealtimePublishStatus("publishing");
       setRealtimePublishedSeq(null);
 
-      void realtimeClient
-        .publishText(chatId, normalizedText, {
+      try {
+        const result = await realtimeClient.publishText(chatId, normalizedText, {
           replyToId: options.replyToId,
           replyToText: options.replyToText,
           replyToAuthor: options.replyToAuthor,
           replyToAuthorId: options.replyToAuthorId,
-        })
-        .then((result) => {
-          setRealtimePublishedSeq(result.seq);
-          setRealtimePublishStatus("published");
-          setRealtimeReadSeqByTopic((current) =>
-            result.seq > (current[chatId] ?? 0)
-              ? { ...current, [chatId]: result.seq }
-              : current,
-          );
-        })
-        .catch(() => {
-          setRealtimePublishStatus("error");
         });
-
-      return true;
+        setRealtimePublishedSeq(result.seq);
+        setRealtimePublishStatus("published");
+        setRealtimeReadSeqByTopic((current) =>
+          result.seq > (current[chatId] ?? 0)
+            ? { ...current, [chatId]: result.seq }
+            : current,
+        );
+        return "sent";
+      } catch (error) {
+        setRealtimePublishStatus("error");
+        return classifyRealtimePublishError(error) as SendMessageResult;
+      }
     }
 
     if (!canUseLocalChatFallback(authMode)) {
       setRealtimePublishStatus("error");
-      return false;
+      return "failed";
     }
 
     const now = formatMessageTime();
-    const messageId = Date.now();
+    const activityOrder = ++activitySequenceRef.current;
+    const messageId = 1_000_000 + activityOrder;
     const outgoingMessage: Message = {
       id: messageId,
       side: "out",
@@ -8361,8 +8437,6 @@ export default function Home() {
         : {}),
       forwardedFrom: options.forwardedFrom,
     };
-    const activityOrder = ++activitySequenceRef.current;
-
     setMessagesByChat((current) => ({
       ...current,
       [chatId]: [
@@ -8403,7 +8477,7 @@ export default function Home() {
       1800,
     );
     deliveryTimersRef.current.push(deliveredTimer, readTimer);
-    return true;
+    return "sent";
   };
 
   const togglePinnedMessage = (chatId: string, messageId: number) => {
@@ -8421,7 +8495,7 @@ export default function Home() {
     }));
   };
 
-  const forwardMessage = (
+  const forwardMessage = async (
     sourceChatId: string,
     messageId: number,
     targetChatId: string,
@@ -8436,11 +8510,11 @@ export default function Home() {
       sourceMessage.forwardedFrom ||
       sourceMessage.author ||
       (sourceMessage.side === "out" ? currentUser.name : sourceChat.title);
-    const sent = sendMessage(targetChatId, sourceMessage.text ?? "", {
+    const sent = await sendMessage(targetChatId, sourceMessage.text ?? "", {
       voice: sourceMessage.voice,
       forwardedFrom,
     });
-    if (sent) openChat(targetChatId);
+    if (sent === "sent") openChat(targetChatId);
   };
 
   const clearMessages = (chatId: string) => {
@@ -8464,6 +8538,14 @@ export default function Home() {
 
   const startCall = (participantIds: string[] = []) => {
     setChatOpenError("");
+    if (authMode === "backend") {
+      setCallOpen(false);
+      setCallParticipantIds([]);
+      setCallOpenError(
+        "Звонки будут подключены отдельным этапом WebRTC. В backend-режиме имитация отключена.",
+      );
+      return;
+    }
     const resolved = resolveCallParticipants({
       caller: currentUser,
       callerRealtimeUserId: realtimeUserId,
@@ -8693,6 +8775,7 @@ export default function Home() {
                             chats={chatItems}
                             users={users}
                             role={role}
+                            runtimeMode={authMode}
                             messages={selectedMessages}
                             onBack={() => setSelectedChatId(null)}
                             onSend={(text, options) =>
@@ -8724,7 +8807,7 @@ export default function Home() {
                               )
                             }
                             onForwardMessage={(messageId, targetChatId) =>
-                              forwardMessage(
+                              void forwardMessage(
                                 selectedChat.id,
                                 messageId,
                                 targetChatId,
