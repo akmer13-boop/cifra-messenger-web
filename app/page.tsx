@@ -3148,33 +3148,11 @@ function ChatView({
     }
   };
 
-  const handleVoice = async () => {
-    if (runtimeMode === "backend") {
-      setRecording(false);
-      showActionNotice(
-        "Голосовые будут доступны после подключения защищённого media pipeline.",
-      );
-      return;
-    }
-    if (recording) {
-      const result = await onSend("", {
-        voice: "0:07",
-        replyToId: replyingToMessage?.id,
-        replyToText: replyingToMessage
-          ? getMessageSnippet(replyingToMessage)
-          : undefined,
-        replyToAuthor: replyingToMessage
-          ? getMessageAuthorLabel(replyingToMessage)
-          : undefined,
-        replyToAuthorId: replyingToMessage?.authorId,
-      });
-      if (result === "sent") {
-        setRecording(false);
-        setReplyingToMessageId(null);
-      }
-      return;
-    }
-    setRecording(true);
+  const handleVoice = () => {
+    setRecording(false);
+    showActionNotice(
+      "Голосовые будут доступны после подключения защищённого media pipeline.",
+    );
   };
 
   const handleAttachment = async (
