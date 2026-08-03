@@ -1,4 +1,5 @@
 import { primaryRole, wireRole } from "./auth-policy.mjs";
+import { collectDirectoryPages } from "./directory-pagination-policy.mjs";
 
 export type RuntimeMode = "demo" | "backend";
 export type CorporateRole = "employee" | "admin" | "security_moderator";
@@ -157,6 +158,8 @@ const REFRESHABLE_ACCESS_ERRORS = new Set([
 ]);
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_DEMO_MFA_CODE = "111111";
+const BUILD_TIME_DATA_MODE = process.env.NEXT_PUBLIC_DATA_MODE;
+const BUILD_TIME_API_BASE_URL = process.env.NEXT_PUBLIC_CIFRA_API_URL;
 
 let runtimeConfigPromise: Promise<RuntimeConfig> | null = null;
 
@@ -196,18 +199,29 @@ export function loadRuntimeConfig(): Promise<RuntimeConfig> {
           "RUNTIME_CONFIG_INVALID",
         );
       }
-      if (raw.mode !== "demo" && raw.mode !== "backend") {
+      const configuredMode =
+        BUILD_TIME_DATA_MODE === "mock"
+          ? "demo"
+          : BUILD_TIME_DATA_MODE === "api"
+            ? "backend"
+            : raw.mode;
+      if (configuredMode !== "demo" && configuredMode !== "backend") {
         throw new CifraApiError(
-          "Некорректный mode в cifra-runtime-config.json",
+          "Некорректный режим данных CIFRA",
           0,
           "RUNTIME_CONFIG_INVALID",
         );
       }
-      const mode: RuntimeMode = raw.mode;
+      const mode: RuntimeMode = configuredMode;
       return {
         mode,
         apiBaseUrl: normalizeApiBase(
-          typeof raw.apiBaseUrl === "string" ? raw.apiBaseUrl : "",
+          typeof BUILD_TIME_API_BASE_URL === "string" &&
+            BUILD_TIME_API_BASE_URL.trim()
+            ? BUILD_TIME_API_BASE_URL
+            : typeof raw.apiBaseUrl === "string"
+              ? raw.apiBaseUrl
+              : "",
         ),
         requestTimeoutMs: clampTimeout(
           typeof raw.requestTimeoutMs === "number"
@@ -377,14 +391,32 @@ export class CifraApiClient {
     }
   }
 
-  async listUsers(query = ""): Promise<UserPage> {
+  async listUsers(query = "", cursor: string | null = null): Promise<UserPage> {
     const params = new URLSearchParams({ limit: "100" });
     if (query.trim()) params.set("query", query.trim());
+    if (cursor) params.set("cursor", cursor);
     return this.request<UserPage>(
       `/api/v1/users?${params.toString()}`,
       {},
       parseUserPage,
     );
+  }
+
+  async listAllUsers(query = ""): Promise<UserPage> {
+    try {
+      return await collectDirectoryPages((cursor: string | null) =>
+        this.listUsers(query, cursor),
+      );
+    } catch (error) {
+      if (error instanceof CifraApiError) throw error;
+      throw new CifraApiError(
+        "Не удалось полностью загрузить каталог сотрудников",
+        0,
+        "DIRECTORY_PAGINATION_INVALID",
+        undefined,
+        true,
+      );
+    }
   }
 
   async createUser(input: CreateUserInput): Promise<BackendUser> {
