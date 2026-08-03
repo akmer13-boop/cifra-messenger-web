@@ -1721,11 +1721,33 @@ function validateTicketExpiry(
   }
 }
 
-function validateEndpointSecurity(
+export function resolveApiSecurityUrl(
+  apiBaseUrl: string,
+  pageOrigin: string,
+): URL {
+  const normalizedApiBase = apiBaseUrl.trim();
+  const normalizedPageOrigin = pageOrigin.trim();
+
+  if (normalizedApiBase) {
+    return normalizedPageOrigin
+      ? new URL(normalizedApiBase, normalizedPageOrigin)
+      : new URL(normalizedApiBase);
+  }
+  if (normalizedPageOrigin) {
+    return new URL(normalizedPageOrigin);
+  }
+  throw new TypeError(
+    "same-origin API configuration requires page origin",
+  );
+}
+
+export function validateEndpointSecurity(
   endpointValue: string,
   ticket: string,
   accessToken: string,
   apiBaseUrl: string,
+  pageOrigin =
+    typeof window === "undefined" ? "" : window.location.origin,
 ): void {
   let endpoint: URL;
 
@@ -1746,7 +1768,15 @@ function validateEndpointSecurity(
     );
   }
 
-  const apiUrl = new URL(apiBaseUrl);
+  let apiUrl: URL;
+
+  try {
+    apiUrl = resolveApiSecurityUrl(apiBaseUrl, pageOrigin);
+  } catch {
+    throw new CifraRealtimeError(
+      "realtime_api_base_invalid",
+    );
+  }
 
   if (
     apiUrl.protocol === "https:" &&
