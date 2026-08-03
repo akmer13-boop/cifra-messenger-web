@@ -43,5 +43,5 @@ test("keeps demo delivery timers behind the backend source guard", async () => {
   assert.ok(publishBranch >= 0);
   assert.ok(mockTimer > publishBranch);
   assert.match(page, /publishText\(chatId, normalizedText, \{/);
-  assert.match(page, /return true;[\s\S]*?canUseLocalChatFallback\(authMode\)[\s\S]*?const now = formatMessageTime\(\)/);
+  assert.match(page, /return "sent";[\s\S]*?canUseLocalChatFallback\(authMode\)[\s\S]*?const now = formatMessageTime\(\)/);
 });

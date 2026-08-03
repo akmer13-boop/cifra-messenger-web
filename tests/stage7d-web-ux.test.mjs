@@ -12,8 +12,11 @@ test("hides the organization role switcher from employees", async () => {
 
 test("keeps reply context until accepted and publishes a real quoted reply", async () => {
   const page = await readFile(pageUrl, "utf8");
-  assert.match(page, /const accepted = onSend\(value, \{[\s\S]*?replyToText:/);
-  assert.match(page, /if \(!accepted\) return;[\s\S]*?setDraft\(""\)/);
+  assert.match(page, /const result = await onSend\(value, \{[\s\S]*?replyToText:/);
+  assert.match(
+    page,
+    /if \(result !== "sent"\) \{[\s\S]*?setSendError\([\s\S]*?return;[\s\S]*?setDraft\(\(current\) =>/,
+  );
   assert.match(page, /publishText\(chatId, normalizedText, \{[\s\S]*?replyToAuthorId:/);
   assert.match(page, /repliedMessage \|\| message\.replyPreview/);
 });

@@ -14,7 +14,8 @@ test("starts fail-closed and never persists auth tokens in Web Storage", async (
   assert.match(page, /useState<RuntimeMode>\("backend"\)/);
   assert.match(page, /useState<Chat\[]>\(\[\]\)/);
   assert.match(page, /useState<MessengerUser\[]>\(\[\]\)/);
-  assert.match(api, /const mode: RuntimeMode = raw\.mode;/);
+  assert.match(api, /const mode: RuntimeMode = configuredMode;/);
+  assert.match(api, /BUILD_TIME_DATA_MODE === "api"/);
   assert.match(api, /Tokens intentionally live in memory only/);
   assert.doesNotMatch(api, /sessionStorage\.setItem/);
   assert.doesNotMatch(api, /localStorage\.setItem\([^\n]*token/i);

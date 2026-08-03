@@ -35,6 +35,6 @@ test("observes every readable Tinode chat while retaining mock UI only in demo m
   assert.match(page, /setChatItems\(initialChats\)/);
   assert.match(page, /const withoutRealtimeTopics = canUseLocalChatFallback\(authMode\)/);
   assert.match(page, /filterChatsForRuntimeMode/);
-  assert.match(page, /const sendMessage = \(/);
+  assert.match(page, /const sendMessage = async \(/);
   assert.match(page, /window\.setTimeout/);
 });

@@ -35,7 +35,7 @@ test("does not create or publish local mock data in backend mode", async () => {
   );
   assert.match(
     page,
-    /realtimeClient\.isTopicSubscribed\(chatId\)[\s\S]*?publishText\(chatId, normalizedText, \{[\s\S]*?if \(!canUseLocalChatFallback\(authMode\)\) \{[\s\S]*?return false;[\s\S]*?const now = formatMessageTime\(\)/,
+    /realtimeClient\.isTopicSubscribed\(chatId\)[\s\S]*?publishText\(chatId, normalizedText, \{[\s\S]*?if \(!canUseLocalChatFallback\(authMode\)\) \{[\s\S]*?return "failed";[\s\S]*?const now = formatMessageTime\(\)/,
   );
   assert.match(
     page,

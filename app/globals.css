@@ -1737,6 +1737,33 @@ textarea:focus-visible {
   box-shadow: 0 6px 16px color-mix(in srgb, var(--accent) 34%, transparent);
 }
 
+.send-button:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+.composer-send-error {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px 10px;
+  border-top: 1px solid color-mix(in srgb, var(--danger) 22%, transparent);
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+  color: var(--danger);
+}
+
+.composer-send-error button {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-weight: 700;
+}
+
 .recording-panel {
   display: flex;
   flex: 1;
