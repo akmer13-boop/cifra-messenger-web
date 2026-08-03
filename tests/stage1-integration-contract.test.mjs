@@ -37,9 +37,17 @@ test("keeps a text draft until the realtime server acknowledges publication", as
 
 test("backend mode does not present simulated media, voice, or calls as real", async () => {
   const page = await readFile(pageUrl, "utf8");
+  const voiceHandler = page.slice(
+    page.indexOf("const handleVoice ="),
+    page.indexOf("const handleAttachment ="),
+  );
 
   assert.match(page, /if \(runtimeMode === "backend"\) \{[\s\S]*?media pipeline/);
   assert.match(page, /if \(authMode === "backend"\) \{[\s\S]*?WebRTC/);
+  assert.match(voiceHandler, /setRecording\(false\)/);
+  assert.match(voiceHandler, /Голосовые будут доступны/);
+  assert.doesNotMatch(voiceHandler, /setRecording\(true\)/);
+  assert.doesNotMatch(voiceHandler, /voice: "0:07"/);
 });
 
 test("accepts the staging data-mode and API URL build variables", async () => {
