@@ -46,7 +46,7 @@ export interface CapabilitiesResponse {
 export interface DeviceCryptoKeysRequest {
   version: 1;
   encryption: {
-    algorithm: "ECDH-P256+A256KW";
+    algorithm: "CIFRA-ECDH-P256-HKDF-SHA256-A256KW";
     key_id: string;
     public_jwk: JsonWebKey;
   };
@@ -61,12 +61,18 @@ export interface DeviceCryptoKeysResponse {
   version: 1;
   deviceId: string;
   keyVersion: number;
+  encryptionAlgorithm: "CIFRA-ECDH-P256-HKDF-SHA256-A256KW";
   encryptionKeyId: string;
+  encryptionPublicJwk: JsonWebKey;
+  signatureAlgorithm: "ECDSA-P256-SHA256";
   signatureKeyId: string;
+  signaturePublicJwk: JsonWebKey;
+  createdAt: string;
 }
 
 export interface TopicCryptoContext {
   suite: "CIFRA_CRYPTO_V1";
+  profile: "CIFRA-ECDH-P256-HKDF-SHA256-A256KW";
   topicId: string;
   keyEpoch: number;
   expiresAt: string;
@@ -75,7 +81,8 @@ export interface TopicCryptoContext {
     userId: string;
     deviceId: string;
     keyId: string;
-    algorithm: "ECDH-P256+A256KW";
+    keyEpoch: number;
+    algorithm: "CIFRA-ECDH-P256-HKDF-SHA256-A256KW";
     publicJwk: JsonWebKey;
   }>;
   complianceKey: {
@@ -83,6 +90,49 @@ export interface TopicCryptoContext {
     algorithm: "RSA-OAEP-256";
     publicJwk: JsonWebKey;
   };
+}
+
+export interface BackendDevice {
+  id: string;
+  externalDeviceId: string;
+  platform: "ios" | "android" | "web" | "desktop" | "unknown";
+  trustStatus: "pending" | "trusted" | "revoked";
+}
+
+export interface MediaManifest {
+  media: MediaView;
+  chunks: Array<{
+    index: number;
+    sizeBytes: number;
+    checksumSha256: string;
+  }>;
+}
+
+export interface CifraMediaReference {
+  id: string;
+  manifest_version: number;
+  manifest_sha256: string;
+}
+
+export interface CifraMessageEnvelope {
+  schema: "cifra.message/1";
+  client_msg_id: string;
+  kind: "text" | "image" | "video" | "video_note" | "document" | "voice" | "system";
+  crypto: {
+    version: 1;
+    suite: "CIFRA_CRYPTO_V1";
+    profile: "CIFRA-ECDH-P256-HKDF-SHA256-A256KW";
+    key_epoch: number;
+    content_algorithm: "A256GCM";
+    nonce: string;
+    ciphertext: string;
+    authentication_tag: string;
+    recipient_dek: string;
+    compliance_key_id: string;
+    compliance_dek: string;
+    signature: string;
+  };
+  media: CifraMediaReference[];
 }
 
 export interface MediaView {
@@ -211,24 +261,55 @@ export function parseCapabilitiesResponse(value: unknown): CapabilitiesResponse 
 export function parseDeviceCryptoKeysResponse(
   value: unknown,
 ): DeviceCryptoKeysResponse {
-  const root = record(value, "device crypto keys");
-  const encryption = record(root.encryption, "device crypto keys.encryption");
-  const signature = record(root.signature, "device crypto keys.signature");
+  const root = exactRecord(
+    value,
+    ["created_at", "device_id", "encryption", "key_version", "signature", "version"],
+    "device crypto keys",
+  );
+  const encryption = exactRecord(
+    root.encryption,
+    ["algorithm", "key_id", "public_jwk"],
+    "device crypto keys.encryption",
+  );
+  const signature = exactRecord(
+    root.signature,
+    ["algorithm", "key_id", "public_jwk"],
+    "device crypto keys.signature",
+  );
   return {
     version: literal(root.version, 1, "device crypto keys.version"),
-    deviceId: nonEmptyString(root.device_id, "device crypto keys.device_id"),
+    deviceId: uuid(root.device_id, "device crypto keys.device_id"),
     keyVersion: positiveInteger(
       root.key_version,
       "device crypto keys.key_version",
     ),
-    encryptionKeyId: nonEmptyString(
+    encryptionAlgorithm: literal(
+      encryption.algorithm,
+      "CIFRA-ECDH-P256-HKDF-SHA256-A256KW",
+      "device crypto keys.encryption.algorithm",
+    ),
+    encryptionKeyId: keyId(
       encryption.key_id,
       "device crypto keys.encryption.key_id",
     ),
-    signatureKeyId: nonEmptyString(
+    encryptionPublicJwk: encryptionJwk(
+      encryption.public_jwk,
+      "device crypto keys.encryption.public_jwk",
+    ),
+    signatureAlgorithm: literal(
+      signature.algorithm,
+      "ECDSA-P256-SHA256",
+      "device crypto keys.signature.algorithm",
+    ),
+    signatureKeyId: keyId(
       signature.key_id,
       "device crypto keys.signature.key_id",
     ),
+    signaturePublicJwk: signatureJwk(
+      signature.public_jwk,
+      "device crypto keys.signature.public_jwk",
+    ),
+    createdAt: dateTime(root.created_at, "device crypto keys.created_at"),
   };
 }
 
@@ -243,28 +324,34 @@ export function parseTopicCryptoContext(value: unknown): TopicCryptoContext {
   }
   return {
     suite: literal(root.suite, "CIFRA_CRYPTO_V1", "topic crypto context.suite"),
+    profile: literal(
+      root.profile,
+      "CIFRA-ECDH-P256-HKDF-SHA256-A256KW",
+      "topic crypto context.profile",
+    ),
     topicId: nonEmptyString(root.topic_id, "topic crypto context.topic_id"),
     keyEpoch: positiveInteger(root.key_epoch, "topic crypto context.key_epoch"),
-    expiresAt: nonEmptyString(
-      root.expires_at,
-      "topic crypto context.expires_at",
-    ),
-    senderDeviceId: nonEmptyString(
+    expiresAt: dateTime(root.expires_at, "topic crypto context.expires_at"),
+    senderDeviceId: uuid(
       root.sender_device_id,
       "topic crypto context.sender_device_id",
     ),
     recipientKeys: root.recipient_keys.map((entry, index) => {
       const key = record(entry, `topic crypto context.recipient_keys[${index}]`);
       return {
-        userId: nonEmptyString(key.user_id, "recipient key.user_id"),
-        deviceId: nonEmptyString(key.device_id, "recipient key.device_id"),
+        userId: uuid(key.user_id, "recipient key.user_id"),
+        deviceId: uuid(key.device_id, "recipient key.device_id"),
         keyId: nonEmptyString(key.key_id, "recipient key.key_id"),
+        keyEpoch: positiveInteger(key.key_epoch, "recipient key.key_epoch"),
         algorithm: literal(
           key.algorithm,
-          "ECDH-P256+A256KW",
+          "CIFRA-ECDH-P256-HKDF-SHA256-A256KW",
           "recipient key.algorithm",
         ),
-        publicJwk: jwk(key.public_jwk, "recipient key.public_jwk"),
+        publicJwk: encryptionJwk(
+          key.public_jwk,
+          "recipient key.public_jwk",
+        ),
       };
     }),
     complianceKey: {
@@ -283,6 +370,52 @@ export function parseTopicCryptoContext(value: unknown): TopicCryptoContext {
       ),
     },
   };
+}
+
+export function parseBackendDevices(value: unknown): BackendDevice[] {
+  const root = record(value, "devices");
+  if (!Array.isArray(root.items)) invalid("devices.items");
+  return root.items.map((value, index) => {
+    const device = record(value, `devices.items[${index}]`);
+    const platform = nonEmptyString(device.platform, "device.platform");
+    const trustStatus = nonEmptyString(device.trust_status, "device.trust_status");
+    if (!["ios", "android", "web", "desktop", "unknown"].includes(platform)) {
+      invalid("device.platform");
+    }
+    if (!["pending", "trusted", "revoked"].includes(trustStatus)) {
+      invalid("device.trust_status");
+    }
+    return {
+      id: uuid(device.id, "device.id"),
+      externalDeviceId: nonEmptyString(
+        device.external_device_id,
+        "device.external_device_id",
+      ),
+      platform: platform as BackendDevice["platform"],
+      trustStatus: trustStatus as BackendDevice["trustStatus"],
+    };
+  });
+}
+
+export function parseMediaManifest(value: unknown): MediaManifest {
+  const root = record(value, "media manifest");
+  if (!Array.isArray(root.chunks) || root.chunks.length === 0) {
+    invalid("media manifest.chunks");
+  }
+  const chunks = root.chunks.map((value, index) => {
+    const chunk = record(value, `media manifest.chunks[${index}]`);
+    const parsedIndex = nonNegativeInteger(chunk.index, "manifest chunk.index");
+    if (parsedIndex !== index) invalid("manifest chunk.index");
+    return {
+      index: parsedIndex,
+      sizeBytes: positiveInteger(chunk.size_bytes, "manifest chunk.size_bytes"),
+      checksumSha256: sha256(
+        chunk.checksum_sha256,
+        "manifest chunk.checksum_sha256",
+      ),
+    };
+  });
+  return { media: parseMediaView(root.media), chunks };
 }
 
 export function parseMediaCreateUploadResponse(
@@ -420,10 +553,113 @@ function record(value: unknown, path: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function exactRecord(
+  value: unknown,
+  keys: string[],
+  path: string,
+): Record<string, unknown> {
+  const parsed = record(value, path);
+  const actual = Object.keys(parsed).sort();
+  const expected = [...keys].sort();
+  if (
+    actual.length !== expected.length ||
+    actual.some((key, index) => key !== expected[index])
+  ) {
+    invalid(path);
+  }
+  return parsed;
+}
+
 function jwk(value: unknown, path: string): JsonWebKey {
   const parsed = record(value, path);
   if (typeof parsed.kty !== "string") invalid(`${path}.kty`);
   return parsed as JsonWebKey;
+}
+
+function encryptionJwk(value: unknown, path: string): JsonWebKey {
+  const parsed = record(value, path);
+  const expected = ["crv", "kty", "use", "x", "y"];
+  const actual = Object.keys(parsed).sort();
+  if (
+    actual.length !== expected.length ||
+    actual.some((key, index) => key !== expected[index]) ||
+    parsed.kty !== "EC" ||
+    parsed.crv !== "P-256" ||
+    parsed.use !== "enc" ||
+    typeof parsed.x !== "string" ||
+    typeof parsed.y !== "string" ||
+    !canonicalP256Coordinate(parsed.x) ||
+    !canonicalP256Coordinate(parsed.y)
+  ) {
+    invalid(path);
+  }
+  return parsed as JsonWebKey;
+}
+
+function signatureJwk(value: unknown, path: string): JsonWebKey {
+  const parsed = record(value, path);
+  const permitted = new Set(["alg", "crv", "ext", "key_ops", "kty", "use", "x", "y"]);
+  if (
+    Object.keys(parsed).some((member) => !permitted.has(member)) ||
+    parsed.kty !== "EC" ||
+    parsed.crv !== "P-256" ||
+    !canonicalP256Coordinate(parsed.x) ||
+    !canonicalP256Coordinate(parsed.y) ||
+    (parsed.use !== undefined && parsed.use !== "sig") ||
+    (parsed.alg !== undefined && parsed.alg !== "ES256") ||
+    (parsed.ext !== undefined && typeof parsed.ext !== "boolean") ||
+    (parsed.key_ops !== undefined &&
+      (!Array.isArray(parsed.key_ops) ||
+        parsed.key_ops.length !== new Set(parsed.key_ops).size ||
+        parsed.key_ops.some((operation) => operation !== "verify")))
+  ) {
+    invalid(path);
+  }
+  return parsed as JsonWebKey;
+}
+
+function canonicalP256Coordinate(value: unknown): value is string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value)) {
+    return false;
+  }
+  try {
+    const padding = "=".repeat((4 - (value.length % 4)) % 4);
+    const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/") + padding);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    let encoded = "";
+    for (const byte of bytes) encoded += String.fromCharCode(byte);
+    return (
+      bytes.byteLength === 32 &&
+      btoa(encoded)
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, "") === value
+    );
+  } catch {
+    return false;
+  }
+}
+
+function keyId(value: unknown, path: string): string {
+  const parsed = nonEmptyString(value, path);
+  if (parsed.length > 256 || !/^[A-Za-z0-9._:-]+$/.test(parsed)) invalid(path);
+  return parsed;
+}
+
+function uuid(value: unknown, path: string): string {
+  if (
+    typeof value !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
+  ) {
+    invalid(path);
+  }
+  return value;
+}
+
+function dateTime(value: unknown, path: string): string {
+  const parsed = nonEmptyString(value, path);
+  if (!Number.isFinite(new Date(parsed).getTime())) invalid(path);
+  return parsed;
 }
 
 function nonEmptyString(value: unknown, path: string): string {

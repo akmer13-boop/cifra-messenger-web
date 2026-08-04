@@ -2,16 +2,20 @@ import { primaryRole, wireRole } from "./auth-policy.mjs";
 import { collectDirectoryPages } from "./directory-pagination-policy.mjs";
 import {
   parseCapabilitiesResponse,
+  parseBackendDevices,
   parseDeviceCryptoKeysResponse,
   parseMediaCreateUploadResponse,
+  parseMediaManifest,
   parseMediaUploadPartResponse,
   parseMediaView,
   parseTopicCryptoContext,
   type CapabilitiesResponse,
+  type BackendDevice,
   type DeviceCryptoKeysRequest,
   type DeviceCryptoKeysResponse,
   type MediaCreateUploadInput,
   type MediaCreateUploadResponse,
+  type MediaManifest,
   type MediaUploadPartResponse,
   type MediaView,
   type TopicCryptoContext,
@@ -129,6 +133,14 @@ export interface ComplianceSearchInput {
   topic_id?: string;
   limit?: number;
   cursor?: string;
+}
+
+export interface MediaContentResponse {
+  body: ArrayBuffer;
+  status: 200 | 206;
+  contentRange: string | null;
+  contentLength: number;
+  etag: string | null;
 }
 
 export interface CreateUserInput {
@@ -545,11 +557,12 @@ export class CifraApiClient {
   }
 
   async registerDeviceCryptoKeys(
+    deviceId: string,
     input: DeviceCryptoKeysRequest,
     idempotencyKey: string,
   ): Promise<DeviceCryptoKeysResponse> {
     return this.request<DeviceCryptoKeysResponse>(
-      `/api/v1/devices/${encodeURIComponent(this.currentDeviceId)}/crypto-keys`,
+      `/api/v1/devices/${encodeURIComponent(deviceId)}/crypto-keys`,
       {
         method: "PUT",
         headers: { "Idempotency-Key": idempotencyKey },
@@ -557,6 +570,33 @@ export class CifraApiClient {
       },
       parseDeviceCryptoKeysResponse,
     );
+  }
+
+  async listOwnDevices(): Promise<BackendDevice[]> {
+    return this.request<BackendDevice[]>(
+      "/api/v1/devices",
+      {},
+      parseBackendDevices,
+    );
+  }
+
+  async resolveCurrentCryptoDeviceId(): Promise<string> {
+    const externalDeviceId = this.currentDeviceId;
+    const devices = await this.listOwnDevices();
+    const matching = devices.filter(
+      (device) =>
+        device.externalDeviceId === externalDeviceId &&
+        device.platform === "web" &&
+        device.trustStatus === "trusted",
+    );
+    if (matching.length !== 1) {
+      throw new CifraApiError(
+        "Не удалось однозначно сопоставить browser device с доверенным backend device",
+        409,
+        "DEVICE_IDENTITY_UNRESOLVED",
+      );
+    }
+    return matching[0].id;
   }
 
   async getTopicCryptoContext(topicId: string): Promise<TopicCryptoContext> {
@@ -622,6 +662,49 @@ export class CifraApiClient {
       {},
       parseMediaView,
     );
+  }
+
+  async getMediaManifest(mediaId: string): Promise<MediaManifest> {
+    return this.request<MediaManifest>(
+      `/api/v1/media/${encodeURIComponent(mediaId)}/manifest`,
+      {},
+      parseMediaManifest,
+    );
+  }
+
+  async downloadMediaContent(
+    mediaId: string,
+    options: { range?: string; controlledPlayback?: boolean } = {},
+  ): Promise<MediaContentResponse> {
+    const headers: Record<string, string> = {};
+    if (options.range) headers.Range = options.range;
+    if (options.controlledPlayback) {
+      headers["X-CIFRA-Controlled-Playback"] = "1";
+    }
+    return this.requestBinary(
+      `/api/v1/media/${encodeURIComponent(mediaId)}/content`,
+      { headers },
+    );
+  }
+
+  private async requestBinary(
+    path: string,
+    init: RequestInit,
+  ): Promise<MediaContentResponse> {
+    try {
+      return await this.authorizedFetchBinary(path, init);
+    } catch (error) {
+      if (
+        error instanceof CifraApiError &&
+        error.status === 401 &&
+        REFRESHABLE_ACCESS_ERRORS.has(error.code) &&
+        this.session?.tokens.refresh_token
+      ) {
+        await this.refresh();
+        return this.authorizedFetchBinary(path, init);
+      }
+      throw error;
+    }
   }
 
   async request<T>(
@@ -722,6 +805,79 @@ export class CifraApiClient {
       },
       parseJson,
     );
+  }
+
+  private async authorizedFetchBinary(
+    path: string,
+    init: RequestInit,
+  ): Promise<MediaContentResponse> {
+    if (!this.session) {
+      throw new CifraApiError("Требуется авторизация", 401, "AUTH_REQUIRED");
+    }
+    const controller = new AbortController();
+    const timeout = window.setTimeout(
+      () => controller.abort(),
+      this.config.requestTimeoutMs,
+    );
+    try {
+      const headers = new Headers(init.headers);
+      headers.set("Accept", "application/octet-stream");
+      headers.set(
+        "Authorization",
+        `Bearer ${this.session.tokens.access_token}`,
+      );
+      const response = await fetch(`${this.config.apiBaseUrl}${path}`, {
+        ...init,
+        headers,
+        cache: "no-store",
+        credentials: "same-origin",
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const body = await parseErrorBody(response);
+        throw new CifraApiError(
+          body.error?.message ?? `Ошибка сервера (${response.status})`,
+          response.status,
+          body.error?.code ?? "HTTP_ERROR",
+          body.error?.request_id,
+          body.error?.retryable ?? false,
+          body.error?.details ?? {},
+        );
+      }
+      if (response.status !== 200 && response.status !== 206) {
+        throw contractError("media content", "status");
+      }
+      const body = await response.arrayBuffer();
+      const declaredLength = Number(response.headers.get("content-length"));
+      if (
+        !Number.isSafeInteger(declaredLength) ||
+        declaredLength < 1 ||
+        declaredLength !== body.byteLength
+      ) {
+        throw contractError("media content", "content-length");
+      }
+      return {
+        body,
+        status: response.status,
+        contentRange: response.headers.get("content-range"),
+        contentLength: declaredLength,
+        etag: response.headers.get("etag"),
+      };
+    } catch (error) {
+      if (error instanceof CifraApiError) throw error;
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new CifraApiError(
+          "Превышено время ожидания media download",
+          0,
+          "REQUEST_TIMEOUT",
+          undefined,
+          true,
+        );
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timeout);
+    }
   }
 
   private async fetchJson<T>(

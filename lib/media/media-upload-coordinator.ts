@@ -1,11 +1,13 @@
 import type {
   CapabilitiesResponse,
+  CifraMessageEnvelope,
   MediaCapabilities,
   MediaCreateUploadInput,
   MediaCreateUploadResponse,
   MediaKind,
   MediaUploadPartResponse,
   MediaView,
+  MediaManifest,
   TopicCryptoContext,
 } from "./contracts";
 import { prepareMediaKey } from "./crypto";
@@ -14,6 +16,10 @@ import {
   type DeviceCryptoRegistrationApi,
 } from "./device-key-store";
 import { MediaCryptor } from "./media-cryptor";
+import {
+  mediaManifestSha256,
+} from "./cifra-crypto-v1.mjs";
+import { prepareMediaEnvelope } from "./message-crypto";
 import {
   calculateMediaUploadPlan,
   MEDIA_CIPHER,
@@ -73,10 +79,18 @@ export interface MediaUploadApi extends DeviceCryptoRegistrationApi {
     idempotencyKey: string,
   ): Promise<MediaView>;
   getMedia(mediaId: string): Promise<MediaView>;
+  getMediaManifest(mediaId: string): Promise<MediaManifest>;
 }
 
 export interface StartMediaUploadOptions {
   durationMs?: number;
+}
+
+export interface PreparedMediaPublisher {
+  publishMessageEnvelope(
+    topicId: string,
+    envelope: CifraMessageEnvelope,
+  ): Promise<{ seq: number }>;
 }
 
 export const EMPTY_MEDIA_PIPELINE_SNAPSHOT: MediaPipelineSnapshot = {
@@ -96,6 +110,14 @@ export const EMPTY_MEDIA_PIPELINE_SNAPSHOT: MediaPipelineSnapshot = {
 
 const PROCESSING_POLL_TIMEOUT_MS = 180_000;
 const PROCESSING_POLL_INTERVAL_MS = 1_200;
+const SAFE_PRE_SEND_OR_REJECTED_CODES = new Set([
+  "tinode_chat_topic_invalid",
+  "tinode_chat_topic_unknown",
+  "tinode_chat_write_access_denied",
+  "realtime_not_connected",
+  "tinode_chat_not_subscribed",
+  "tinode_publish_rejected",
+]);
 
 interface MediaOperationScope {
   userId: string;
@@ -109,6 +131,14 @@ export class MediaUploadCoordinator {
   private snapshot: MediaPipelineSnapshot = EMPTY_MEDIA_PIPELINE_SNAPSHOT;
   private operation: StoredMediaOperation | null = null;
   private capabilities: CapabilitiesResponse | null = null;
+  private transientMediaSecret: {
+    mediaId: string;
+    mediaDek: Uint8Array;
+    mediaNonce: string;
+    durationMs: number | null;
+  } | null = null;
+  private preparedEnvelope: CifraMessageEnvelope | null = null;
+  private publishState: "idle" | "attempting" | "published" | "unknown" = "idle";
   private runGeneration = 0;
   private disposed = false;
 
@@ -123,6 +153,60 @@ export class MediaUploadCoordinator {
 
   get currentSnapshot(): MediaPipelineSnapshot {
     return this.snapshot;
+  }
+
+  get preparedMessageEnvelope(): CifraMessageEnvelope | null {
+    return this.preparedEnvelope;
+  }
+
+  async publishPrepared(publisher: PreparedMediaPublisher): Promise<number> {
+    if (
+      !this.preparedEnvelope ||
+      this.snapshot.phase !== "ready" ||
+      this.publishState !== "idle"
+    ) {
+      throw new MediaPipelineError(
+        "MEDIA_ENVELOPE_NOT_READY",
+        this.publishState === "unknown"
+          ? "Результат прошлой публикации неизвестен; автоматический повтор запрещён во избежание дубля"
+          : "Signed media envelope ещё не подготовлен или уже использован",
+        false,
+      );
+    }
+    const envelope = this.preparedEnvelope;
+    this.publishState = "attempting";
+    try {
+      const result = await publisher.publishMessageEnvelope(this.topicId, envelope);
+      this.publishState = "published";
+      this.preparedEnvelope = null;
+      this.emit({
+        ...this.snapshot,
+        detail: `Media опубликовано в чате (seq ${result.seq})`,
+        deliveryBlocked: false,
+      });
+      return result.seq;
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (typeof code === "string" && SAFE_PRE_SEND_OR_REJECTED_CODES.has(code)) {
+        this.publishState = "idle";
+        throw error;
+      }
+      this.publishState = "unknown";
+      this.preparedEnvelope = null;
+      this.emit({
+        ...this.snapshot,
+        phase: "failed",
+        detail:
+          "Ответ Tinode потерян после отправки. Автоповтор запрещён: backend пока не фиксирует client_msg_id атомарно с commit.",
+        errorCode: "MEDIA_DELIVERY_UNKNOWN",
+        errorMessage: "Статус доставки неизвестен",
+        retryable: false,
+        canRetry: false,
+        canCancel: false,
+        deliveryBlocked: true,
+      });
+      throw error;
+    }
   }
 
   async getCapabilities(force = false): Promise<CapabilitiesResponse> {
@@ -168,6 +252,16 @@ export class MediaUploadCoordinator {
       );
       return;
     }
+    if (operation.phase === "ready") {
+      await this.failStoredOperation(
+        operation,
+        "MEDIA_RESELECT_REQUIRED",
+        "Страница была перезагружена после upload: raw media DEK намеренно не сохранялся. Выберите исходный файл заново.",
+        false,
+        null,
+      );
+      return;
+    }
     this.emit(storedOperationSnapshot(operation));
   }
 
@@ -186,6 +280,8 @@ export class MediaUploadCoordinator {
       await this.store.deleteOperation(this.operation.operationId);
       this.operation = null;
     }
+    this.clearTransientSecrets();
+    this.publishState = "idle";
 
     const generation = this.beginRun();
     this.emit({
@@ -236,6 +332,7 @@ export class MediaUploadCoordinator {
     }
     this.runGeneration += 1;
     this.cryptor.cancel();
+    this.clearTransientSecrets();
     const operation = this.operation;
     this.operation = null;
     if (operation) await this.store.deleteOperation(operation.operationId);
@@ -258,6 +355,7 @@ export class MediaUploadCoordinator {
     const operation = this.operation;
     this.operation = null;
     if (operation) await this.store.deleteOperation(operation.operationId);
+    this.clearTransientSecrets();
     this.emit(EMPTY_MEDIA_PIPELINE_SNAPSHOT);
   }
 
@@ -265,6 +363,7 @@ export class MediaUploadCoordinator {
     this.disposed = true;
     this.runGeneration += 1;
     this.cryptor.dispose();
+    this.clearTransientSecrets();
   }
 
   private async createEncryptAndUpload(
@@ -290,7 +389,7 @@ export class MediaUploadCoordinator {
       );
     }
 
-    await ensureRegisteredDeviceKeys(this.api, this.store);
+    const deviceKeys = await ensureRegisteredDeviceKeys(this.api, this.store);
     this.assertActive(generation);
     this.assertCurrentScope(scope);
     this.update({ progress: 8, detail: "Считаем SHA-256 исходного файла" });
@@ -301,13 +400,24 @@ export class MediaUploadCoordinator {
     const cryptoContext = await this.api.getTopicCryptoContext(this.topicId);
     this.assertActive(generation);
     this.assertCurrentScope(scope);
-    validateCryptoContext(cryptoContext, this.topicId, this.api.currentDeviceId);
+    validateCryptoContext(cryptoContext, this.topicId, deviceKeys.deviceId);
     const preparedKey = await prepareMediaKey({
       complianceKeyId: cryptoContext.complianceKey.keyId,
       compliancePublicJwk: cryptoContext.complianceKey.publicJwk,
     });
-    this.assertActive(generation);
-    this.assertCurrentScope(scope);
+    try {
+      this.assertActive(generation);
+      this.assertCurrentScope(scope);
+    } catch (error) {
+      preparedKey.mediaDek.fill(0);
+      throw error;
+    }
+    this.transientMediaSecret = {
+      mediaId: "pending",
+      mediaDek: preparedKey.mediaDek,
+      mediaNonce: preparedKey.mediaNonce,
+      durationMs: options.durationMs ?? null,
+    };
 
     this.update({
       phase: "creating",
@@ -337,11 +447,13 @@ export class MediaUploadCoordinator {
       upload,
       this.topicId,
       kind,
+      file.type,
       file.size,
       uploadPlan,
       capabilities.media,
       scope.userId,
     );
+    this.transientMediaSecret.mediaId = upload.media.id;
 
     const timestamp = new Date().toISOString();
     const operation: StoredMediaOperation = {
@@ -568,15 +680,17 @@ export class MediaUploadCoordinator {
         operation.progress = 100;
         operation.updatedAt = new Date().toISOString();
         await this.store.putOperation(operation);
+        await this.prepareReadyEnvelope(operation, media, generation);
         this.emit({
           ...storedOperationSnapshot(operation),
           detail:
-            "Тестовая encrypted-загрузка готова. Для будущей отправки после финального crypto-контракта выберите исходник заново.",
+            "Encrypted media и signed CIFRA envelope готовы. Публикация заблокирована до backend-контрактов sender key и idempotent commit.",
           deliveryBlocked: true,
         });
         return;
       }
       if (media.status === "rejected") {
+        this.clearTransientSecrets();
         operation.phase = "rejected";
         operation.resumeFrom = null;
         operation.rejectionCode = media.rejectionCode;
@@ -589,6 +703,7 @@ export class MediaUploadCoordinator {
         return;
       }
       if (media.status === "failed") {
+        this.clearTransientSecrets();
         await this.failStoredOperation(
           operation,
           media.rejectionCode ?? "MEDIA_PROCESSING_FAILED",
@@ -599,6 +714,7 @@ export class MediaUploadCoordinator {
         return;
       }
       if (media.status === "expired") {
+        this.clearTransientSecrets();
         await this.expireOperation(operation);
         return;
       }
@@ -614,6 +730,69 @@ export class MediaUploadCoordinator {
       "Обработка продолжается дольше ожидаемого. Можно повторить проверку статуса.",
       true,
     );
+  }
+
+  private async prepareReadyEnvelope(
+    operation: StoredMediaOperation,
+    media: MediaView,
+    generation: number,
+  ): Promise<void> {
+    const secret = this.transientMediaSecret;
+    if (!secret || secret.mediaId !== operation.mediaId) {
+      throw new MediaPipelineError(
+        "MEDIA_RESELECT_REQUIRED",
+        "Upload завершён после перезагрузки, но ephemeral media DEK больше нет в памяти. Безопасно выберите исходный файл заново.",
+        false,
+      );
+    }
+    if (operation.kind === "preview") {
+      throw new MediaPipelineError(
+        "MEDIA_KIND_UNSUPPORTED",
+        "Preview нельзя публиковать как самостоятельное сообщение",
+        false,
+      );
+    }
+    try {
+      const manifest = await this.api.getMediaManifest(operation.mediaId);
+      this.assertActive(generation);
+      this.assertOperationScope(operation, this.requireScope());
+      validateReadyManifest(manifest, media, operation);
+      const manifestSha256 = await mediaManifestSha256({
+        mediaId: operation.mediaId,
+        manifestVersion: operation.manifestVersion,
+        chunks: manifest.chunks.map((chunk) => ({
+          index: chunk.index,
+          sizeBytes: chunk.sizeBytes,
+          checksumSha256: chunk.checksumSha256,
+        })),
+      });
+      const deviceKeys = await ensureRegisteredDeviceKeys(this.api, this.store);
+      const context = await this.api.getTopicCryptoContext(this.topicId);
+      this.assertActive(generation);
+      validateCryptoContext(context, this.topicId, deviceKeys.deviceId);
+      this.preparedEnvelope = await prepareMediaEnvelope({
+        topicId: this.topicId,
+        senderUserId: operation.ownerUserId,
+        senderDeviceId: deviceKeys.deviceId,
+        deviceKeys,
+        cryptoContext: context,
+        media: {
+          kind: operation.kind,
+          fileName: operation.fileName,
+          mimeType: operation.mimeType,
+          plaintextSize: operation.plaintextSize,
+          durationMs: secret.durationMs,
+          mediaDek: secret.mediaDek,
+          mediaNonce: secret.mediaNonce,
+          mediaId: operation.mediaId,
+          manifestVersion: operation.manifestVersion,
+          manifestSha256,
+        },
+      });
+    } finally {
+      secret.mediaDek.fill(0);
+      this.transientMediaSecret = null;
+    }
   }
 
   private async executeSafely(
@@ -648,6 +827,7 @@ export class MediaUploadCoordinator {
         );
         return;
       }
+      this.clearTransientSecrets();
       this.emit({
         ...this.snapshot,
         phase: "failed",
@@ -668,8 +848,9 @@ export class MediaUploadCoordinator {
     retryable: boolean,
     resumeFrom: "uploading" | "processing" | null,
   ): Promise<void> {
+    if (!retryable || resumeFrom === null) this.clearTransientSecrets();
     operation.phase = "failed";
-    operation.resumeFrom = resumeFrom;
+    operation.resumeFrom = retryable ? resumeFrom : null;
     operation.errorCode = code;
     operation.errorMessage = message;
     operation.retryable = retryable;
@@ -680,6 +861,7 @@ export class MediaUploadCoordinator {
   }
 
   private async expireOperation(operation: StoredMediaOperation): Promise<void> {
+    this.clearTransientSecrets();
     operation.phase = "expired";
     operation.resumeFrom = null;
     operation.errorCode = "MEDIA_UPLOAD_EXPIRED";
@@ -764,6 +946,12 @@ export class MediaUploadCoordinator {
     if (this.disposed) return;
     this.snapshot = snapshot;
     this.onSnapshot(snapshot);
+  }
+
+  private clearTransientSecrets(): void {
+    this.transientMediaSecret?.mediaDek.fill(0);
+    this.transientMediaSecret = null;
+    this.preparedEnvelope = null;
   }
 }
 
@@ -880,6 +1068,7 @@ function validateUploadDescriptor(
   upload: MediaCreateUploadResponse,
   topicId: string,
   kind: MediaKind,
+  mimeType: string,
   plaintextSize: number,
   plan: { expectedParts: number; ciphertextSize: number },
   capabilities: MediaCapabilities,
@@ -889,6 +1078,7 @@ function validateUploadDescriptor(
     upload.media.topicId !== topicId ||
     upload.media.ownerId !== ownerUserId ||
     upload.media.kind !== kind ||
+    upload.media.declaredMimeType !== mimeType ||
     upload.media.plaintextSize !== plaintextSize ||
     upload.media.ciphertextSize !== null ||
     upload.media.manifestVersion !== upload.upload.manifestVersion ||
@@ -916,6 +1106,7 @@ function validateStoredMediaView(
     media.topicId !== operation.topicId ||
     media.ownerId !== operation.ownerUserId ||
     media.kind !== operation.kind ||
+    media.declaredMimeType !== operation.mimeType ||
     media.plaintextSize !== operation.plaintextSize ||
     media.ciphertextSize !== operation.ciphertextSize ||
     media.manifestVersion !== operation.manifestVersion
@@ -923,6 +1114,42 @@ function validateStoredMediaView(
     throw new MediaPipelineError(
       errorCode,
       "Backend вернул данные другой или повреждённой media-операции",
+      false,
+    );
+  }
+}
+
+function validateReadyManifest(
+  manifest: MediaManifest,
+  media: MediaView,
+  operation: StoredMediaOperation,
+): void {
+  const ciphertextSize = manifest.chunks.reduce(
+    (total, chunk) => total + chunk.sizeBytes,
+    0,
+  );
+  if (
+    manifest.media.id !== media.id ||
+    manifest.media.topicId !== operation.topicId ||
+    manifest.media.ownerId !== operation.ownerUserId ||
+    manifest.media.kind !== operation.kind ||
+    manifest.media.declaredMimeType !== operation.mimeType ||
+    manifest.media.status !== "ready" ||
+    manifest.media.manifestVersion !== operation.manifestVersion ||
+    manifest.media.plaintextSize !== operation.plaintextSize ||
+    manifest.media.ciphertextSize !== operation.ciphertextSize ||
+    ciphertextSize !== operation.ciphertextSize ||
+    manifest.chunks.length !== operation.expectedParts ||
+    manifest.chunks.some(
+      (chunk, index) =>
+        chunk.index !== index ||
+        chunk.sizeBytes <= 16 ||
+        !/^[0-9a-f]{64}$/.test(chunk.checksumSha256),
+    )
+  ) {
+    throw new MediaPipelineError(
+      "MEDIA_MANIFEST_INVALID",
+      "Backend manifest не совпадает с завершённой media-операцией",
       false,
     );
   }
@@ -941,7 +1168,7 @@ function storedOperationSnapshot(
     detail:
       operation.errorMessage ??
       (deliveryBlocked
-        ? "Тестовая encrypted-загрузка готова. Для отправки потребуется повторно выбрать исходник."
+        ? "Encrypted media готово, но publish заблокирован до backend sender-key/idempotency gate."
         : phase === "rejected"
           ? "Backend отклонил media после проверки"
           : "Media pipeline"),

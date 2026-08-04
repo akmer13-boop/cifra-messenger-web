@@ -6,6 +6,8 @@ import {
 
 export interface PreparedMediaKey {
   mediaKey: CryptoKey;
+  /** Same-tab only; caller MUST zero it after signed envelope preparation. */
+  mediaDek: Uint8Array;
   noncePrefix: Uint8Array;
   mediaNonce: string;
   wrappedMediaDek: string;
@@ -31,6 +33,7 @@ export async function prepareMediaKey(input: {
     const wrapped = await wrapMediaDek(rawDek, input.compliancePublicJwk);
     return {
       mediaKey,
+      mediaDek: rawDek.slice(),
       noncePrefix,
       mediaNonce: bytesToBase64Url(noncePrefix),
       wrappedMediaDek: bytesToBase64Url(

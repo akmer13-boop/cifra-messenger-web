@@ -241,6 +241,94 @@ test("publishes plain text to an attached writable Tinode topic and returns serv
   }
 });
 
+test("publishes the exact CIFRA envelope with its protocol MIME and client id", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWebSocket = globalThis.WebSocket;
+
+  FakeWebSocket.instances = [];
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      ticket: "A".repeat(43),
+      expires_in: 60,
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      channel: "tinode",
+      endpoint: {
+        url: "wss://tinode.example.test/v0/channels",
+        protocol: "tinode",
+        auth_scheme: "cifra",
+        ticket_transport: "login_secret",
+        ticket_encoding: "base64",
+      },
+    }),
+  });
+  globalThis.WebSocket = FakeWebSocket;
+
+  try {
+    const golden = JSON.parse(
+      await readFile(
+        new URL("./fixtures/crypto-golden-vectors.json", import.meta.url),
+        "utf8",
+      ),
+    );
+    const vector = golden.vectors.find((entry) => entry.media);
+    const signing = JSON.parse(vector.signature.canonical_input_utf8);
+    const envelope = {
+      schema: "cifra.message/1",
+      client_msg_id: vector.client_msg_id,
+      kind: vector.kind,
+      crypto: {
+        version: 1,
+        suite: golden.suite,
+        profile: golden.profile,
+        key_epoch: vector.key_epoch,
+        content_algorithm: "A256GCM",
+        nonce: vector.content.nonce,
+        ciphertext: vector.content.ciphertext,
+        authentication_tag: vector.content.authentication_tag,
+        recipient_dek: vector.recipient_bundle.encoded,
+        compliance_key_id: signing.compliance_key_id,
+        compliance_dek: signing.compliance_dek,
+        signature: vector.signature.signature,
+      },
+      media: [{
+        id: vector.media.media_id,
+        manifest_version: vector.media.manifest_version,
+        manifest_sha256: vector.media.manifest_sha256,
+      }],
+    };
+    const { CifraRealtimeClient } = await loadRealtimeModule();
+    const client = new CifraRealtimeClient();
+    await client.connect({
+      apiBaseUrl: "https://gateway.example.test",
+      accessToken: "access-token",
+      deviceId: "device-id",
+    });
+    await client.subscribeToChat("usrZyXwVuTsR10");
+
+    const result = await client.publishMessageEnvelope(
+      "usrZyXwVuTsR10",
+      envelope,
+    );
+    assert.equal(result.seq, 8);
+    const socket = FakeWebSocket.instances[0];
+    const packet = socket.sent.find((entry) => entry.pub);
+    assert.deepEqual(packet.pub, {
+      id: packet.pub.id,
+      topic: "usrZyXwVuTsR10",
+      noecho: false,
+      head: {
+        mime: "application/vnd.cifra.envelope+json",
+        "x-cifra-client-msg-id": envelope.client_msg_id,
+      },
+      content: envelope,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
 test("rejects empty, unknown, read-only, and unattached publish targets", async () => {
   const originalFetch = globalThis.fetch;
   const originalWebSocket = globalThis.WebSocket;

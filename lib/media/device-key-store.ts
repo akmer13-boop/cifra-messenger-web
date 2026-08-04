@@ -6,13 +6,19 @@ import {
   MediaUploadStore,
   type StoredDeviceKeys,
 } from "./upload-store";
+import {
+  publicEncryptionJwk,
+  publicSignatureJwk,
+} from "./cifra-crypto-v1.mjs";
 
 export interface DeviceCryptoRegistrationApi {
   readonly currentDeviceId: string;
   readonly currentSession: {
     context: { user_id: string };
   } | null;
+  resolveCurrentCryptoDeviceId(): Promise<string>;
   registerDeviceCryptoKeys(
+    deviceId: string,
     input: DeviceCryptoKeysRequest,
     idempotencyKey: string,
   ): Promise<DeviceCryptoKeysResponse>;
@@ -24,7 +30,7 @@ export async function ensureRegisteredDeviceKeys(
 ): Promise<StoredDeviceKeys> {
   const userId = api.currentSession?.context.user_id;
   if (!userId) throw new Error("Требуется активная backend-сессия");
-  const deviceId = api.currentDeviceId;
+  const deviceId = await api.resolveCurrentCryptoDeviceId();
   const storageId = `${userId}:${deviceId}`;
   let stored = await store.getDeviceKeys(storageId);
 
@@ -38,10 +44,11 @@ export async function ensureRegisteredDeviceKeys(
   if (stored.registeredKeyVersion !== null) return stored;
 
   const response = await api.registerDeviceCryptoKeys(
+    deviceId,
     {
       version: 1,
       encryption: {
-        algorithm: "ECDH-P256+A256KW",
+        algorithm: "CIFRA-ECDH-P256-HKDF-SHA256-A256KW",
         key_id: stored.encryptionKeyId,
         public_jwk: stored.encryptionPublicJwk,
       },
@@ -58,13 +65,32 @@ export async function ensureRegisteredDeviceKeys(
   }
   if (
     response.encryptionKeyId !== stored.encryptionKeyId ||
-    response.signatureKeyId !== stored.signatureKeyId
+    response.signatureKeyId !== stored.signatureKeyId ||
+    !sameP256Coordinates(
+      response.encryptionPublicJwk,
+      stored.encryptionPublicJwk,
+    ) ||
+    !sameP256Coordinates(
+      response.signaturePublicJwk,
+      stored.signaturePublicJwk,
+    )
   ) {
     throw new Error("Backend подтвердил другой набор crypto keys устройства");
   }
   stored = { ...stored, registeredKeyVersion: response.keyVersion };
   await store.putDeviceKeys(stored);
   return stored;
+}
+
+function sameP256Coordinates(left: JsonWebKey, right: JsonWebKey): boolean {
+  return (
+    left.kty === "EC" &&
+    right.kty === "EC" &&
+    left.crv === "P-256" &&
+    right.crv === "P-256" &&
+    left.x === right.x &&
+    left.y === right.y
+  );
 }
 
 async function generateDeviceKeys(
@@ -94,10 +120,10 @@ async function generateDeviceKeys(
     deviceId,
     encryptionKeyId: `web-enc-${keySuffix}`,
     encryptionPrivateKey: encryption.privateKey,
-    encryptionPublicJwk,
+    encryptionPublicJwk: publicEncryptionJwk(encryptionPublicJwk),
     signatureKeyId: `web-sig-${keySuffix}`,
     signaturePrivateKey: signature.privateKey,
-    signaturePublicJwk,
+    signaturePublicJwk: publicSignatureJwk(signaturePublicJwk),
     registrationIdempotencyKey: crypto.randomUUID(),
     registeredKeyVersion: null,
     createdAt: new Date().toISOString(),

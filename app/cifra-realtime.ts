@@ -1,3 +1,5 @@
+import type { CifraMessageEnvelope } from "../lib/media/contracts";
+
 type RealtimeReplyPayload = {
   readonly id?: number;
   readonly text?: string;
@@ -166,6 +168,8 @@ export interface RealtimePublishTextResult {
   readonly seq: number;
   readonly timestamp?: string;
 }
+
+export type RealtimePublishEnvelopeResult = RealtimePublishTextResult;
 
 export interface RealtimePublishTextOptions {
   readonly replyToId?: number;
@@ -592,6 +596,64 @@ export class CifraRealtimeClient {
       ...(control.timestamp
         ? { timestamp: control.timestamp }
         : {}),
+    };
+  }
+
+  async publishMessageEnvelope(
+    topic: string,
+    envelopeInput: CifraMessageEnvelope,
+  ): Promise<RealtimePublishEnvelopeResult> {
+    if (!isChatTopicName(topic)) {
+      throw new CifraRealtimeError("tinode_chat_topic_invalid");
+    }
+    const subscription = this.chatSubscriptions.get(topic);
+    if (!subscription) {
+      throw new CifraRealtimeError("tinode_chat_topic_unknown");
+    }
+    if (subscription.access?.mode && !subscription.access.mode.includes("W")) {
+      throw new CifraRealtimeError("tinode_chat_write_access_denied");
+    }
+    const socket = this.socket;
+    if (!this.isConnected() || !socket || socket.readyState !== WebSocket.OPEN) {
+      throw new CifraRealtimeError("realtime_not_connected");
+    }
+    if (!this.subscribedTopics.has(topic)) {
+      throw new CifraRealtimeError("tinode_chat_not_subscribed");
+    }
+    // The crypto boundary produces this value through prepareMediaEnvelope(),
+    // which applies the normative strict parser before returning. Keeping this
+    // transport module import-free also lets it run in the isolated realtime
+    // harness used by the client tests.
+    const envelope = envelopeInput;
+    const requestId = createPacketId(`pub-cifra-${envelope.client_msg_id}`);
+    const controlPromise = waitForControl(socket, requestId);
+    socket.send(JSON.stringify({
+      pub: {
+        id: requestId,
+        topic,
+        noecho: false,
+        head: {
+          mime: "application/vnd.cifra.envelope+json",
+          "x-cifra-client-msg-id": envelope.client_msg_id,
+        },
+        content: envelope,
+      },
+    }));
+    const control = await controlPromise;
+    if (this.socket !== socket) {
+      throw new CifraRealtimeError("realtime_connection_cancelled");
+    }
+    if (control.code < 200 || control.code >= 300) {
+      throw new CifraRealtimeError("tinode_publish_rejected");
+    }
+    const seq = parsePositiveInteger(control.params?.["seq"]);
+    if (seq === null) {
+      throw new CifraRealtimeError("tinode_publish_seq_missing");
+    }
+    return {
+      topic,
+      seq,
+      ...(control.timestamp ? { timestamp: control.timestamp } : {}),
     };
   }
 

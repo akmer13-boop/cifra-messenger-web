@@ -1,3 +1,4 @@
+[Uploading README.md…]()
 # CIFRA Messenger Web v22 — RBAC + MFA
 
 Готовая статическая WEB‑версия для Amvera Browser (Node.js 22). Версия   
@@ -50,6 +51,10 @@ npm run dev
 ```bash
 npm run check
 ```
+
+Текущий статус защищённых media/voice и точные backend gates для их публикации:
+`docs/STAGE3_CRYPTO_MEDIA_RU.md`. Состав Stage 3 patch:
+`PATCH_MANIFEST_STAGE3_RU.md`.
 
 ## Demo‑режим
 
