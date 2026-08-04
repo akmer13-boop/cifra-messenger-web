@@ -27,7 +27,7 @@ test("keeps a text draft until the realtime server acknowledges publication", as
   assert.match(page, /if \(result !== "sent"\) \{[\s\S]*?setSendError/);
   assert.match(page, /setDraft\(\(current\) => \(current\.trim\(\) === value/);
   assert.match(page, /if \(!value \|\| sendPending\) return/);
-  assert.match(page, /disabled=\{sendPending\}/);
+  assert.match(page, /disabled=\{sendPending \|\| \(!draft && !recording && mediaPipelineBusy\)\}/);
   assert.match(page, /const result = await realtimeClient\.publishText/);
   assert.doesNotMatch(page, /void realtimeClient[\s\S]{0,30}\.publishText/);
   assert.match(page, /className="composer-send-error" role="alert"/);
@@ -35,19 +35,19 @@ test("keeps a text draft until the realtime server acknowledges publication", as
   assert.match(page, /retryable: false/);
 });
 
-test("backend mode does not present simulated media, voice, or calls as real", async () => {
+test("backend mode uses protected media and never falls back to simulated delivery", async () => {
   const page = await readFile(pageUrl, "utf8");
   const voiceHandler = page.slice(
     page.indexOf("const handleVoice ="),
     page.indexOf("const handleAttachment ="),
   );
 
-  assert.match(page, /if \(runtimeMode === "backend"\) \{[\s\S]*?media pipeline/);
+  assert.match(page, /new MediaUploadCoordinator\(/);
+  assert.match(voiceHandler, /new MediaRecorderAdapter\(\)/);
+  assert.match(voiceHandler, /await recorder\.start\(/);
   assert.match(page, /if \(authMode === "backend"\) \{[\s\S]*?WebRTC/);
-  assert.match(voiceHandler, /setRecording\(false\)/);
-  assert.match(voiceHandler, /Голосовые будут доступны/);
-  assert.doesNotMatch(voiceHandler, /setRecording\(true\)/);
   assert.doesNotMatch(voiceHandler, /voice: "0:07"/);
+  assert.match(page, /Файл не опубликован в чате и не показан получателю/);
 });
 
 test("accepts the staging data-mode and API URL build variables", async () => {

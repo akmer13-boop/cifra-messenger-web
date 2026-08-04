@@ -10,7 +10,7 @@ test("every declared font size includes the one-pixel web increase", async () =>
     ([, value]) => value.trim(),
   );
 
-  assert.equal(declarations.length, 241);
+  assert.equal(declarations.length, 247);
 
   for (const value of declarations) {
     assert.match(value, /^calc\(.+\s\+\s1px\)$/);

@@ -1,5 +1,21 @@
 import { primaryRole, wireRole } from "./auth-policy.mjs";
 import { collectDirectoryPages } from "./directory-pagination-policy.mjs";
+import {
+  parseCapabilitiesResponse,
+  parseDeviceCryptoKeysResponse,
+  parseMediaCreateUploadResponse,
+  parseMediaUploadPartResponse,
+  parseMediaView,
+  parseTopicCryptoContext,
+  type CapabilitiesResponse,
+  type DeviceCryptoKeysRequest,
+  type DeviceCryptoKeysResponse,
+  type MediaCreateUploadInput,
+  type MediaCreateUploadResponse,
+  type MediaUploadPartResponse,
+  type MediaView,
+  type TopicCryptoContext,
+} from "../lib/media/contracts";
 
 export type RuntimeMode = "demo" | "backend";
 export type CorporateRole = "employee" | "admin" | "security_moderator";
@@ -520,6 +536,94 @@ export class CifraApiClient {
     );
   }
 
+  async getMediaCapabilities(): Promise<CapabilitiesResponse> {
+    return this.request<CapabilitiesResponse>(
+      "/api/v1/capabilities",
+      {},
+      parseCapabilitiesResponse,
+    );
+  }
+
+  async registerDeviceCryptoKeys(
+    input: DeviceCryptoKeysRequest,
+    idempotencyKey: string,
+  ): Promise<DeviceCryptoKeysResponse> {
+    return this.request<DeviceCryptoKeysResponse>(
+      `/api/v1/devices/${encodeURIComponent(this.currentDeviceId)}/crypto-keys`,
+      {
+        method: "PUT",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify(input),
+      },
+      parseDeviceCryptoKeysResponse,
+    );
+  }
+
+  async getTopicCryptoContext(topicId: string): Promise<TopicCryptoContext> {
+    return this.request<TopicCryptoContext>(
+      `/api/v1/chats/${encodeURIComponent(topicId)}/crypto-context`,
+      {},
+      parseTopicCryptoContext,
+    );
+  }
+
+  async createMediaUpload(
+    input: MediaCreateUploadInput,
+    idempotencyKey: string,
+  ): Promise<MediaCreateUploadResponse> {
+    return this.request<MediaCreateUploadResponse>(
+      "/api/v1/media/uploads",
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify(input),
+      },
+      parseMediaCreateUploadResponse,
+    );
+  }
+
+  async uploadMediaPart(
+    uploadId: string,
+    partNumber: number,
+    ciphertext: ArrayBuffer,
+    checksumSha256: string,
+  ): Promise<MediaUploadPartResponse> {
+    return this.request<MediaUploadPartResponse>(
+      `/api/v1/media/uploads/${encodeURIComponent(uploadId)}/parts/${partNumber}`,
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "Content-SHA256": checksumSha256,
+        },
+        body: ciphertext,
+      },
+      parseMediaUploadPartResponse,
+    );
+  }
+
+  async completeMediaUpload(
+    uploadId: string,
+    idempotencyKey: string,
+  ): Promise<MediaView> {
+    return this.request<MediaView>(
+      `/api/v1/media/uploads/${encodeURIComponent(uploadId)}/complete`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
+      parseMediaView,
+    );
+  }
+
+  async getMedia(mediaId: string): Promise<MediaView> {
+    return this.request<MediaView>(
+      `/api/v1/media/${encodeURIComponent(mediaId)}`,
+      {},
+      parseMediaView,
+    );
+  }
+
   async request<T>(
     path: string,
     init: RequestInit,
@@ -631,13 +735,14 @@ export class CifraApiClient {
       this.config.requestTimeoutMs,
     );
     try {
+      const headers = new Headers(init.headers);
+      headers.set("Accept", "application/json");
+      if (init.body && !headers.has("Content-Type")) {
+        headers.set("Content-Type", "application/json");
+      }
       const response = await fetch(`${this.config.apiBaseUrl}${path}`, {
         ...init,
-        headers: {
-          Accept: "application/json",
-          ...(init.body ? { "Content-Type": "application/json" } : {}),
-          ...headersToObject(init.headers),
-        },
+        headers,
         cache: "no-store",
         credentials: "same-origin",
         signal: controller.signal,
@@ -653,8 +758,17 @@ export class CifraApiClient {
           body.error?.details ?? {},
         );
       }
-      if (response.status === 204) return parseJson(undefined);
-      return parseJson(await response.json());
+      if (response.status === 204) {
+        return parseSuccessfulResponse(parseJson, undefined);
+      }
+      let responseBody: unknown;
+      try {
+        responseBody = await response.json();
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        throw contractError("ответ API", "json");
+      }
+      return parseSuccessfulResponse(parseJson, responseBody);
     } catch (error) {
       if (error instanceof CifraApiError) throw error;
       if (error instanceof DOMException && error.name === "AbortError") {
@@ -999,6 +1113,18 @@ function contractError(resource: string, field: string): CifraApiError {
     false,
     { field },
   );
+}
+
+function parseSuccessfulResponse<T>(
+  parser: JsonParser<T>,
+  value: unknown,
+): T {
+  try {
+    return parser(value);
+  } catch (error) {
+    if (error instanceof CifraApiError) throw error;
+    throw contractError("ответ API", "body");
+  }
 }
 
 function browserDevice(): {

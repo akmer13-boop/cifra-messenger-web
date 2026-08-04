@@ -1630,6 +1630,143 @@ textarea:focus-visible {
   backdrop-filter: blur(18px);
 }
 
+.media-pipeline-card,
+.voice-draft-panel {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 8px;
+  margin: 7px 9px 0;
+  padding: 11px 12px;
+  border: 1px solid color-mix(in srgb, var(--notification) 34%, var(--line));
+  border-radius: 20px;
+  background: color-mix(in srgb, var(--notification) 7%, var(--surface));
+  box-shadow: 0 10px 24px rgba(1, 8, 20, 0.13);
+}
+
+.media-pipeline-card.is-failed,
+.media-pipeline-card.is-rejected,
+.media-pipeline-card.is-expired {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+}
+
+.media-pipeline-card.is-ready {
+  border-color: color-mix(in srgb, #36c98f 42%, var(--line));
+  background: color-mix(in srgb, #36c98f 7%, var(--surface));
+}
+
+.media-pipeline-heading {
+  display: flex;
+  min-width: 0;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.media-pipeline-heading > span,
+.voice-draft-panel > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.media-pipeline-heading strong,
+.voice-draft-panel strong {
+  font-size: calc(10px + 1px);
+}
+
+.media-pipeline-heading small,
+.voice-draft-panel small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: calc(9px + 1px);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-pipeline-heading b {
+  color: var(--accent-deep);
+  font-size: calc(10px + 1px);
+}
+
+.media-pipeline-progress {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--line) 82%, transparent);
+}
+
+.media-pipeline-progress > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--notification), var(--accent));
+  transition: width 0.22s ease;
+}
+
+.media-pipeline-card p,
+.media-delivery-gate {
+  margin: 0;
+  color: var(--muted-strong);
+  font-size: calc(9px + 1px);
+  line-height: 1.35;
+}
+
+.media-pipeline-card code {
+  width: fit-content;
+  padding: 3px 6px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--danger) 9%, var(--surface-muted));
+  color: var(--danger);
+  font-size: calc(8px + 1px);
+}
+
+.media-delivery-gate {
+  padding: 7px 8px;
+  border-radius: 11px;
+  background: color-mix(in srgb, #f2b84b 13%, transparent);
+}
+
+.media-pipeline-actions,
+.voice-draft-panel > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.media-pipeline-actions button,
+.voice-draft-panel button {
+  display: inline-flex;
+  min-height: 32px;
+  gap: 5px;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: white;
+  font-size: calc(9px + 1px);
+  font-weight: 720;
+}
+
+.media-pipeline-actions button:last-child,
+.voice-draft-panel .voice-draft-remove {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted-strong);
+}
+
+.media-pipeline-actions button:disabled,
+.voice-draft-panel button:disabled {
+  cursor: wait;
+  opacity: 0.5;
+}
+
+.voice-draft-panel audio {
+  width: 100%;
+  height: 34px;
+}
+
 .deleted-chat-readonly {
   display: flex;
   flex: 0 0 62px;
@@ -1670,6 +1807,11 @@ textarea:focus-visible {
 .composer-wrap > .attachment-menu-button {
   background: color-mix(in srgb, var(--notification) 18%, var(--surface));
   color: #78b9ff;
+}
+
+.composer-wrap > .attachment-menu-button:disabled {
+  cursor: wait;
+  opacity: 0.45;
 }
 
 .composer-wrap > .media-composer-button:not(.attachment-menu-button) {
@@ -1789,6 +1931,17 @@ textarea:focus-visible {
   margin-left: auto;
   color: var(--muted);
   font-size: calc(9px + 1px);
+}
+
+.recording-panel button {
+  display: grid;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+  color: var(--danger);
 }
 
 @keyframes record-pulse {
