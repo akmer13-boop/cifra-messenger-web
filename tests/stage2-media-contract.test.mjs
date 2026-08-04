@@ -19,7 +19,8 @@ const recorderUrl = new URL(
 test("wires the exact PR 18 media endpoints and binary part headers", async () => {
   const api = await readFile(apiUrl, "utf8");
   assert.match(api, /"\/api\/v1\/capabilities"/);
-  assert.match(api, /\/api\/v1\/devices\/\$\{encodeURIComponent\(this\.currentDeviceId\)\}\/crypto-keys/);
+  assert.match(api, /\/api\/v1\/devices\/\$\{encodeURIComponent\(deviceId\)\}\/crypto-keys/);
+  assert.match(api, /"\/api\/v1\/devices"/);
   assert.match(api, /\/api\/v1\/chats\/\$\{encodeURIComponent\(topicId\)\}\/crypto-context/);
   assert.match(api, /"\/api\/v1\/media\/uploads"/);
   assert.match(api, /\/parts\/\$\{partNumber\}/);
@@ -85,7 +86,7 @@ test("encrypts chunked AES-GCM in a worker and acknowledges storage before conti
   assert.match(worker, /ciphertext/);
 });
 
-test("records real voice and keeps A-to-B publication hard-blocked", async () => {
+test("records real voice and prepares a signed envelope while UI publication stays blocked", async () => {
   const [page, coordinator] = await Promise.all([
     readFile(pageUrl, "utf8"),
     readFile(coordinatorUrl, "utf8"),
@@ -96,8 +97,10 @@ test("records real voice and keeps A-to-B publication hard-blocked", async () =>
   assert.doesNotMatch(page, /<strong>0:07<\/strong>/);
   assert.match(page, /await coordinator\.start\(voiceDraft\.file, "voice"/);
   assert.match(coordinator, /deliveryBlocked: true/);
-  assert.match(coordinator, /Тестовая encrypted-загрузка готова/);
-  assert.doesNotMatch(coordinator, /publishText|publishMessage|onSend/);
+  assert.match(coordinator, /prepareMediaEnvelope/);
+  assert.match(coordinator, /publishMessageEnvelope/);
+  assert.match(coordinator, /MEDIA_DELIVERY_UNKNOWN/);
+  assert.doesNotMatch(page, /publishPrepared\(/);
 });
 
 test("stops a late microphone grant after cancellation or disposal", async () => {
