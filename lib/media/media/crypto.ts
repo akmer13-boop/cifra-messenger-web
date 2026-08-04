@@ -7,7 +7,7 @@ export interface EncryptedMediaChunk {
 type PendingRequest =
   | {
       kind: "digest";
-      resolve: (checksum: string) => void;
+      resolve: (checksum: string) => void; 
       reject: (error: Error) => void;
     }
   | {
