@@ -35,12 +35,14 @@ import {
   Play,
   Plus,
   Reply,
+  RotateCcw,
   Search,
   Send,
   Settings2,
   ShieldCheck,
   Signal,
   Smile,
+  Square,
   SquarePen,
   Trash2,
   UserRound,
@@ -147,6 +149,16 @@ import {
   normalizeSafeAvatarUrl,
   validateAvatarFile,
 } from "./avatar-policy.mjs";
+import {
+  EMPTY_MEDIA_PIPELINE_SNAPSHOT,
+  MediaUploadCoordinator,
+  type MediaPipelineSnapshot,
+} from "../lib/media/media-upload-coordinator";
+import {
+  MediaRecorderAdapter,
+  type RecordedVoice,
+} from "../lib/media/media-recorder-adapter";
+import type { MediaKind } from "../lib/media/contracts";
 
 import {
   clampSwipeOffset,
@@ -2701,12 +2713,59 @@ function ChatsView({
   );
 }
 
+function resolveSelectedMediaKind(file: File): MediaKind {
+  const mimeType = file.type.toLowerCase();
+  if (mimeType.startsWith("image/")) return "image";
+  if (mimeType.startsWith("video/")) return "video";
+  return "document";
+}
+
+function voiceFileExtension(mimeType: string): string {
+  const base = mimeType.split(";", 1)[0]?.toLowerCase();
+  if (base === "audio/ogg") return "ogg";
+  if (base === "audio/mp4") return "m4a";
+  if (base === "audio/mpeg") return "mp3";
+  return "webm";
+}
+
+function formatMediaDuration(durationMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(durationMs / 1_000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function mediaPhaseLabel(phase: MediaPipelineSnapshot["phase"]): string {
+  const labels: Record<MediaPipelineSnapshot["phase"], string> = {
+    idle: "Media",
+    analyzing: "Проверка файла",
+    creating: "Создание upload",
+    encrypting: "Шифрование",
+    uploading: "Защищённая загрузка",
+    completing: "Завершение upload",
+    processing: "Обработка backend",
+    ready: "Media готово",
+    rejected: "Media отклонено",
+    failed: "Ошибка media",
+    expired: "Upload истёк",
+    cancelled: "Операция отменена",
+  };
+  return labels[phase];
+}
+
+function mediaActionError(error: unknown): string {
+  return error instanceof Error && error.message
+    ? error.message
+    : "Не удалось выполнить media-операцию";
+}
+
 function ChatView({
   chat,
   chats,
   users,
   role,
   runtimeMode,
+  apiClient,
   messages,
   onBack,
   onSend,
@@ -2726,6 +2785,7 @@ function ChatView({
   users: MessengerUser[];
   role: UserRole;
   runtimeMode: RuntimeMode;
+  apiClient: CifraApiClient | null;
   messages: Message[];
   onBack: () => void;
   onSend: (
@@ -2767,6 +2827,15 @@ function ChatView({
   } | null>(null);
   const [activePanel, setActivePanel] = useState<ChatPanel>(null);
   const [recording, setRecording] = useState(false);
+  const [recordingElapsedMs, setRecordingElapsedMs] = useState(0);
+  const [voiceDraft, setVoiceDraft] = useState<{
+    file: File;
+    url: string;
+    durationMs: number;
+  } | null>(null);
+  const [mediaSnapshot, setMediaSnapshot] = useState<MediaPipelineSnapshot>(
+    EMPTY_MEDIA_PIPELINE_SNAPSHOT,
+  );
   const [joinApproval, setJoinApproval] = useState(false);
   const [emojiCategory, setEmojiCategory] =
     useState<EmojiCategory>("Недавние");
@@ -2798,6 +2867,10 @@ function ChatView({
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const longPressTimerRef = useRef<number | null>(null);
   const actionNoticeTimerRef = useRef<number | null>(null);
+  const recordingTimerRef = useRef<number | null>(null);
+  const recorderRef = useRef<MediaRecorderAdapter | null>(null);
+  const voiceDraftUrlRef = useRef<string | null>(null);
+  const mediaCoordinatorRef = useRef<MediaUploadCoordinator | null>(null);
   const messageGestureRef = useRef<{
     id: number;
     pointerId: number;
@@ -2809,6 +2882,14 @@ function ChatView({
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
   const cameraInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const mediaPipelineBusy = [
+    "analyzing",
+    "creating",
+    "encrypting",
+    "uploading",
+    "completing",
+    "processing",
+  ].includes(mediaSnapshot.phase);
   const profileUser = users.find((user) => user.id === chat.id);
   const conversationParticipantIds = Array.from(
     new Set([
@@ -2859,9 +2940,45 @@ function ChatView({
       if (actionNoticeTimerRef.current !== null) {
         window.clearTimeout(actionNoticeTimerRef.current);
       }
+      if (recordingTimerRef.current !== null) {
+        window.clearInterval(recordingTimerRef.current);
+      }
+      const recorder = recorderRef.current;
+      recorderRef.current = null;
+      recorder?.dispose();
+      if (voiceDraftUrlRef.current) {
+        URL.revokeObjectURL(voiceDraftUrlRef.current);
+      }
     },
     [],
   );
+
+  useEffect(() => {
+    if (runtimeMode !== "backend" || !apiClient) return;
+    const coordinator = new MediaUploadCoordinator(
+      apiClient,
+      chat.id,
+      setMediaSnapshot,
+    );
+    mediaCoordinatorRef.current = coordinator;
+    void coordinator.loadPending().catch((error: unknown) => {
+      if (mediaCoordinatorRef.current !== coordinator) return;
+      const message = mediaActionError(error);
+      setMediaSnapshot({
+        ...EMPTY_MEDIA_PIPELINE_SNAPSHOT,
+        phase: "failed",
+        detail: message,
+        errorCode: "MEDIA_RESUME_FAILED",
+        errorMessage: message,
+      });
+    });
+    return () => {
+      coordinator.dispose();
+      if (mediaCoordinatorRef.current === coordinator) {
+        mediaCoordinatorRef.current = null;
+      }
+    };
+  }, [apiClient, chat.id, runtimeMode]);
 
   const latestMessageId = messages.at(-1)?.id ?? null;
 
@@ -3148,33 +3265,133 @@ function ChatView({
     }
   };
 
+  const clearRecordingTimer = () => {
+    if (recordingTimerRef.current !== null) {
+      window.clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  };
+
+  const clearVoiceDraft = () => {
+    if (voiceDraftUrlRef.current) {
+      URL.revokeObjectURL(voiceDraftUrlRef.current);
+      voiceDraftUrlRef.current = null;
+    }
+    setVoiceDraft(null);
+  };
+
+  const acceptVoiceRecording = (recordedVoice: RecordedVoice) => {
+    clearRecordingTimer();
+    setRecording(false);
+    setRecordingElapsedMs(recordedVoice.durationMs);
+    recorderRef.current = null;
+    if (!recordedVoice.blob.size) {
+      showActionNotice("Браузер создал пустую запись. Попробуйте ещё раз.");
+      return;
+    }
+    clearVoiceDraft();
+    const extension = voiceFileExtension(recordedVoice.mimeType);
+    const file = new File(
+      [recordedVoice.blob],
+      `voice-${new Date().toISOString().replace(/[:.]/g, "-")}.${extension}`,
+      { type: recordedVoice.mimeType },
+    );
+    const url = URL.createObjectURL(file);
+    voiceDraftUrlRef.current = url;
+    setVoiceDraft({ file, url, durationMs: recordedVoice.durationMs });
+    showActionNotice("Голосовое записано: прослушайте и загрузите");
+  };
+
+  const cancelVoiceRecording = () => {
+    recorderRef.current?.cancel();
+    recorderRef.current = null;
+    clearRecordingTimer();
+    setRecording(false);
+    setRecordingElapsedMs(0);
+  };
+
   const handleVoice = async () => {
-    if (runtimeMode === "backend") {
-      setRecording(false);
-      showActionNotice(
-        "Голосовые будут доступны после подключения защищённого media pipeline.",
-      );
+    if (runtimeMode !== "backend") {
+      showActionNotice("В demo-режиме голосовые не отправляются");
       return;
     }
     if (recording) {
-      const result = await onSend("", {
-        voice: "0:07",
-        replyToId: replyingToMessage?.id,
-        replyToText: replyingToMessage
-          ? getMessageSnippet(replyingToMessage)
-          : undefined,
-        replyToAuthor: replyingToMessage
-          ? getMessageAuthorLabel(replyingToMessage)
-          : undefined,
-        replyToAuthorId: replyingToMessage?.authorId,
-      });
-      if (result === "sent") {
-        setRecording(false);
-        setReplyingToMessageId(null);
+      const recorder = recorderRef.current;
+      if (!recorder) {
+        cancelVoiceRecording();
+        return;
+      }
+      try {
+        acceptVoiceRecording(await recorder.stop());
+      } catch (error) {
+        cancelVoiceRecording();
+        showActionNotice(mediaActionError(error));
       }
       return;
     }
-    setRecording(true);
+    if (mediaPipelineBusy) {
+      showActionNotice("Дождитесь завершения текущей media-операции");
+      return;
+    }
+    const coordinator = mediaCoordinatorRef.current;
+    if (!coordinator || !apiClient) {
+      showActionNotice("Backend media API ещё не готов");
+      return;
+    }
+
+    const recorder = new MediaRecorderAdapter();
+    recorderRef.current = recorder;
+    try {
+      const capabilities = await coordinator.getCapabilities(true);
+      if (recorderRef.current !== recorder) {
+        recorder.dispose();
+        return;
+      }
+      if (!capabilities.media.enabled || !capabilities.media.voice.enabled) {
+        throw new Error("Backend voice pipeline пока выключен");
+      }
+      await recorder.start({
+        preferredMimeTypes: capabilities.media.voice.preferredMimeTypes,
+        maxDurationSeconds: capabilities.media.voice.maxDurationSeconds,
+        onAutoStop: acceptVoiceRecording,
+        onError: (error) => {
+          recorderRef.current = null;
+          clearRecordingTimer();
+          setRecording(false);
+          showActionNotice(error.message);
+        },
+      });
+      if (recorderRef.current !== recorder) {
+        recorder.dispose();
+        return;
+      }
+      setRecordingElapsedMs(0);
+      setRecording(true);
+      clearRecordingTimer();
+      recordingTimerRef.current = window.setInterval(() => {
+        setRecordingElapsedMs((current) => current + 250);
+      }, 250);
+    } catch (error) {
+      recorder.dispose();
+      if (recorderRef.current === recorder) recorderRef.current = null;
+      clearRecordingTimer();
+      setRecording(false);
+      showActionNotice(mediaActionError(error));
+    }
+  };
+
+  const uploadVoiceDraft = async () => {
+    const coordinator = mediaCoordinatorRef.current;
+    if (!coordinator || !voiceDraft || mediaPipelineBusy) return;
+    try {
+      await coordinator.start(voiceDraft.file, "voice", {
+        durationMs: voiceDraft.durationMs,
+      });
+      const result = coordinator.currentSnapshot;
+      if (result.phase !== "failed" || result.canRetry) clearVoiceDraft();
+    } catch (error) {
+      showActionNotice(mediaActionError(error));
+    }
   };
 
   const handleAttachment = async (
@@ -3185,9 +3402,26 @@ function ChatView({
     if (!selectedFiles.length) return;
     if (runtimeMode === "backend") {
       event.currentTarget.value = "";
-      showActionNotice(
-        "Вложения будут доступны после подключения защищённого media pipeline.",
-      );
+      const coordinator = mediaCoordinatorRef.current;
+      if (!coordinator) {
+        showActionNotice("Backend media API ещё не готов");
+        return;
+      }
+      if (mediaPipelineBusy) {
+        showActionNotice("Дождитесь завершения текущей media-операции");
+        return;
+      }
+      if (selectedFiles.length > 1) {
+        showActionNotice("На этом этапе загружается только первый выбранный файл");
+      }
+      try {
+        await coordinator.start(
+          selectedFiles[0],
+          resolveSelectedMediaKind(selectedFiles[0]),
+        );
+      } catch (error) {
+        showActionNotice(mediaActionError(error));
+      }
       return;
     }
 
@@ -3537,6 +3771,105 @@ function ChatView({
         </div>
       ) : (
       <>
+        {runtimeMode === "backend" && mediaSnapshot.phase !== "idle" ? (
+          <div
+            className={`media-pipeline-card is-${mediaSnapshot.phase}`}
+            role={
+              ["failed", "rejected", "expired"].includes(mediaSnapshot.phase)
+                ? "alert"
+                : "status"
+            }
+          >
+            <div className="media-pipeline-heading">
+              <span>
+                <strong>{mediaPhaseLabel(mediaSnapshot.phase)}</strong>
+                <small title={mediaSnapshot.fileName}>
+                  {mediaSnapshot.fileName || "Media operation"}
+                </small>
+              </span>
+              <b>{Math.round(mediaSnapshot.progress)}%</b>
+            </div>
+            <div
+              className="media-pipeline-progress"
+              role="progressbar"
+              aria-label="Прогресс защищённой загрузки"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(mediaSnapshot.progress)}
+            >
+              <i style={{ width: `${mediaSnapshot.progress}%` }} />
+            </div>
+            <p>{mediaSnapshot.detail}</p>
+            {mediaSnapshot.errorCode ? (
+              <code>{mediaSnapshot.errorCode}</code>
+            ) : null}
+            {mediaSnapshot.deliveryBlocked ? (
+              <small className="media-delivery-gate">
+                Файл не опубликован в чате и не показан получателю. После
+                финального crypto-контракта выберите или запишите его заново.
+              </small>
+            ) : null}
+            <div className="media-pipeline-actions">
+              {mediaSnapshot.canRetry ? (
+                <button
+                  type="button"
+                  onClick={() => void mediaCoordinatorRef.current?.retry()}
+                >
+                  <RotateCcw size={15} />
+                  Повторить / продолжить
+                </button>
+              ) : null}
+              {mediaSnapshot.canCancel ? (
+                <button
+                  type="button"
+                  onClick={() => void mediaCoordinatorRef.current?.cancel()}
+                >
+                  <X size={15} />
+                  Отменить
+                </button>
+              ) : null}
+              {!mediaPipelineBusy && !mediaSnapshot.canRetry ? (
+                <button
+                  type="button"
+                  onClick={() => void mediaCoordinatorRef.current?.dismiss()}
+                >
+                  {mediaSnapshot.phase === "failed"
+                    ? "Удалить локальные данные"
+                    : "Скрыть"}
+                </button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+        {voiceDraft ? (
+          <div className="voice-draft-panel" role="status">
+            <span>
+              <strong>Голосовое готово к защищённой загрузке</strong>
+              <small>{formatMediaDuration(voiceDraft.durationMs)}</small>
+            </span>
+            <audio controls preload="metadata" src={voiceDraft.url}>
+              Ваш браузер не поддерживает воспроизведение аудио.
+            </audio>
+            <div>
+              <button
+                type="button"
+                className="voice-draft-remove"
+                disabled={mediaPipelineBusy}
+                onClick={clearVoiceDraft}
+              >
+                Удалить
+              </button>
+              <button
+                type="button"
+                disabled={mediaPipelineBusy}
+                onClick={() => void uploadVoiceDraft()}
+              >
+                <Send size={15} />
+                Загрузить
+              </button>
+            </div>
+          </div>
+        ) : null}
         {replyingToMessage ? (
           <div className="reply-selection" role="status">
             <i />
@@ -3581,14 +3914,22 @@ function ChatView({
         {recording ? (
           <div className="recording-panel">
             <i />
-            <strong>0:07</strong>
-            <span>Нажмите, чтобы отправить</span>
+            <strong>{formatMediaDuration(recordingElapsedMs)}</strong>
+            <span>Квадрат — завершить</span>
+            <button
+              type="button"
+              aria-label="Отменить запись голосового"
+              onClick={cancelVoiceRecording}
+            >
+              <X size={16} />
+            </button>
           </div>
         ) : (
           <>
             <button
               type="button"
               className="media-composer-button attachment-menu-button"
+              disabled={mediaPipelineBusy}
               aria-label="Добавить вложение"
               aria-expanded={activePanel === "attachments"}
               onClick={(event) =>
@@ -3629,11 +3970,29 @@ function ChatView({
         <button
           type="button"
           className="send-button"
-          disabled={sendPending}
-          aria-label={draft ? "Отправить" : recording ? "Завершить запись" : "Записать голосовое"}
-          onClick={() => void (draft ? submitMessage() : handleVoice())}
+          disabled={sendPending || (!draft && !recording && mediaPipelineBusy)}
+          aria-label={
+            recording
+              ? "Завершить запись"
+              : draft
+                ? "Отправить"
+                : "Записать голосовое"
+          }
+          onClick={() =>
+            void (recording
+              ? handleVoice()
+              : draft
+                ? submitMessage()
+                : handleVoice())
+          }
         >
-          {draft ? <Send size={19} /> : <Mic size={20} />}
+          {recording ? (
+            <Square size={16} fill="currentColor" />
+          ) : draft ? (
+            <Send size={19} />
+          ) : (
+            <Mic size={20} />
+          )}
         </button>
         </div>
         {sendError ? (
@@ -6689,6 +7048,8 @@ export default function Home() {
     null,
   );
   const apiClientRef = useRef<CifraApiClient | null>(null);
+  const [activeApiClient, setActiveApiClient] =
+    useState<CifraApiClient | null>(null);
   const realtimeClientRef = useRef<CifraRealtimeClient | null>(null);
   const realtimeUiTopicRef = useRef<string | null>(null);
   const realtimeUiTopicsRef = useRef<Set<string>>(new Set());
@@ -6853,6 +7214,7 @@ export default function Home() {
         if (cancelled) return;
         const client = new CifraApiClient(config);
         apiClientRef.current = client;
+        setActiveApiClient(client);
         configureAvatarAllowedOrigins(config.avatarAllowedOrigins);
         applyRuntimeMode(config.mode);
         const restored = await client.restoreSession();
@@ -7959,6 +8321,7 @@ export default function Home() {
     const config = await loadRuntimeConfig();
     const client = new CifraApiClient(config);
     apiClientRef.current = client;
+    setActiveApiClient(client);
     configureAvatarAllowedOrigins(config.avatarAllowedOrigins);
     applyRuntimeMode(config.mode);
     return client;
@@ -8776,6 +9139,11 @@ export default function Home() {
                             users={users}
                             role={role}
                             runtimeMode={authMode}
+                            apiClient={
+                              authMode === "backend"
+                                ? activeApiClient
+                                : null
+                            }
                             messages={selectedMessages}
                             onBack={() => setSelectedChatId(null)}
                             onSend={(text, options) =>
