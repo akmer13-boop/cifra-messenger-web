@@ -1,5 +1,6 @@
 import { primaryRole, wireRole } from "./auth-policy.mjs";
 import { collectDirectoryPages } from "./directory-pagination-policy.mjs";
+import { classifySessionInvalidation } from "./session-recovery-policy.mjs";
 import {
   parseCapabilitiesResponse,
   parseBackendDevices,
@@ -55,6 +56,15 @@ export interface AuthSession {
   context: AuthContext;
   role: UserRole;
 }
+
+export type SessionInvalidationReason =
+  | "expired"
+  | "revoked"
+  | "account_unavailable";
+
+type SessionInvalidationListener = (
+  reason: SessionInvalidationReason,
+) => void;
 
 export interface MfaChallenge {
   kind: "mfa_required";
@@ -286,6 +296,8 @@ export function loadRuntimeConfig(): Promise<RuntimeConfig> {
 export class CifraApiClient {
   private session: AuthSession | null = null;
   private refreshInFlight: Promise<AuthSession> | null = null;
+  private readonly sessionInvalidationListeners =
+    new Set<SessionInvalidationListener>();
 
   constructor(readonly config: RuntimeConfig) {
     purgeLegacyStoredSession();
@@ -301,6 +313,13 @@ export class CifraApiClient {
 
   get currentSession(): AuthSession | null {
     return this.session;
+  }
+
+  onSessionInvalidated(listener: SessionInvalidationListener): () => void {
+    this.sessionInvalidationListeners.add(listener);
+    return () => {
+      this.sessionInvalidationListeners.delete(listener);
+    };
   }
 
   async login(login: string, password: string): Promise<LoginOutcome> {
@@ -419,13 +438,17 @@ export class CifraApiClient {
     }
   }
 
-  async listUsers(query = "", cursor: string | null = null): Promise<UserPage> {
+  async listUsers(
+    query = "",
+    cursor: string | null = null,
+    signal?: AbortSignal,
+  ): Promise<UserPage> {
     const params = new URLSearchParams({ limit: "100" });
     if (query.trim()) params.set("query", query.trim());
     if (cursor) params.set("cursor", cursor);
     return this.request<UserPage>(
       `/api/v1/users?${params.toString()}`,
-      {},
+      { signal },
       parseUserPage,
     );
   }
@@ -701,8 +724,14 @@ export class CifraApiClient {
         this.session?.tokens.refresh_token
       ) {
         await this.refresh();
-        return this.authorizedFetchBinary(path, init);
+        try {
+          return await this.authorizedFetchBinary(path, init);
+        } catch (retryError) {
+          this.invalidateIfTerminal(retryError, "after_refresh");
+          throw retryError;
+        }
       }
+      this.invalidateIfTerminal(error, "authorized");
       throw error;
     }
   }
@@ -722,8 +751,14 @@ export class CifraApiClient {
         this.session?.tokens.refresh_token
       ) {
         await this.refresh();
-        return this.authorizedFetch<T>(path, init, parseJson);
+        try {
+          return await this.authorizedFetch<T>(path, init, parseJson);
+        } catch (retryError) {
+          this.invalidateIfTerminal(retryError, "after_refresh");
+          throw retryError;
+        }
       }
+      this.invalidateIfTerminal(error, "authorized");
       throw error;
     }
   }
@@ -769,9 +804,15 @@ export class CifraApiClient {
       },
       parseAuthTokens,
     )
-      .then((tokens) => this.acceptTokens(current.login, tokens))
+      .then((tokens) => {
+        // Adopt the rotated pair before refreshing the context. If that
+        // follow-up request hits a transient network error, retrying with the
+        // already-consumed previous refresh token would revoke the family.
+        this.setSession({ ...current, tokens });
+        return this.acceptTokens(current.login, tokens);
+      })
       .catch((error: unknown) => {
-        this.clearSession();
+        this.invalidateIfTerminal(error, "refresh");
         throw error;
       })
       .finally(() => {
@@ -886,6 +927,15 @@ export class CifraApiClient {
     parseJson: JsonParser<T>,
   ): Promise<T> {
     const controller = new AbortController();
+    const externalSignal = init.signal;
+    const abortFromCaller = () => controller.abort();
+    if (externalSignal?.aborted) {
+      controller.abort();
+    } else {
+      externalSignal?.addEventListener("abort", abortFromCaller, {
+        once: true,
+      });
+    }
     const timeout = window.setTimeout(
       () => controller.abort(),
       this.config.requestTimeoutMs,
@@ -928,6 +978,13 @@ export class CifraApiClient {
     } catch (error) {
       if (error instanceof CifraApiError) throw error;
       if (error instanceof DOMException && error.name === "AbortError") {
+        if (externalSignal?.aborted) {
+          throw new CifraApiError(
+            "Запрос отменён",
+            0,
+            "REQUEST_CANCELLED",
+          );
+        }
         throw new CifraApiError(
           "Сервер не ответил вовремя",
           0,
@@ -945,6 +1002,7 @@ export class CifraApiClient {
       );
     } finally {
       window.clearTimeout(timeout);
+      externalSignal?.removeEventListener("abort", abortFromCaller);
     }
   }
 
@@ -954,6 +1012,23 @@ export class CifraApiClient {
 
   private clearSession(): void {
     this.session = null;
+  }
+
+  private invalidateIfTerminal(
+    error: unknown,
+    source: "authorized" | "refresh" | "after_refresh",
+  ): void {
+    if (!(error instanceof CifraApiError)) return;
+    const reason = classifySessionInvalidation(error, source);
+    if (!reason || !this.session) return;
+    this.clearSession();
+    for (const listener of this.sessionInvalidationListeners) {
+      try {
+        listener(reason);
+      } catch {
+        // A UI observer must never mask the original authenticated request.
+      }
+    }
   }
 }
 

@@ -24,7 +24,7 @@ test("keeps reply context until accepted and publishes a real quoted reply", asy
 test("creates backend groups asynchronously and shows creation errors", async () => {
   const page = await readFile(pageUrl, "utf8");
   assert.match(page, /const createGroup = async \(/);
-  assert.match(page, /resolveRealtimeMemberIds\(users, memberIds\)/);
+  assert.match(page, /resolveRealtimeMemberIds\([\s\S]*?mergeDirectoryPage\(users,[\s\S]*?memberIds/);
   assert.match(page, /realtimeClient\.createGroup\(name, members\.resolved\)/);
   assert.match(page, /className="group-creation-error"/);
 });

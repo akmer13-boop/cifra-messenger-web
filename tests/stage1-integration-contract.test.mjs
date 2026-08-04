@@ -5,16 +5,16 @@ import test from "node:test";
 const pageUrl = new URL("../app/page.tsx", import.meta.url);
 const apiUrl = new URL("../app/cifra-api.ts", import.meta.url);
 
-test("loads every directory page and never assigns the first employee as self", async () => {
+test("loads the directory lazily and never assigns the first employee as self", async () => {
   const [page, api] = await Promise.all([
     readFile(pageUrl, "utf8"),
     readFile(apiUrl, "utf8"),
   ]);
 
-  assert.match(api, /async listUsers\(query = "", cursor: string \| null = null\)/);
   assert.match(api, /if \(cursor\) params\.set\("cursor", cursor\)/);
-  assert.match(api, /async listAllUsers\(query = ""\)/);
-  assert.match(page, /await client\.listAllUsers\(\)/);
+  assert.match(api, /async listUsers\(/);
+  assert.match(page, /await client\.listUsers\("", null, controller\.signal\)/);
+  assert.match(page, /setDirectoryNextCursor\(merged\.next_cursor\)/);
   assert.match(page, /authSessionToMessenger\(session\), \.\.\.directoryUsers/);
   assert.doesNotMatch(page, /\?\? users\[0\]/);
 });

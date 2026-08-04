@@ -52,7 +52,8 @@ test("uses the exact supplied gateway authentication contract", async () => {
   assert.match(api, /challenge_token: challengeToken/);
   assert.match(api, /refresh_token: current\.tokens\.refresh_token/);
   assert.match(api, /REFRESHABLE_ACCESS_ERRORS\.has\(error\.code\)/);
-  assert.match(api, /\.catch\(\(error: unknown\) => \{\s*this\.clearSession\(\)/);
+  assert.match(api, /this\.invalidateIfTerminal\(error, "refresh"\)/);
+  assert.match(api, /this\.setSession\(\{ \.\.\.current, tokens \}\)/);
   assert.match(api, /platform: "web"/);
   assert.match(api, /"Idempotency-Key": crypto\.randomUUID\(\)/);
   assert.match(api, /"If-Match": String\(version\)/);

@@ -163,6 +163,15 @@ export interface RealtimeChatSubscribeOptions {
   readonly historyLimit?: number;
 }
 
+export interface RealtimeHistoryPageResult {
+  readonly topic: string;
+  readonly before: number;
+  readonly receivedCount: number;
+  readonly addedCount: number;
+  readonly oldestSeq: number | null;
+  readonly hasMore: boolean;
+}
+
 export interface RealtimePublishTextResult {
   readonly topic: string;
   readonly seq: number;
@@ -288,6 +297,11 @@ export class CifraRealtimeClient {
   private duplicateMessageCount = 0;
   private lastError: string | undefined;
   private directorySearchQueue: Promise<void> = Promise.resolve();
+  private historyLoadPromises = new Map<
+    string,
+    Promise<RealtimeHistoryPageResult>
+  >();
+  private exhaustedHistoryTopics = new Set<string>();
 
   constructor(
     private readonly onStatus: RealtimeStatusListener = () => undefined,
@@ -468,6 +482,62 @@ export class CifraRealtimeClient {
       () => undefined,
     );
     return search;
+  }
+
+  async loadOlderMessages(
+    topic: string,
+    historyLimit = 50,
+  ): Promise<RealtimeHistoryPageResult> {
+    if (!isChatTopicName(topic)) {
+      throw new CifraRealtimeError("tinode_chat_topic_invalid");
+    }
+    const subscription = this.chatSubscriptions.get(topic);
+    if (!subscription) {
+      throw new CifraRealtimeError("tinode_chat_topic_unknown");
+    }
+    if (subscription.access?.mode && !subscription.access.mode.includes("R")) {
+      throw new CifraRealtimeError("tinode_chat_read_access_denied");
+    }
+    const socket = this.socket;
+    if (!this.isConnected() || !socket || socket.readyState !== WebSocket.OPEN) {
+      throw new CifraRealtimeError("realtime_not_connected");
+    }
+    if (!this.subscribedTopics.has(topic)) {
+      throw new CifraRealtimeError("tinode_chat_not_subscribed");
+    }
+
+    const pending = this.historyLoadPromises.get(topic);
+    if (pending) return pending;
+
+    const messages = this.getChatMessages(topic);
+    const query = buildTinodeOlderHistoryQuery(
+      topic,
+      historyLimit,
+      messages,
+      subscription.seq,
+    );
+    if (!query || this.exhaustedHistoryTopics.has(topic)) {
+      return {
+        topic,
+        before: query?.before ?? 1,
+        receivedCount: 0,
+        addedCount: 0,
+        oldestSeq: getOldestTopicSeq(messages, topic),
+        hasMore: false,
+      };
+    }
+
+    const request = this.loadOlderMessagesInternal(
+      socket,
+      topic,
+      query,
+    ).finally(() => {
+      if (this.historyLoadPromises.get(topic) === request) {
+        this.historyLoadPromises.delete(topic);
+      }
+    });
+    this.historyLoadPromises.set(topic, request);
+    return request;
   }
 
   async openDirectConversation(
@@ -1460,6 +1530,74 @@ export class CifraRealtimeClient {
     }
   }
 
+  private async loadOlderMessagesInternal(
+    socket: WebSocket,
+    topic: string,
+    query: { readonly before: number; readonly limit: number },
+  ): Promise<RealtimeHistoryPageResult> {
+    const requestId = createPacketId("get-history");
+    const existingKeys = new Set(
+      this.getChatMessages(topic).map(
+        (message) => `${message.topic}:${message.seq}`,
+      ),
+    );
+    const pagePromise = waitForHistoryPage(
+      socket,
+      requestId,
+      topic,
+      query.before,
+    );
+
+    socket.send(
+      JSON.stringify({
+        get: {
+          id: requestId,
+          topic,
+          what: "data",
+          data: query,
+        },
+      }),
+    );
+
+    const page = await pagePromise;
+    if (this.socket !== socket) {
+      throw new CifraRealtimeError("realtime_connection_cancelled");
+    }
+    if (page.control.code < 200 || page.control.code >= 300) {
+      throw new CifraRealtimeError("tinode_history_page_rejected");
+    }
+
+    const receivedKeys = new Set(
+      page.messages.map((message) => `${message.topic}:${message.seq}`),
+    );
+    const addedCount = Array.from(receivedKeys).filter(
+      (key) => !existingKeys.has(key),
+    ).length;
+    if (page.messages.length > 0 && addedCount === 0) {
+      throw new CifraRealtimeError("tinode_history_page_repeated");
+    }
+
+    const oldestSeq = getOldestTopicSeq(this.getChatMessages(topic), topic);
+    if (addedCount > 0 && (oldestSeq === null || oldestSeq >= query.before)) {
+      throw new CifraRealtimeError("tinode_history_page_invalid");
+    }
+
+    const hasMore =
+      page.messages.length === query.limit &&
+      oldestSeq !== null &&
+      oldestSeq > 1;
+    if (!hasMore) this.exhaustedHistoryTopics.add(topic);
+
+    return {
+      topic,
+      before: query.before,
+      receivedCount: page.messages.length,
+      addedCount,
+      oldestSeq,
+      hasMore,
+    };
+  }
+
   private async subscribeToChatInternal(
     socket: WebSocket,
     topic: string,
@@ -1578,6 +1716,8 @@ export class CifraRealtimeClient {
   }
 
   private clearChatMessages(): void {
+    this.historyLoadPromises.clear();
+    this.exhaustedHistoryTopics.clear();
     if (this.chatMessages.size === 0) {
       return;
     }
@@ -1969,6 +2109,68 @@ function waitForControl(
       );
     };
 
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.removeEventListener("message", onMessage);
+      socket.removeEventListener("error", onError);
+      socket.removeEventListener("close", onClose);
+    };
+
+    socket.addEventListener("message", onMessage);
+    socket.addEventListener("error", onError);
+    socket.addEventListener("close", onClose);
+  });
+}
+
+function waitForHistoryPage(
+  socket: WebSocket,
+  expectedId: string,
+  expectedTopic: string,
+  before: number,
+): Promise<{
+  control: TinodeControl;
+  messages: RealtimeChatMessage[];
+}> {
+  return new Promise((resolve, reject) => {
+    const messages = new Map<number, RealtimeChatMessage>();
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new CifraRealtimeError("tinode_history_page_timeout"));
+    }, REQUEST_TIMEOUT_MS);
+
+    const onMessage = (event: MessageEvent) => {
+      if (typeof event.data !== "string") return;
+      const message = parseTinodeChatMessage(event.data);
+      if (
+        message &&
+        message.topic === expectedTopic &&
+        message.seq < before
+      ) {
+        messages.set(message.seq, message);
+        return;
+      }
+
+      const control = parseTinodeControl(event.data);
+      if (!control || control.id !== expectedId) return;
+      cleanup();
+      resolve({
+        control,
+        messages: Array.from(messages.values()).sort(
+          (left, right) => left.seq - right.seq,
+        ),
+      });
+    };
+
+    const onError = () => {
+      cleanup();
+      reject(new CifraRealtimeError("websocket_failed"));
+    };
+    const onClose = () => {
+      cleanup();
+      reject(
+        new CifraRealtimeError("websocket_closed_before_history_page"),
+      );
+    };
     const cleanup = () => {
       clearTimeout(timer);
       socket.removeEventListener("message", onMessage);
@@ -2533,6 +2735,37 @@ export function buildTinodeHistoryQuery(
     since: latestLocalSeq + 1,
     limit: Math.min(100, Math.max(normalizedLimit, missingCount)),
   };
+}
+
+export function buildTinodeOlderHistoryQuery(
+  topic: string,
+  historyLimit: number,
+  messages: readonly RealtimeChatMessage[],
+  serverSeq?: number,
+): { readonly before: number; readonly limit: number } | null {
+  if (!isChatTopicName(topic)) {
+    throw new CifraRealtimeError("tinode_chat_topic_invalid");
+  }
+  const limit = normalizeHistoryLimit(historyLimit);
+  const oldestLocalSeq = getOldestTopicSeq(messages, topic);
+  const normalizedServerSeq = parseNonNegativeInteger(serverSeq) ?? 0;
+  const before = oldestLocalSeq ?? (normalizedServerSeq > 0
+    ? normalizedServerSeq + 1
+    : null);
+  if (before === null || before <= 1) return null;
+  return { before, limit };
+}
+
+function getOldestTopicSeq(
+  messages: readonly RealtimeChatMessage[],
+  topic: string,
+): number | null {
+  let oldest: number | null = null;
+  for (const message of messages) {
+    if (message.topic !== topic || !Number.isInteger(message.seq)) continue;
+    if (oldest === null || message.seq < oldest) oldest = message.seq;
+  }
+  return oldest;
 }
 
 function normalizeHistoryLimit(value: number | undefined): number {
