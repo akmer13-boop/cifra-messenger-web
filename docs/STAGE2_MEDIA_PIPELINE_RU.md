@@ -1,5 +1,7 @@
-[STAGE2_MEDIA_PIPELINE_RU.md](https://github.com/user-attachments/files/30692012/STAGE2_MEDIA_PIPELINE_RU.md)
+[STAGE2_MEDIA_PIPELINE_RU.md](https://github.com/user-attachments/files/30695300/STAGE2_MEDIA_PIPELINE_RU.md)
 # Stage 2: защищённая загрузка media и запись voice
+
+> Этот файл фиксирует результат Stage 2. Текущий Stage 3 crypto/receiver status и оставшиеся backend gates описаны в `docs/STAGE3_CRYPTO_MEDIA_RU.md`.
 
 Дата локальной сборки: 2026-08-03. Это безопасная промежуточная часть Stage 2. Изменения подготовлены локально: без операций в GitHub, без merge, без deploy и без изменения backend.
 
