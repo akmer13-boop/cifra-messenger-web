@@ -32,6 +32,103 @@ body {
   -webkit-text-size-adjust: 100%;
 }
 
+.runtime-recovery-shell {
+  display: grid;
+  min-height: 100dvh;
+  padding: 24px;
+  place-items: center;
+  background:
+    radial-gradient(circle at 18% 16%, rgba(45, 103, 166, 0.25), transparent 38%),
+    linear-gradient(145deg, #020814, #07162a 58%, #020711);
+}
+
+.runtime-recovery-card {
+  width: min(100%, 440px);
+  padding: 30px;
+  border: 1px solid color-mix(in srgb, var(--line) 82%, white 8%);
+  border-radius: 30px;
+  background: color-mix(in srgb, var(--surface-glass) 94%, transparent);
+  box-shadow: var(--shadow);
+  text-align: center;
+}
+
+.runtime-recovery-mark {
+  display: grid;
+  width: 54px;
+  height: 54px;
+  margin: 0 auto;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 50%;
+  background: linear-gradient(145deg, #285d95, #102f55);
+  color: white;
+  font-size: calc(25px + 1px);
+  font-weight: 800;
+}
+
+.runtime-recovery-kicker {
+  margin: 17px 0 10px;
+  color: var(--accent-deep);
+  font-size: calc(10px + 1px);
+  font-weight: 760;
+  letter-spacing: 0.15em;
+}
+
+.runtime-recovery-card h1 {
+  margin: 0;
+  font-size: calc(25px + 1px);
+  letter-spacing: -0.025em;
+}
+
+.runtime-recovery-card > p:not(.runtime-recovery-kicker, .runtime-recovery-digest) {
+  margin: 13px 0 0;
+  color: var(--muted-strong);
+  font-size: calc(12px + 1px);
+  line-height: 1.55;
+}
+
+.runtime-recovery-digest {
+  margin: 17px 0 0;
+  color: var(--muted);
+  font-size: calc(10px + 1px);
+}
+
+.runtime-recovery-digest code {
+  color: var(--muted-strong);
+}
+
+.runtime-recovery-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.runtime-recovery-actions button {
+  min-height: 48px;
+  padding: 0 14px;
+  border-radius: 16px;
+  background: var(--notification);
+  color: white;
+  font-size: calc(12px + 1px);
+  font-weight: 720;
+}
+
+.runtime-recovery-actions button:last-child {
+  background: var(--surface-muted);
+  color: var(--muted-strong);
+}
+
+@media (max-width: 420px) {
+  .runtime-recovery-card {
+    padding: 25px 20px;
+  }
+
+  .runtime-recovery-actions {
+    grid-template-columns: 1fr;
+  }
+}
+
 body {
   overflow-x: hidden;
   background: var(--page);
@@ -1275,6 +1372,44 @@ textarea:focus-visible {
 
 .message-canvas::-webkit-scrollbar {
   display: none;
+}
+
+.history-page-control {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  gap: 4px;
+  justify-items: center;
+  margin: 0 auto 8px;
+}
+
+.history-page-control button,
+.history-page-control > span {
+  display: inline-flex;
+  min-height: 30px;
+  gap: 6px;
+  align-items: center;
+  padding: 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  color: var(--accent-deep);
+  font-size: calc(9px + 1px);
+  font-weight: 720;
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+}
+
+.history-page-control button:disabled {
+  cursor: wait;
+  opacity: 0.68;
+}
+
+.history-page-control small {
+  max-width: 340px;
+  color: var(--muted);
+  font-size: calc(8px + 1px);
+  text-align: center;
 }
 
 .pattern {
@@ -4026,6 +4161,77 @@ textarea:focus-visible {
   color: var(--accent-deep);
 }
 
+.directory-virtual-viewport {
+  position: relative;
+  display: block;
+  min-height: 204px;
+  max-height: min(52vh, 520px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.directory-virtual-spacer {
+  position: relative;
+  width: 100%;
+}
+
+.directory-virtual-window {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+}
+
+.directory-virtual-row {
+  display: flex;
+  align-items: stretch;
+  padding: 3px 0;
+}
+
+.directory-virtual-row > .person-row {
+  min-height: 0;
+}
+
+.directory-load-more {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  margin-top: 7px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface-soft);
+  color: var(--accent-deep);
+  font-size: calc(11px + 1px);
+  font-weight: 750;
+}
+
+.directory-load-more:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.directory-inline-error {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, #ef4444 35%, var(--line));
+  border-radius: 15px;
+  background: color-mix(in srgb, #ef4444 8%, var(--surface));
+  color: var(--text);
+  font-size: calc(10px + 1px);
+}
+
+.directory-inline-error button {
+  color: var(--accent-deep);
+  font-weight: 750;
+}
+
 .call-link-card {
   display: grid;
   width: calc(100% - 30px);
@@ -5203,6 +5409,27 @@ textarea:focus-visible {
   text-align: left;
 }
 
+.auth-session-notice {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 9px;
+  align-items: start;
+  margin: -11px 0 18px;
+  padding: 11px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent-deep) 38%, var(--line));
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--accent-deep) 9%, var(--surface-muted));
+  color: var(--muted-strong);
+  font-size: calc(10px + 1px);
+  line-height: 1.4;
+  text-align: left;
+}
+
+.auth-session-notice svg {
+  margin-top: 1px;
+  color: var(--accent-deep);
+}
+
 .auth-submit {
   display: flex;
   min-height: 50px;
@@ -5920,6 +6147,45 @@ textarea:focus-visible {
 }
 
 .group-member-list > button.is-selected > i {
+  border-color: var(--notification);
+  background: var(--notification);
+}
+
+.compose-windowed-list {
+  min-height: 204px;
+  max-height: 420px;
+}
+
+.group-member-list .directory-virtual-row > button {
+  display: grid;
+  grid-template-columns: 53px 1fr 28px;
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  min-height: 0;
+  padding: 3px 4px;
+  background: transparent;
+  text-align: left;
+}
+
+.group-member-list .directory-virtual-row > button > span:nth-child(2) {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.group-member-list .directory-virtual-row > button > i {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: white;
+  font-style: normal;
+}
+
+.group-member-list .directory-virtual-row > button.is-selected > i {
   border-color: var(--notification);
   background: var(--notification);
 }
