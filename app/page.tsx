@@ -58,12 +58,14 @@ import {
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type ChangeEvent,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
 } from "react";
 import {
   getChatPreview,
@@ -90,8 +92,10 @@ import {
   type CorporateRole,
   type LoginOutcome,
   type RuntimeMode,
+  type SessionInvalidationReason,
   type UserRole,
 } from "./cifra-api";
+import { sessionInvalidationMessage } from "./session-recovery-policy.mjs";
 
 import {
   CifraRealtimeClient,
@@ -101,6 +105,7 @@ import {
   type RealtimeChatReceipt,
   type RealtimeChatSubscription,
   type RealtimeDiagnostics,
+  type RealtimeHistoryPageResult,
   type RealtimeStatus,
 } from "./cifra-realtime";
 import {
@@ -138,6 +143,12 @@ import {
   mergeRealtimeParticipantsIntoDirectory,
   resolveRealtimeMemberIds,
 } from "./contact-directory-policy.mjs";
+import {
+  calculateDirectoryWindow,
+  createDirectoryRequestEpoch,
+  mergeDirectoryPage,
+  normalizeDirectoryQuery,
+} from "./directory-release-policy.mjs";
 import {
   canUseLocalChatFallback,
   filterChatsForRuntimeMode,
@@ -180,6 +191,15 @@ type RealtimePublishStatus =
   | "published"
   | "error";
 type DirectoryStatus = "idle" | "loading" | "ready" | "empty" | "error";
+type DirectoryPage = {
+  items: MessengerUser[];
+  next_cursor: string | null;
+};
+type DirectoryPageLoader = (
+  query: string,
+  cursor: string | null,
+  signal: AbortSignal,
+) => Promise<DirectoryPage>;
 type RealtimeListStatus =
   | "ready"
   | "connecting"
@@ -187,6 +207,16 @@ type RealtimeListStatus =
   | "loading"
   | "empty"
   | "error";
+type RealtimeHistoryStatus =
+  | "idle"
+  | "loading"
+  | "ready"
+  | "exhausted"
+  | "error";
+type RealtimeHistoryUiState = {
+  status: RealtimeHistoryStatus;
+  error: string;
+};
 
 const EMPTY_REALTIME_DIAGNOSTICS: RealtimeDiagnostics = {
   connectionGeneration: 0,
@@ -1357,9 +1387,11 @@ function ContentPreview({
 }
 
 function SignedOutView({
+  notice,
   onCredentials,
   onVerifyMfa,
 }: {
+  notice?: string;
   onCredentials: (login: string, password: string) => Promise<LoginOutcome>;
   onVerifyMfa: (
     login: string,
@@ -1400,6 +1432,13 @@ function SignedOutView({
             <div className="auth-heading">
               <h1>Добро пожаловать</h1>
             </div>
+
+            {notice ? (
+              <p className="auth-session-notice" role="alert">
+                <ShieldCheck size={17} aria-hidden="true" />
+                <span>{notice}</span>
+              </p>
+            ) : null}
 
             <form
               className="auth-form"
@@ -2779,6 +2818,10 @@ function ChatView({
   onAddParticipants,
   onTogglePinnedMessage,
   onForwardMessage,
+  historyStatus,
+  historyError,
+  canLoadOlder,
+  onLoadOlder,
 }: {
   chat: Chat;
   chats: Chat[];
@@ -2802,6 +2845,10 @@ function ChatView({
   onAddParticipants: (participantIds: string[]) => void;
   onTogglePinnedMessage: (messageId: number) => void;
   onForwardMessage: (messageId: number, targetChatId: string) => void;
+  historyStatus: RealtimeHistoryStatus;
+  historyError: string;
+  canLoadOlder: boolean;
+  onLoadOlder: () => Promise<RealtimeHistoryPageResult>;
 }) {
   const [draft, setDraft] = useState("");
   const [replyingToMessageId, setReplyingToMessageId] = useState<
@@ -2864,6 +2911,13 @@ function ChatView({
   const messageCanvasRef = useRef<HTMLDivElement | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const previousChatIdRef = useRef<string | null>(null);
+  const pendingHistoryScrollRef = useRef<{
+    scrollHeight: number;
+    scrollTop: number;
+    oldestMessageId: number;
+  } | null>(null);
+  const skipAutoScrollRef = useRef(false);
+  const historyRestoreTimerRef = useRef<number | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const longPressTimerRef = useRef<number | null>(null);
   const actionNoticeTimerRef = useRef<number | null>(null);
@@ -2943,6 +2997,9 @@ function ChatView({
       if (recordingTimerRef.current !== null) {
         window.clearInterval(recordingTimerRef.current);
       }
+      if (historyRestoreTimerRef.current !== null) {
+        window.clearTimeout(historyRestoreTimerRef.current);
+      }
       const recorder = recorderRef.current;
       recorderRef.current = null;
       recorder?.dispose();
@@ -2981,10 +3038,37 @@ function ChatView({
   }, [apiClient, chat.id, runtimeMode]);
 
   const latestMessageId = messages.at(-1)?.id ?? null;
+  const oldestMessageId = messages.at(0)?.id ?? null;
+
+  useLayoutEffect(() => {
+    const pending = pendingHistoryScrollRef.current;
+    const canvas = messageCanvasRef.current;
+    if (
+      !pending ||
+      !canvas ||
+      oldestMessageId === null ||
+      oldestMessageId >= pending.oldestMessageId
+    ) {
+      return;
+    }
+    canvas.scrollTop =
+      pending.scrollTop + (canvas.scrollHeight - pending.scrollHeight);
+    pendingHistoryScrollRef.current = null;
+    if (historyRestoreTimerRef.current !== null) {
+      window.clearTimeout(historyRestoreTimerRef.current);
+      historyRestoreTimerRef.current = null;
+    }
+    skipAutoScrollRef.current = true;
+  }, [messages.length, oldestMessageId]);
 
   useEffect(() => {
     const canvas = messageCanvasRef.current;
     if (!canvas) return;
+
+    if (skipAutoScrollRef.current) {
+      skipAutoScrollRef.current = false;
+      return;
+    }
 
     const chatChanged = previousChatIdRef.current !== chat.id;
     previousChatIdRef.current = chat.id;
@@ -3007,6 +3091,35 @@ function ChatView({
       settleTimerIds.forEach((timerId) => window.clearTimeout(timerId));
     };
   }, [chat.id, latestMessageId, messages.length]);
+
+  const loadOlderHistory = async () => {
+    const canvas = messageCanvasRef.current;
+    if (!canvas || historyStatus === "loading" || !oldestMessageId) return;
+    pendingHistoryScrollRef.current = {
+      scrollHeight: canvas.scrollHeight,
+      scrollTop: canvas.scrollTop,
+      oldestMessageId,
+    };
+    try {
+      const result = await onLoadOlder();
+      if (result.addedCount === 0) {
+        pendingHistoryScrollRef.current = null;
+      } else {
+        if (historyRestoreTimerRef.current !== null) {
+          window.clearTimeout(historyRestoreTimerRef.current);
+        }
+        historyRestoreTimerRef.current = window.setTimeout(() => {
+          // A wire page may contain unsupported payloads which are intentionally
+          // filtered from the UI. Never let their stale scroll snapshot affect
+          // a later, unrelated render.
+          pendingHistoryScrollRef.current = null;
+          historyRestoreTimerRef.current = null;
+        }, 750);
+      }
+    } catch {
+      pendingHistoryScrollRef.current = null;
+    }
+  };
 
   const openPanel = (panel: ActiveChatPanel, trigger: HTMLButtonElement) => {
     panelTriggerRef.current = trigger;
@@ -3562,6 +3675,29 @@ function ChatView({
 
       <div className="message-canvas" ref={messageCanvasRef}>
         {chatPatternEnabled ? <div className="pattern" aria-hidden="true" /> : null}
+        {runtimeMode === "backend" && messages.length > 0 ? (
+          <div className="history-page-control" role="status">
+            {historyStatus === "exhausted" ? (
+              <span>Начало переписки</span>
+            ) : (
+              <button
+                type="button"
+                disabled={!canLoadOlder || historyStatus === "loading"}
+                onClick={() => void loadOlderHistory()}
+              >
+                <RotateCcw size={14} />
+                {historyStatus === "loading"
+                  ? "Загружаем историю…"
+                  : historyStatus === "error"
+                    ? "Повторить загрузку истории"
+                    : "Загрузить более ранние сообщения"}
+              </button>
+            )}
+            {historyStatus === "error" && historyError ? (
+              <small>{historyError}</small>
+            ) : null}
+          </div>
+        ) : null}
         <div className="day-chip">Сегодня</div>
         <div className="security-chip">
           <LockKeyhole size={12} />
@@ -5015,6 +5151,292 @@ function ChatView({
   );
 }
 
+function isCancelledDirectoryRequest(error: unknown): boolean {
+  return (
+    error instanceof CifraApiError && error.code === "REQUEST_CANCELLED"
+  );
+}
+
+function useDirectorySearchListing({
+  query,
+  runtimeMode,
+  localUsers,
+  loadPage,
+}: {
+  query: string;
+  runtimeMode: RuntimeMode;
+  localUsers: MessengerUser[];
+  loadPage: DirectoryPageLoader;
+}) {
+  const normalizedQuery = normalizeDirectoryQuery(query);
+  const [searchItems, setSearchItems] = useState<MessengerUser[]>([]);
+  const [searchStatus, setSearchStatus] =
+    useState<DirectoryStatus>("idle");
+  const [searchError, setSearchError] = useState("");
+  const [resultQuery, setResultQuery] = useState("");
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [retryNonce, setRetryNonce] = useState(0);
+  const requestEpochRef = useRef(createDirectoryRequestEpoch());
+  const requestAbortRef = useRef<AbortController | null>(null);
+  const seenCursorsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    requestAbortRef.current?.abort();
+    requestAbortRef.current = null;
+    const epochManager = requestEpochRef.current;
+    epochManager.invalidate();
+    seenCursorsRef.current = new Set();
+
+    if (runtimeMode !== "backend" || !normalizedQuery) {
+      const resetTimerId = window.setTimeout(() => {
+        setLoadingMore(false);
+        setSearchError("");
+        setSearchItems([]);
+        setResultQuery("");
+        setNextCursor(null);
+        setSearchStatus("idle");
+      }, 0);
+      return () => window.clearTimeout(resetTimerId);
+    }
+
+    const epoch = epochManager.next();
+    const controller = new AbortController();
+    requestAbortRef.current = controller;
+
+    const timerId = window.setTimeout(() => {
+      setLoadingMore(false);
+      setSearchError("");
+      setSearchItems([]);
+      setResultQuery("");
+      setNextCursor(null);
+      setSearchStatus("loading");
+      void loadPage(normalizedQuery, null, controller.signal)
+        .then((page) => {
+          if (!epochManager.isCurrent(epoch)) return;
+          const merged = mergeDirectoryPage([], page);
+          if (merged.next_cursor) {
+            seenCursorsRef.current.add(merged.next_cursor);
+          }
+          setSearchItems(merged.items);
+          setResultQuery(normalizedQuery);
+          setNextCursor(merged.next_cursor);
+          setSearchStatus(merged.items.length ? "ready" : "empty");
+        })
+        .catch((error: unknown) => {
+          if (
+            !epochManager.isCurrent(epoch) ||
+            isCancelledDirectoryRequest(error)
+          ) {
+            return;
+          }
+          setSearchItems([]);
+          setResultQuery(normalizedQuery);
+          setNextCursor(null);
+          setSearchStatus("error");
+          setSearchError(authErrorMessage(error));
+        });
+    }, 280);
+
+    return () => {
+      window.clearTimeout(timerId);
+      controller.abort();
+      epochManager.invalidate();
+    };
+  }, [loadPage, normalizedQuery, retryNonce, runtimeMode]);
+
+  const loadMore = useCallback(async () => {
+    if (
+      runtimeMode !== "backend" ||
+      !normalizedQuery ||
+      !nextCursor ||
+      loadingMore
+    ) {
+      return;
+    }
+
+    requestAbortRef.current?.abort();
+    const controller = new AbortController();
+    requestAbortRef.current = controller;
+    const epoch = requestEpochRef.current.next();
+    const requestedCursor = nextCursor;
+    setLoadingMore(true);
+    setSearchError("");
+    try {
+      const page = await loadPage(
+        normalizedQuery,
+        requestedCursor,
+        controller.signal,
+      );
+      if (!requestEpochRef.current.isCurrent(epoch)) return;
+      const merged = mergeDirectoryPage(searchItems, page, {
+        requestedCursor,
+        seenCursors: seenCursorsRef.current,
+      });
+      if (merged.next_cursor) {
+        seenCursorsRef.current.add(merged.next_cursor);
+      }
+      setSearchItems(merged.items);
+      setNextCursor(merged.next_cursor);
+      setSearchStatus(merged.items.length ? "ready" : "empty");
+    } catch (error) {
+      if (
+        requestEpochRef.current.isCurrent(epoch) &&
+        !isCancelledDirectoryRequest(error)
+      ) {
+        setSearchError(authErrorMessage(error));
+      }
+    } finally {
+      if (requestEpochRef.current.isCurrent(epoch)) {
+        setLoadingMore(false);
+      }
+    }
+  }, [loadPage, loadingMore, nextCursor, normalizedQuery, runtimeMode, searchItems]);
+
+  const localMatches = useMemo(() => {
+    if (!normalizedQuery) return localUsers;
+    const folded = normalizedQuery.toLocaleLowerCase("ru");
+    return localUsers.filter((user) =>
+      `${user.name} ${user.position} ${user.username}`
+        .toLocaleLowerCase("ru")
+        .includes(folded),
+    );
+  }, [localUsers, normalizedQuery]);
+  const resultMatchesQuery = resultQuery === normalizedQuery;
+
+  return {
+    items:
+      runtimeMode === "backend" && normalizedQuery
+        ? resultMatchesQuery
+          ? searchItems
+          : []
+        : localMatches,
+    status:
+      runtimeMode === "backend" && normalizedQuery
+        ? resultMatchesQuery
+          ? searchStatus
+          : ("loading" as DirectoryStatus)
+        : ("ready" as DirectoryStatus),
+    error: searchError,
+    hasMore:
+      runtimeMode === "backend" && normalizedQuery
+        ? Boolean(nextCursor)
+        : false,
+    loadingMore,
+    loadMore,
+    retry: () => setRetryNonce((current) => current + 1),
+    searchingBackend: runtimeMode === "backend" && Boolean(normalizedQuery),
+  };
+}
+
+function WindowedDirectoryList({
+  items,
+  className,
+  rowHeight = 68,
+  hasMore,
+  loadingMore,
+  onLoadMore,
+  renderItem,
+  empty,
+}: {
+  items: MessengerUser[];
+  className: string;
+  rowHeight?: number;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void | Promise<void>;
+  renderItem: (person: MessengerUser) => ReactNode;
+  empty: ReactNode;
+}) {
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const endRequestLockedRef = useRef(false);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(420);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const updateHeight = () => {
+      setViewportHeight(Math.max(rowHeight, viewport.clientHeight));
+    };
+    updateHeight();
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, [rowHeight]);
+
+  useEffect(() => {
+    endRequestLockedRef.current = false;
+  }, [hasMore, items.length, loadingMore]);
+
+  const windowed = calculateDirectoryWindow(
+    items.length,
+    scrollTop,
+    viewportHeight,
+    rowHeight,
+  );
+  const visibleItems = items.slice(windowed.start, windowed.end);
+
+  if (!items.length) return <>{empty}</>;
+
+  return (
+    <>
+      <div
+        ref={viewportRef}
+        className={`directory-virtual-viewport ${className}`}
+        role="list"
+        aria-label="Каталог сотрудников"
+        onScroll={(event) => {
+          const viewport = event.currentTarget;
+          setScrollTop(viewport.scrollTop);
+          const remaining =
+            viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+          if (
+            remaining <= rowHeight * 4 &&
+            hasMore &&
+            !loadingMore &&
+            !endRequestLockedRef.current
+          ) {
+            endRequestLockedRef.current = true;
+            void onLoadMore();
+          }
+        }}
+      >
+        <div
+          className="directory-virtual-spacer"
+          style={{ height: windowed.totalHeight }}
+        >
+          <div
+            className="directory-virtual-window"
+            style={{ transform: `translateY(${windowed.offset}px)` }}
+          >
+            {visibleItems.map((person) => (
+              <div
+                className="directory-virtual-row"
+                role="listitem"
+                style={{ height: rowHeight }}
+                key={person.id}
+              >
+                {renderItem(person)}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      {hasMore || loadingMore ? (
+        <button
+          type="button"
+          className="directory-load-more"
+          onClick={() => void onLoadMore()}
+          disabled={loadingMore}
+        >
+          {loadingMore ? "Загружаем…" : "Показать ещё"}
+        </button>
+      ) : null}
+    </>
+  );
+}
+
 function TeamsView({
   users,
   role,
@@ -5023,27 +5445,45 @@ function TeamsView({
   runtimeMode,
   directoryStatus,
   directoryError,
+  directoryHasMore,
+  directoryLoadingMore,
+  directoryPageError,
   onRetryDirectory,
+  onLoadMoreDirectory,
+  searchDirectory,
 }: {
   users: MessengerUser[];
   role: UserRole;
-  onMessage: (id: string) => void;
-  onOpenUser: (id: string) => void;
+  onMessage: (user: MessengerUser) => void;
+  onOpenUser: (user: MessengerUser) => void;
   runtimeMode: RuntimeMode;
   directoryStatus: DirectoryStatus;
   directoryError: string;
+  directoryHasMore: boolean;
+  directoryLoadingMore: boolean;
+  directoryPageError: string;
   onRetryDirectory: () => void;
+  onLoadMoreDirectory: () => void | Promise<void>;
+  searchDirectory: DirectoryPageLoader;
 }) {
   const [query, setQuery] = useState("");
   const [organizationOpen, setOrganizationOpen] = useState(false);
-  const normalizedQuery = query.trim().toLocaleLowerCase("ru");
-  const visibleUsers = users.filter(
-    (user) =>
-      !normalizedQuery ||
-      `${user.name} ${user.position}`
-        .toLocaleLowerCase("ru")
-        .includes(normalizedQuery),
-  );
+  const listing = useDirectorySearchListing({
+    query,
+    runtimeMode,
+    localUsers: users,
+    loadPage: searchDirectory,
+  });
+  const visibleUsers = listing.items;
+  const effectiveHasMore = listing.searchingBackend
+    ? listing.hasMore
+    : directoryHasMore;
+  const effectiveLoadingMore = listing.searchingBackend
+    ? listing.loadingMore
+    : directoryLoadingMore;
+  const loadMore = listing.searchingBackend
+    ? listing.loadMore
+    : onLoadMoreDirectory;
 
   return (
     <section className="view">
@@ -5132,53 +5572,79 @@ function TeamsView({
           <strong>Сотрудники</strong>
         </div>
 
-        <div className="people-list">
-          {visibleUsers.map((person) => (
-            <button
-              type="button"
-              className="person-row"
-              key={person.id}
-              onClick={() => {
-                if (person.id === "self") return;
-                if (role !== "employee") onOpenUser(person.id);
-                else onMessage(person.id);
-              }}
-              aria-label={
-                person.id === "self"
-                  ? `${person.name} — это вы`
-                  : role !== "employee"
-                    ? `Открыть профиль: ${person.name}`
-                    : `Написать: ${person.name}`
-              }
-            >
-              <Avatar
-                label={person.avatar}
-                gradient={person.gradient}
-                imageUrl={person.avatarUrl}
-                online={person.online}
-              />
-              <span>
-                <strong>{person.name}</strong>
-                <small>
-                  {person.position} · {person.online ? "в сети" : "не в сети"}
-                </small>
-              </span>
-              {person.id === "self" ? (
-                <UserRound size={19} />
-              ) : role !== "employee" ? (
-                <ChevronRight size={19} />
-              ) : (
-                <MessageCircle size={19} />
-              )}
+        {listing.searchingBackend && listing.status === "loading" ? (
+          <BackendStateCard
+            title="Ищем сотрудников"
+            detail="Поиск выполняется в серверном каталоге."
+            busy
+          />
+        ) : listing.searchingBackend && listing.status === "error" ? (
+          <BackendStateCard
+            title="Поиск временно недоступен"
+            detail={listing.error || "Повторите поиск сотрудников."}
+            onRetry={listing.retry}
+          />
+        ) : (
+          <WindowedDirectoryList
+            items={visibleUsers}
+            className="people-list"
+            hasMore={effectiveHasMore}
+            loadingMore={effectiveLoadingMore}
+            onLoadMore={loadMore}
+            empty={
+              <div className="panel-empty">
+                <Search size={22} />
+                <span>Сотрудники не найдены</span>
+              </div>
+            }
+            renderItem={(person) => (
+              <button
+                type="button"
+                className="person-row"
+                onClick={() => {
+                  if (person.id === "self") return;
+                  if (role !== "employee") onOpenUser(person);
+                  else onMessage(person);
+                }}
+                aria-label={
+                  person.id === "self"
+                    ? `${person.name} — это вы`
+                    : role !== "employee"
+                      ? `Открыть профиль: ${person.name}`
+                      : `Написать: ${person.name}`
+                }
+              >
+                <Avatar
+                  label={person.avatar}
+                  gradient={person.gradient}
+                  imageUrl={person.avatarUrl}
+                  online={person.online}
+                />
+                <span>
+                  <strong>{person.name}</strong>
+                  <small>
+                    {person.position} · {person.online ? "в сети" : "не в сети"}
+                  </small>
+                </span>
+                {person.id === "self" ? (
+                  <UserRound size={19} />
+                ) : role !== "employee" ? (
+                  <ChevronRight size={19} />
+                ) : (
+                  <MessageCircle size={19} />
+                )}
+              </button>
+            )}
+          />
+        )}
+        {!listing.searchingBackend && directoryPageError ? (
+          <div className="directory-inline-error" role="status">
+            <span>{directoryPageError}</span>
+            <button type="button" onClick={() => void onLoadMoreDirectory()}>
+              Повторить
             </button>
-          ))}
-          {!visibleUsers.length ? (
-            <div className="panel-empty">
-              <Search size={22} />
-              <span>Сотрудники не найдены</span>
-            </div>
-          ) : null}
-        </div>
+          </div>
+        ) : null}
           </>
         )}
       </div>
@@ -5217,13 +5683,13 @@ function TeamsView({
               </button>
             </div>
             <div className="organization-contact-list">
-              {users.map((person) => (
+              {users.slice(0, 100).map((person) => (
                 <button
                   type="button"
                   key={person.id}
                   onClick={() => {
                     setOrganizationOpen(false);
-                    onOpenUser(person.id);
+                    onOpenUser(person);
                   }}
                   aria-label={`Открыть профиль: ${person.name}`}
                 >
@@ -6527,46 +6993,75 @@ function ComposeSheet({
   runtimeMode,
   directoryStatus,
   directoryError,
+  directoryHasMore,
+  directoryLoadingMore,
+  directoryPageError,
   onRetryDirectory,
+  onLoadMoreDirectory,
+  searchDirectory,
 }: {
   users: MessengerUser[];
   onClose: () => void;
-  onSelect: (id: string) => void;
+  onSelect: (user: MessengerUser) => void;
   onCreateGroup: (
     name: string,
-    memberIds: string[],
+    members: MessengerUser[],
   ) => Promise<string | null>;
   runtimeMode: RuntimeMode;
   directoryStatus: DirectoryStatus;
   directoryError: string;
+  directoryHasMore: boolean;
+  directoryLoadingMore: boolean;
+  directoryPageError: string;
   onRetryDirectory: () => void;
+  onLoadMoreDirectory: () => void | Promise<void>;
+  searchDirectory: DirectoryPageLoader;
 }) {
   const [step, setStep] = useState<"message" | "members" | "details">(
     "message",
   );
   const [query, setQuery] = useState("");
   const [selectedMemberIds, setSelectedMemberIds] = useState<string[]>([]);
+  const [selectedMembers, setSelectedMembers] = useState<
+    Record<string, MessengerUser>
+  >({});
   const [groupName, setGroupName] = useState("");
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [creationError, setCreationError] = useState("");
   const backdropRef = useRef<HTMLDivElement | null>(null);
   const dialogRef = useRef<HTMLDivElement | null>(null);
-  const normalizedQuery = query.trim().toLocaleLowerCase("ru");
-  const availableUsers = users.filter(
-    (user) =>
-      user.id !== "self" &&
-      (!normalizedQuery ||
-        `${user.name} ${user.position}`
-          .toLocaleLowerCase("ru")
-          .includes(normalizedQuery)),
-  );
+  const listing = useDirectorySearchListing({
+    query,
+    runtimeMode,
+    localUsers: users,
+    loadPage: searchDirectory,
+  });
+  const availableUsers = listing.items.filter((user) => user.id !== "self");
+  const effectiveHasMore = listing.searchingBackend
+    ? listing.hasMore
+    : directoryHasMore;
+  const effectiveLoadingMore = listing.searchingBackend
+    ? listing.loadingMore
+    : directoryLoadingMore;
+  const loadMore = listing.searchingBackend
+    ? listing.loadMore
+    : onLoadMoreDirectory;
 
-  const toggleMember = (id: string) => {
+  const toggleMember = (person: MessengerUser) => {
+    const id = person.id;
     setSelectedMemberIds((current) =>
       current.includes(id)
         ? current.filter((memberId) => memberId !== id)
         : [...current, id],
     );
+    setSelectedMembers((current) => {
+      if (id in current) {
+        const next = { ...current };
+        delete next[id];
+        return next;
+      }
+      return { ...current, [id]: person };
+    });
   };
 
   useEffect(() => {
@@ -6754,34 +7249,61 @@ function ComposeSheet({
                   }
                   onRetry={onRetryDirectory}
                 />
-              ) : availableUsers.length ? (
-                availableUsers.map((person) => (
-                  <button
-                    type="button"
-                    className="person-row sheet-person"
-                    key={person.id}
-                    onClick={() => onSelect(person.id)}
-                  >
-                    <Avatar
-                      label={person.avatar}
-                      gradient={person.gradient}
-                      imageUrl={person.avatarUrl}
-                      online={person.online}
-                    />
-                    <span>
-                      <strong>{person.name}</strong>
-                      <small>
-                        {person.online ? "В сети" : person.position}
-                      </small>
-                    </span>
-                  </button>
-                ))
+              ) : listing.searchingBackend && listing.status === "loading" ? (
+                <BackendStateCard
+                  title="Ищем контакты"
+                  detail="Поиск выполняется в серверном каталоге."
+                  busy
+                />
+              ) : listing.searchingBackend && listing.status === "error" ? (
+                <BackendStateCard
+                  title="Поиск временно недоступен"
+                  detail={listing.error || "Повторите поиск контакта."}
+                  onRetry={listing.retry}
+                />
               ) : (
-                <div className="panel-empty">
-                  <Search size={22} />
-                  <span>Контакты не найдены</span>
-                </div>
+                <WindowedDirectoryList
+                  items={availableUsers}
+                  className="compose-windowed-list"
+                  hasMore={effectiveHasMore}
+                  loadingMore={effectiveLoadingMore}
+                  onLoadMore={loadMore}
+                  empty={
+                    <div className="panel-empty">
+                      <Search size={22} />
+                      <span>Контакты не найдены</span>
+                    </div>
+                  }
+                  renderItem={(person) => (
+                    <button
+                      type="button"
+                      className="person-row sheet-person"
+                      onClick={() => onSelect(person)}
+                    >
+                      <Avatar
+                        label={person.avatar}
+                        gradient={person.gradient}
+                        imageUrl={person.avatarUrl}
+                        online={person.online}
+                      />
+                      <span>
+                        <strong>{person.name}</strong>
+                        <small>
+                          {person.online ? "В сети" : person.position}
+                        </small>
+                      </span>
+                    </button>
+                  )}
+                />
               )}
+              {!listing.searchingBackend && directoryPageError ? (
+                <div className="directory-inline-error" role="status">
+                  <span>{directoryPageError}</span>
+                  <button type="button" onClick={() => void onLoadMoreDirectory()}>
+                    Повторить
+                  </button>
+                </div>
+              ) : null}
             </div>
           </>
         ) : step === "members" ? (
@@ -6803,36 +7325,55 @@ function ComposeSheet({
                   }
                   onRetry={onRetryDirectory}
                 />
-              ) : availableUsers.length ? (
-                availableUsers.map((person) => {
-                  const selected = selectedMemberIds.includes(person.id);
-                  return (
-                    <button
-                      type="button"
-                      key={person.id}
-                      className={selected ? "is-selected" : ""}
-                      aria-pressed={selected}
-                      onClick={() => toggleMember(person.id)}
-                    >
-                      <Avatar
-                        label={person.avatar}
-                        gradient={person.gradient}
-                        imageUrl={person.avatarUrl}
-                        online={person.online}
-                      />
-                      <span>
-                        <strong>{person.name}</strong>
-                        <small>{person.position}</small>
-                      </span>
-                      <i>{selected ? <CheckCheck size={16} /> : null}</i>
-                    </button>
-                  );
-                })
+              ) : listing.searchingBackend && listing.status === "loading" ? (
+                <BackendStateCard
+                  title="Ищем участников"
+                  detail="Поиск выполняется в серверном каталоге."
+                  busy
+                />
+              ) : listing.searchingBackend && listing.status === "error" ? (
+                <BackendStateCard
+                  title="Поиск временно недоступен"
+                  detail={listing.error || "Повторите поиск участника."}
+                  onRetry={listing.retry}
+                />
               ) : (
-                <div className="panel-empty">
-                  <Search size={22} />
-                  <span>Участники не найдены</span>
-                </div>
+                <WindowedDirectoryList
+                  items={availableUsers}
+                  className="compose-windowed-list"
+                  hasMore={effectiveHasMore}
+                  loadingMore={effectiveLoadingMore}
+                  onLoadMore={loadMore}
+                  empty={
+                    <div className="panel-empty">
+                      <Search size={22} />
+                      <span>Участники не найдены</span>
+                    </div>
+                  }
+                  renderItem={(person) => {
+                    const selected = selectedMemberIds.includes(person.id);
+                    return (
+                      <button
+                        type="button"
+                        className={selected ? "is-selected" : ""}
+                        aria-pressed={selected}
+                        onClick={() => toggleMember(person)}
+                      >
+                        <Avatar
+                          label={person.avatar}
+                          gradient={person.gradient}
+                          imageUrl={person.avatarUrl}
+                          online={person.online}
+                        />
+                        <span>
+                          <strong>{person.name}</strong>
+                          <small>{person.position}</small>
+                        </span>
+                        <i>{selected ? <CheckCheck size={16} /> : null}</i>
+                      </button>
+                    );
+                  }}
+                />
               )}
             </div>
             <button
@@ -6865,7 +7406,8 @@ function ComposeSheet({
             </label>
             <div className="selected-member-strip" aria-label="Выбранные участники">
               {selectedMemberIds.map((id) => {
-                const person = users.find((user) => user.id === id);
+                const person =
+                  selectedMembers[id] ?? users.find((user) => user.id === id);
                 if (!person) return null;
                 return (
                   <span key={id}>
@@ -6895,7 +7437,15 @@ function ComposeSheet({
                 setCreationError("");
                 const error = await onCreateGroup(
                   groupName.trim(),
-                  selectedMemberIds,
+                  selectedMemberIds
+                    .map(
+                      (id) =>
+                        selectedMembers[id] ??
+                        users.find((user) => user.id === id),
+                    )
+                    .filter(
+                      (person): person is MessengerUser => Boolean(person),
+                    ),
                 );
                 if (error) {
                   setCreationError(error);
@@ -7090,15 +7640,27 @@ export default function Home() {
   >(null);
   const [realtimeDiagnostics, setRealtimeDiagnostics] =
     useState<RealtimeDiagnostics>(EMPTY_REALTIME_DIAGNOSTICS);
+  const [realtimeHistoryByTopic, setRealtimeHistoryByTopic] = useState<
+    Record<string, RealtimeHistoryUiState>
+  >({});
   const [realtimeRetryNonce, setRealtimeRetryNonce] = useState(0);
   const [authMode, setAuthMode] = useState<RuntimeMode>("backend");
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
+  const [sessionNotice, setSessionNotice] = useState("");
   const [role, setRole] = useState<UserRole>("admin");
   const [users, setUsers] = useState<MessengerUser[]>([]);
   const [directoryStatus, setDirectoryStatus] =
     useState<DirectoryStatus>("idle");
   const [directoryError, setDirectoryError] = useState("");
+  const [directoryNextCursor, setDirectoryNextCursor] = useState<
+    string | null
+  >(null);
+  const [directoryLoadingMore, setDirectoryLoadingMore] = useState(false);
+  const [directoryPageError, setDirectoryPageError] = useState("");
+  const directoryEpochRef = useRef(createDirectoryRequestEpoch());
+  const directoryAbortRef = useRef<AbortController | null>(null);
+  const directorySeenCursorsRef = useRef<Set<string>>(new Set());
   const [selectedProfileUserId, setSelectedProfileUserId] = useState<
     string | null
   >(null);
@@ -7124,6 +7686,37 @@ export default function Home() {
     ownedAvatarUrlsRef.current.clear();
   }, []);
 
+  const handleSessionInvalidated = useCallback(
+    (reason: SessionInvalidationReason) => {
+      directoryAbortRef.current?.abort();
+      directoryAbortRef.current = null;
+      directoryEpochRef.current.next();
+      realtimeClientRef.current?.disconnect();
+      realtimeClientRef.current = null;
+      releaseOwnedAvatarUrls();
+      setAuthSession(null);
+      setSessionActive(false);
+      setSessionNotice(sessionInvalidationMessage(reason));
+      setActiveTab("chats");
+      setSelectedChatId(null);
+      setComposeOpen(false);
+      setCallOpen(false);
+      setSelectedProfileUserId(null);
+      setAuditUserId(null);
+      setChatItems([]);
+      setMessagesByChat({});
+      setUsers([]);
+      setDirectoryStatus("idle");
+      setDirectoryError("");
+      setDirectoryNextCursor(null);
+      setDirectoryLoadingMore(false);
+      setDirectoryPageError("");
+      setChatOpenError("");
+      setCallOpenError("");
+    },
+    [releaseOwnedAvatarUrls],
+  );
+
   const applyRuntimeMode = useCallback((mode: RuntimeMode) => {
     setAuthMode(mode);
     if (mode === "demo") {
@@ -7133,6 +7726,9 @@ export default function Home() {
       setUsers(initialUsers);
       setDirectoryStatus("ready");
       setDirectoryError("");
+      setDirectoryNextCursor(null);
+      setDirectoryLoadingMore(false);
+      setDirectoryPageError("");
       return;
     }
 
@@ -7142,12 +7738,16 @@ export default function Home() {
     setUsers([]);
     setDirectoryStatus("idle");
     setDirectoryError("");
+    setDirectoryNextCursor(null);
+    setDirectoryLoadingMore(false);
+    setDirectoryPageError("");
   }, []);
 
   const activateSession = useCallback((session: AuthSession) => {
     setAuthSession(session);
     setRole(session.role);
     setSessionActive(true);
+    setSessionNotice("");
     setUsers((current) => {
       const next = current.map((user) =>
         user.id === "self"
@@ -7173,32 +7773,152 @@ export default function Home() {
   const syncBackendDirectory = useCallback(
     async (client: CifraApiClient, session: AuthSession) => {
       if (client.mode !== "backend") return;
+      directoryAbortRef.current?.abort();
+      const controller = new AbortController();
+      directoryAbortRef.current = controller;
+      const epoch = directoryEpochRef.current.next();
+      directorySeenCursorsRef.current = new Set();
       setDirectoryStatus("loading");
       setDirectoryError("");
+      setDirectoryPageError("");
+      setDirectoryNextCursor(null);
+      setDirectoryLoadingMore(false);
       try {
-        const page = await client.listAllUsers();
+        const page = await client.listUsers("", null, controller.signal);
+        if (!directoryEpochRef.current.isCurrent(epoch)) return;
         if (page.items.length === 0) {
           setUsers([authSessionToMessenger(session)]);
           setDirectoryStatus("empty");
           return;
         }
-        const directoryUsers = page.items.map((user) =>
-          backendUserToMessenger(user, session.context.user_id),
+        const merged = mergeDirectoryPage(
+          [],
+          {
+            items: page.items.map((user) =>
+              backendUserToMessenger(user, session.context.user_id),
+            ),
+            next_cursor: page.next_cursor,
+          },
         );
+        if (merged.next_cursor) {
+          directorySeenCursorsRef.current.add(merged.next_cursor);
+        }
+        const directoryUsers = merged.items;
         setUsers(
           directoryUsers.some((user) => user.id === "self")
             ? directoryUsers
             : [authSessionToMessenger(session), ...directoryUsers],
         );
+        setDirectoryNextCursor(merged.next_cursor);
         setDirectoryStatus("ready");
       } catch (error) {
+        if (
+          !directoryEpochRef.current.isCurrent(epoch) ||
+          isCancelledDirectoryRequest(error)
+        ) {
+          return;
+        }
         setUsers([authSessionToMessenger(session)]);
         setDirectoryStatus("error");
         setDirectoryError(authErrorMessage(error));
         throw error;
+      } finally {
+        if (
+          directoryEpochRef.current.isCurrent(epoch) &&
+          directoryAbortRef.current === controller
+        ) {
+          directoryAbortRef.current = null;
+        }
       }
     },
     [],
+  );
+
+  const loadMoreBackendDirectory = useCallback(async () => {
+    const client = apiClientRef.current;
+    if (
+      !client ||
+      !authSession ||
+      client.mode !== "backend" ||
+      !directoryNextCursor ||
+      directoryLoadingMore
+    ) {
+      return;
+    }
+
+    const requestedCursor = directoryNextCursor;
+    const epoch = directoryEpochRef.current.next();
+    directoryAbortRef.current?.abort();
+    const controller = new AbortController();
+    directoryAbortRef.current = controller;
+    setDirectoryLoadingMore(true);
+    setDirectoryPageError("");
+    try {
+      const page = await client.listUsers("", requestedCursor, controller.signal);
+      if (!directoryEpochRef.current.isCurrent(epoch)) return;
+      const mappedPage = {
+        items: page.items.map((user) =>
+          backendUserToMessenger(user, authSession.context.user_id),
+        ),
+        next_cursor: page.next_cursor,
+      };
+      const validated = mergeDirectoryPage([], mappedPage, {
+        requestedCursor,
+        seenCursors: directorySeenCursorsRef.current,
+      });
+      setUsers((current) => {
+        const merged = mergeDirectoryPage(current, {
+          items: validated.items,
+          next_cursor: null,
+        });
+        return merged.items.some((user) => user.id === "self")
+          ? merged.items
+          : [authSessionToMessenger(authSession), ...merged.items];
+      });
+      if (validated.next_cursor) {
+        directorySeenCursorsRef.current.add(validated.next_cursor);
+      }
+      setDirectoryNextCursor(validated.next_cursor);
+    } catch (error) {
+      if (
+        directoryEpochRef.current.isCurrent(epoch) &&
+        !isCancelledDirectoryRequest(error)
+      ) {
+        setDirectoryPageError(authErrorMessage(error));
+      }
+    } finally {
+      if (directoryEpochRef.current.isCurrent(epoch)) {
+        setDirectoryLoadingMore(false);
+        if (directoryAbortRef.current === controller) {
+          directoryAbortRef.current = null;
+        }
+      }
+    }
+  }, [authSession, directoryLoadingMore, directoryNextCursor]);
+
+  const searchBackendDirectory = useCallback<DirectoryPageLoader>(
+    async (query, cursor, signal) => {
+      const client = apiClientRef.current;
+      if (!client || !authSession || client.mode !== "backend") {
+        throw new CifraApiError(
+          "Каталог сотрудников недоступен",
+          503,
+          "DIRECTORY_UNAVAILABLE",
+          undefined,
+          true,
+        );
+      }
+      const normalizedQuery = normalizeDirectoryQuery(query);
+      if (!normalizedQuery) return { items: [], next_cursor: null };
+      const page = await client.listUsers(normalizedQuery, cursor, signal);
+      return {
+        items: page.items.map((user) =>
+          backendUserToMessenger(user, authSession.context.user_id),
+        ),
+        next_cursor: page.next_cursor,
+      };
+    },
+    [authSession],
   );
 
   const retryBackendDirectory = useCallback(() => {
@@ -7209,10 +7929,14 @@ export default function Home() {
 
   useEffect(() => {
     let cancelled = false;
+    let unsubscribeSessionInvalidated: (() => void) | undefined;
     void loadRuntimeConfig()
       .then(async (config) => {
         if (cancelled) return;
         const client = new CifraApiClient(config);
+        unsubscribeSessionInvalidated = client.onSessionInvalidated(
+          handleSessionInvalidated,
+        );
         apiClientRef.current = client;
         setActiveApiClient(client);
         configureAvatarAllowedOrigins(config.avatarAllowedOrigins);
@@ -7227,8 +7951,14 @@ export default function Home() {
       });
     return () => {
       cancelled = true;
+      unsubscribeSessionInvalidated?.();
     };
-  }, [activateSession, applyRuntimeMode, syncBackendDirectory]);
+  }, [
+    activateSession,
+    applyRuntimeMode,
+    handleSessionInvalidated,
+    syncBackendDirectory,
+  ]);
   useEffect(() => {
     const apiClient = apiClientRef.current;
 
@@ -7253,6 +7983,7 @@ export default function Home() {
       setRealtimePublishStatus("idle");
       setRealtimePublishedSeq(null);
       setRealtimeDiagnostics(EMPTY_REALTIME_DIAGNOSTICS);
+      setRealtimeHistoryByTopic({});
       setRealtimeReadSeqByTopic({});
       realtimeActivityRef.current = {};
       realtimeUiTopicsRef.current = new Set();
@@ -8080,6 +8811,45 @@ export default function Home() {
     setRealtimeRetryNonce((current) => current + 1);
   };
 
+  const loadOlderRealtimeHistory = async (
+    topic: string,
+  ): Promise<RealtimeHistoryPageResult> => {
+    const realtimeClient = realtimeClientRef.current;
+    if (!realtimeClient || realtimeStatus !== "connected") {
+      throw new CifraRealtimeError("realtime_not_connected");
+    }
+    setRealtimeHistoryByTopic((current) => ({
+      ...current,
+      [topic]: { status: "loading", error: "" },
+    }));
+    try {
+      const result = await realtimeClient.loadOlderMessages(topic, 50);
+      setRealtimeMessages([...realtimeClient.getChatMessages()]);
+      setRealtimeHistoryByTopic((current) => ({
+        ...current,
+        [topic]: {
+          status: result.hasMore ? "ready" : "exhausted",
+          error: "",
+        },
+      }));
+      return result;
+    } catch (error) {
+      const message =
+        error instanceof CifraRealtimeError &&
+        error.code === "tinode_history_page_repeated"
+          ? "Сервер повторил уже загруженную страницу. История не изменена."
+          : error instanceof CifraRealtimeError &&
+              error.code === "realtime_not_connected"
+            ? "Нет соединения с сервером сообщений."
+            : "Не удалось загрузить более ранние сообщения.";
+      setRealtimeHistoryByTopic((current) => ({
+        ...current,
+        [topic]: { status: "error", error: message },
+      }));
+      throw error;
+    }
+  };
+
   const acknowledgeRealtimeChatOpen = (id: string) => {
     if (!realtimeUserId || !realtimeAttachedTopics.includes(id)) {
       return;
@@ -8156,9 +8926,21 @@ export default function Home() {
     }
   };
 
-  const openUserChat = async (id: string) => {
-    const user = users.find((person) => person.id === id);
+  const openUserChat = async (target: string | MessengerUser) => {
+    const user =
+      typeof target === "string"
+        ? users.find((person) => person.id === target)
+        : target;
     if (!user || user.id === "self") return;
+    const id = user.id;
+    if (typeof target !== "string") {
+      setUsers((current) =>
+        mergeDirectoryPage(current, {
+          items: [target],
+          next_cursor: null,
+        }).items,
+      );
+    }
 
     const directChat = findDirectChatForUser(chatItems, user);
     if (directChat) {
@@ -8421,6 +9203,7 @@ export default function Home() {
   setRealtimePublishStatus("idle");
   setRealtimePublishedSeq(null);
   setRealtimeDiagnostics(EMPTY_REALTIME_DIAGNOSTICS);
+  setRealtimeHistoryByTopic({});
   setRealtimeReadSeqByTopic({});
   realtimeActivityRef.current = {};
   realtimeUiTopicsRef.current = new Set();
@@ -8657,8 +9440,9 @@ export default function Home() {
 
   const createGroup = async (
     name: string,
-    memberIds: string[],
+    selectedMembers: MessengerUser[],
   ): Promise<string | null> => {
+    const memberIds = selectedMembers.map((member) => member.id);
     if (canUseLocalChatFallback(authMode)) {
       const newChat: Chat = {
         id: `group-${Date.now()}`,
@@ -8688,7 +9472,13 @@ export default function Home() {
       return "Нет соединения с сервером сообщений. Повторите попытку.";
     }
 
-    const members = resolveRealtimeMemberIds(users, memberIds);
+    const members = resolveRealtimeMemberIds(
+      mergeDirectoryPage(users, {
+        items: selectedMembers,
+        next_cursor: null,
+      }).items,
+      memberIds,
+    );
     if (members.unresolved.length) {
       return "Не удалось сопоставить всех выбранных сотрудников. Откройте с ними чат и повторите попытку.";
     }
@@ -9092,6 +9882,7 @@ export default function Home() {
             <div className="view-host">
               {!sessionActive ? (
                 <SignedOutView
+                  notice={sessionNotice}
                   onCredentials={loginWithCredentials}
                   onVerifyMfa={verifyMfa}
                 />
@@ -9181,6 +9972,24 @@ export default function Home() {
                                 targetChatId,
                               )
                             }
+                            historyStatus={
+                              realtimeHistoryByTopic[selectedChat.id]?.status ??
+                              "idle"
+                            }
+                            historyError={
+                              realtimeHistoryByTopic[selectedChat.id]?.error ??
+                              ""
+                            }
+                            canLoadOlder={
+                              authMode === "backend" &&
+                              realtimeStatus === "connected" &&
+                              realtimeAttachedTopics.includes(selectedChat.id) &&
+                              realtimeHistoryByTopic[selectedChat.id]?.status !==
+                                "exhausted"
+                            }
+                            onLoadOlder={() =>
+                              loadOlderRealtimeHistory(selectedChat.id)
+                            }
                           />
                         ) : (
                           <div className="desktop-chat-empty">
@@ -9224,11 +10033,22 @@ export default function Home() {
                           runtimeMode={authMode}
                           directoryStatus={directoryStatus}
                           directoryError={directoryError}
+                          directoryHasMore={Boolean(directoryNextCursor)}
+                          directoryLoadingMore={directoryLoadingMore}
+                          directoryPageError={directoryPageError}
                           onRetryDirectory={retryBackendDirectory}
+                          onLoadMoreDirectory={loadMoreBackendDirectory}
+                          searchDirectory={searchBackendDirectory}
                           onMessage={openUserChat}
-                          onOpenUser={(id) => {
+                          onOpenUser={(user) => {
                             if (role !== "employee") {
-                              setSelectedProfileUserId(id);
+                              setUsers((current) =>
+                                mergeDirectoryPage(current, {
+                                  items: [user],
+                                  next_cursor: null,
+                                }).items,
+                              );
+                              setSelectedProfileUserId(user.id);
                             }
                           }}
                         />
@@ -9288,7 +10108,12 @@ export default function Home() {
                 runtimeMode={authMode}
                 directoryStatus={directoryStatus}
                 directoryError={directoryError}
+                directoryHasMore={Boolean(directoryNextCursor)}
+                directoryLoadingMore={directoryLoadingMore}
+                directoryPageError={directoryPageError}
                 onRetryDirectory={retryBackendDirectory}
+                onLoadMoreDirectory={loadMoreBackendDirectory}
+                searchDirectory={searchBackendDirectory}
                 onClose={() => setComposeOpen(false)}
                 onSelect={openUserChat}
                 onCreateGroup={createGroup}
